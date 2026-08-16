@@ -24,6 +24,13 @@ use sandbox::{CreateRequest, Limits, SandboxSummary};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+/// Port a sandbox serves its tool surface on, when it serves one.
+///
+/// Fixed rather than configurable: it is reachable only from the sandbox
+/// network, so there is no conflict to resolve, and a caller that had to
+/// discover the port would need a second round trip to learn it.
+const TOOLS_PORT: u16 = 9320;
+
 #[derive(Clone)]
 struct AppState {
     docker: docker::Docker,
@@ -303,6 +310,24 @@ async fn create_sandbox(
         return internal(format!("container created but would not start: {e}"));
     }
 
+    // Where the agent's brain reaches this sandbox's tools.
+    //
+    // Sandboxes sit on their own bridge network and publish no host ports, so
+    // the address is the container's IP on that network. That is deliberately
+    // *not* reachable from the internet: only something already on the sandbox
+    // network — an agent running on this host — can use it. Nothing is exposed
+    // to reach it, which is why this is preferable to publishing a port.
+    //
+    // Best-effort: a sandbox whose IP cannot be read still runs, it simply
+    // cannot be driven remotely, so this must not fail the create.
+    let tools_url = state
+        .docker
+        .inspect_container(&id)
+        .await
+        .ok()
+        .and_then(|v| sandbox_ip(&v, &state.network))
+        .map(|ip| format!("http://{ip}:{TOOLS_PORT}/mcp"));
+
     // Announce to the relay so Buzz can show that this agent has a computer.
     // Best-effort: a sandbox that runs unannounced is a display gap, not a
     // failure, so this never affects the response.
@@ -348,9 +373,35 @@ async fn create_sandbox(
             "ttl_seconds": limits.ttl_seconds,
             "cpuset": cpuset,
             "expires_at": expires_at,
+            // Absent when the container's IP could not be read; a caller that
+            // needs remote tools should treat that as "not drivable" rather
+            // than guessing an address.
+            "tools_url": tools_url,
         })),
     )
         .into_response()
+}
+
+/// The sandbox's IP on its own bridge network.
+///
+/// Prefers the network the broker places sandboxes on. Falls back to any
+/// attached network with an address, because a misconfigured `NetworkMode`
+/// should degrade to "reachable" rather than "invisible".
+fn sandbox_ip(inspect: &serde_json::Value, network: &str) -> Option<String> {
+    let networks = inspect
+        .get("NetworkSettings")?
+        .get("Networks")?
+        .as_object()?;
+    let addr = |v: &serde_json::Value| {
+        v.get("IPAddress")
+            .and_then(|a| a.as_str())
+            .filter(|a| !a.is_empty())
+            .map(str::to_string)
+    };
+    networks
+        .get(network)
+        .and_then(addr)
+        .or_else(|| networks.values().find_map(addr))
 }
 
 async fn list_sandboxes(
@@ -581,6 +632,52 @@ fn internal(e: impl std::fmt::Display) -> axum::response::Response {
         Json(serde_json::json!({"error": msg})),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod sandbox_ip_tests {
+    use super::*;
+
+    fn inspect(networks: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "NetworkSettings": { "Networks": networks } })
+    }
+
+    #[test]
+    fn prefers_the_sandbox_network() {
+        let v = inspect(serde_json::json!({
+            "bridge": {"IPAddress": "172.17.0.5"},
+            "buzz-sandboxes": {"IPAddress": "172.16.240.7"}
+        }));
+        assert_eq!(
+            sandbox_ip(&v, "buzz-sandboxes").as_deref(),
+            Some("172.16.240.7")
+        );
+    }
+
+    /// A sandbox attached to an unexpected network should still be reachable
+    /// rather than silently undrivable.
+    #[test]
+    fn falls_back_to_any_attached_network() {
+        let v = inspect(serde_json::json!({"other": {"IPAddress": "10.1.2.3"}}));
+        assert_eq!(
+            sandbox_ip(&v, "buzz-sandboxes").as_deref(),
+            Some("10.1.2.3")
+        );
+    }
+
+    /// An empty address must read as absent, not as an address of "": the
+    /// caller would otherwise build `http://:9320/mcp`.
+    #[test]
+    fn treats_an_empty_address_as_absent() {
+        let v = inspect(serde_json::json!({"buzz-sandboxes": {"IPAddress": ""}}));
+        assert!(sandbox_ip(&v, "buzz-sandboxes").is_none());
+    }
+
+    #[test]
+    fn returns_none_when_no_networks_are_attached() {
+        assert!(sandbox_ip(&inspect(serde_json::json!({})), "buzz-sandboxes").is_none());
+        assert!(sandbox_ip(&serde_json::json!({}), "buzz-sandboxes").is_none());
+    }
 }
 
 #[cfg(test)]
