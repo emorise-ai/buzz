@@ -30,7 +30,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls", "form"] }
-rmcp = { version = "1", default-features = false, features = ["client", "transport-child-process"] }
+# `transport-streamable-http-client-reqwest` adds the remote tool transport:
+# an agent can drive a sandbox's tools over HTTP instead of spawning them
+# locally. See src/mcp_http.rs for why the signing client is ours.
+rmcp = { version = "1", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 arc-swap = "1"
 getrandom = "0.4"
 tracing = { workspace = true }
@@ -38,6 +41,11 @@ tracing-subscriber = { workspace = true }
 # OAuth 2.0 PKCE for Databricks (and future browser-auth providers).
 async-trait = "0.1"
 axum = { workspace = true }
+nostr = { workspace = true }
+buzz-auth = { workspace = true }
+futures = "0.3"
+sse-stream = "0.2"
+http = "1"
 base64 = "0.22"
 hex = { workspace = true }
 sha2 = { workspace = true }

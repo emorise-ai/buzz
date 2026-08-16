@@ -2585,6 +2585,7 @@ mod tests {
 
     fn cfg(provider: Provider) -> Config {
         Config {
+            private_key: None,
             provider,
             system_prompt: "system".into(),
             max_rounds: 10,

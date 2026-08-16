@@ -777,6 +777,13 @@ pub enum OpenAiApi {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// The agent's own Nostr key, when one is available.
+    ///
+    /// Only needed to drive a *remote* tool server: the sandbox authenticates
+    /// every call by Buzz identity, so requests must be signed with the key the
+    /// sandbox was told to accept. Local (stdio) tools need nothing, which is
+    /// why this is optional rather than required.
+    pub private_key: Option<String>,
     pub provider: Provider,
     pub system_prompt: String,
     pub max_rounds: u32,
@@ -927,6 +934,9 @@ impl Config {
             _ => DEFAULT_SYSTEM_PROMPT.to_owned(),
         };
         let cfg = Config {
+            // Injected by the ACP harness into managed agents; absent when
+            // buzz-agent runs standalone, which only rules out remote tools.
+            private_key: env("BUZZ_PRIVATE_KEY").filter(|k| !k.trim().is_empty()),
             provider,
             system_prompt,
             api_key,
@@ -979,6 +989,7 @@ impl Config {
     /// `DATABRICKS_MODEL` and other fields that are irrelevant here.
     pub fn for_discovery(provider: Provider, api_key: String, base_url: String) -> Self {
         Self {
+            private_key: None,
             provider,
             api_key,
             base_url,
