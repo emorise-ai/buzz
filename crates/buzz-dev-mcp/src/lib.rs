@@ -14,6 +14,7 @@ mod browser;
 mod paths;
 mod read_file;
 mod rg;
+mod serve_http;
 mod shell;
 mod shim;
 mod str_replace;
@@ -241,8 +242,77 @@ async fn async_main(cmd: String) -> Result<(), Box<dyn std::error::Error>> {
     let shim = shim::Shim::install()?;
     let state = Arc::new(shell::SharedState::new(cwd, shim)?);
 
-    let service = DevMcp::new(state).serve(stdio()).await?;
-    service.waiting().await?;
+    // Two transports, one tool surface.
+    //
+    // stdio (the default) is for an agent that spawns this process as a child:
+    // the pipe *is* the trust boundary, so there is nothing to authenticate.
+    //
+    // HTTP is for an agent whose reasoning model runs on another machine —
+    // the sandbox holds the tools, the operator's side holds the brain and the
+    // LLM credential. That endpoint is remote code execution by design, so it
+    // authenticates every call by Buzz identity and serves exactly one owner.
+    // See `serve_http` for the reasoning.
+    match std::env::var("BUZZ_DEV_MCP_BIND")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        Some(bind) => serve_over_http(state, bind).await,
+        None => {
+            let service = DevMcp::new(state).serve(stdio()).await?;
+            service.waiting().await?;
+            Ok(())
+        }
+    }
+}
+
+/// Serve the tool surface over authenticated HTTP.
+///
+/// Refuses to start without an owner: a tool server that would run any shell
+/// command for any caller is never the intended configuration, so an unset
+/// owner is a startup error rather than an open port.
+async fn serve_over_http(
+    state: Arc<shell::SharedState>,
+    bind: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpService,
+    };
+
+    let owner = std::env::var("BUZZ_DEV_MCP_OWNER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or(
+            "BUZZ_DEV_MCP_BIND is set but BUZZ_DEV_MCP_OWNER is not — refusing to \
+             serve tools to an unauthenticated caller. Set it to the hex pubkey of \
+             the agent that owns this sandbox.",
+        )?;
+
+    // NIP-98 signs the exact URL the caller used, and verification rebuilds it
+    // from this value rather than the Host header. It must match the origin the
+    // agent actually reaches, or every request fails in a way that looks like a
+    // broken signature rather than a misconfiguration.
+    let public_url =
+        std::env::var("BUZZ_DEV_MCP_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}"));
+
+    let auth = serve_http::AuthConfig::new(owner, public_url.clone())?;
+
+    let service = StreamableHttpService::new(
+        move || Ok(DevMcp::new(state.clone())),
+        LocalSessionManager::default().into(),
+        Default::default(),
+    );
+
+    let app = axum::Router::new().nest_service("/mcp", service).layer(
+        axum::middleware::from_fn_with_state(auth, serve_http::require_owner),
+    );
+
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    tracing::info!(
+        %bind,
+        %public_url,
+        "serving tools over authenticated HTTP (NIP-98, single owner)"
+    );
+    axum::serve(listener, app).await?;
     Ok(())
 }
 

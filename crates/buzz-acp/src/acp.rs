@@ -24,14 +24,76 @@ const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 
 /// An MCP server configuration passed to `session/new`.
 ///
-/// Corresponds to the `McpServerStdio` variant in the ACP schema.
-/// All four fields are **required** by the schema (`args` and `env` may be empty arrays).
+/// Two transports, because the tools do not always run beside the model.
+///
+/// * **Stdio** — the agent spawns the tool server as a child process and speaks
+///   over the pipe. The process boundary is the trust boundary.
+/// * **Http** — the tool server runs elsewhere (a sandbox on another host) and
+///   the agent drives it over the network. Used when the reasoning model, and
+///   its LLM credential, deliberately stay off the machine being controlled.
+///
+/// `Http` is only legal when the agent advertises `mcpCapabilities.http` in its
+/// `initialize` response; sending it to an agent that does not is a protocol
+/// error, so callers must check first.
+///
+/// Serialized untagged with an explicit `type` field in each variant, matching
+/// the ACP schema's discriminated union.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct McpServer {
+#[serde(untagged)]
+pub enum McpServer {
+    /// `McpServerStdio`. All four fields are **required** by the schema
+    /// (`args` and `env` may be empty arrays).
+    Stdio {
+        name: String,
+        command: String,
+        args: Vec<String>,
+        env: Vec<EnvVar>,
+    },
+    /// `McpServerHttp`. Credentials belong in `headers`, which the agent sends
+    /// on every request to `url`.
+    Http {
+        #[serde(rename = "type")]
+        transport: HttpTransportTag,
+        name: String,
+        url: String,
+        headers: Vec<HttpHeader>,
+    },
+}
+
+/// Transport-agnostic readers, so assertions do not have to match on the
+/// variant to check a field every server has.
+#[cfg(test)]
+impl McpServer {
+    /// The server's name, whichever transport it uses.
+    pub fn name(&self) -> &str {
+        match self {
+            McpServer::Stdio { name, .. } | McpServer::Http { name, .. } => name,
+        }
+    }
+
+    /// The environment passed to a stdio server. Empty for remote servers,
+    /// whose environment is fixed where they run.
+    pub fn env(&self) -> &[EnvVar] {
+        match self {
+            McpServer::Stdio { env, .. } => env,
+            McpServer::Http { .. } => &[],
+        }
+    }
+}
+
+/// The `type` discriminator for the HTTP variant. A single-valued enum rather
+/// than a bare string so the discriminator cannot be set to anything else.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub enum HttpTransportTag {
+    #[serde(rename = "http")]
+    Http,
+}
+
+/// One HTTP header sent with every request to a remote MCP server.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HttpHeader {
     pub name: String,
-    pub command: String,
-    pub args: Vec<String>,
-    pub env: Vec<EnvVar>,
+    pub value: String,
 }
 
 /// A single environment variable for an MCP server.
@@ -2502,7 +2564,7 @@ mod tests {
     #[test]
     fn session_new_mcp_server_has_required_fields() {
         // Schema requires name, command, args, env — all present, args/env may be empty.
-        let server = McpServer {
+        let server = McpServer::Stdio {
             name: "test-mcp".into(),
             command: "/usr/local/bin/test-mcp-server".into(),
             args: vec![],

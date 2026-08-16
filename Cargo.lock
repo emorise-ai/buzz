@@ -949,10 +949,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-backend-common"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "buzz-backend-docker"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "buzz-backend-common",
  "hex",
  "nostr 0.44.7",
  "rand 0.10.1",
@@ -968,6 +977,7 @@ dependencies = [
 name = "buzz-backend-kubernetes"
 version = "0.1.0"
 dependencies = [
+ "buzz-backend-common",
  "chrono",
  "hex",
  "http",
@@ -1110,12 +1120,16 @@ dependencies = [
 name = "buzz-dev-mcp"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64 0.22.1",
+ "buzz-auth",
  "buzz-cli",
  "buzz-core",
+ "chrono",
  "futures-util",
  "git-credential-nostr",
  "git-sign-nostr",
+ "hex",
  "ignore",
  "image",
  "nix 0.31.3",
@@ -1126,6 +1140,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "similar",
  "tempfile",
  "tokio",

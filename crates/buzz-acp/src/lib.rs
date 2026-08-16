@@ -4581,6 +4581,9 @@ struct PoolStartup {
     has_generated_codex_config: bool,
     model: Option<String>,
     observer: Option<observer::ObserverHandle>,
+    /// Remote tool server URL, carried here so the pool can refuse an agent
+    /// that cannot drive one at initialize rather than failing later.
+    mcp_url: Option<String>,
 }
 
 impl PoolStartup {
@@ -4593,6 +4596,7 @@ impl PoolStartup {
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
             observer,
+            mcp_url: config.mcp_url.clone(),
         }
     }
 }
@@ -4631,6 +4635,16 @@ async fn initialize_agent_pool(
                 match initialize_result {
                     Ok(Ok(init_result)) => {
                         tracing::info!(agent = i, "agent initialized: {init_result}");
+                        // Refuse a remote tool server the agent cannot speak to.
+                        // Without this the mismatch surfaces later as an opaque
+                        // protocol error from session/new, which reads like a
+                        // broken sandbox rather than the wrong agent choice.
+                        if let Err(e) =
+                            check_remote_mcp_supported(startup.mcp_url.as_deref(), &init_result)
+                        {
+                            tracing::error!(agent = i, "{e}");
+                            return Err(anyhow::anyhow!(e));
+                        }
                         let protocol_version =
                             init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
                         tracing::info!(
@@ -4998,11 +5012,64 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
     Ok(())
 }
 
+/// Refuse `--mcp-url` when the agent cannot drive a remote tool server.
+///
+/// The ACP schema gates the HTTP `McpServer` variant on the agent advertising
+/// `agentCapabilities.mcpCapabilities.http`. Sending it regardless is a
+/// protocol violation, and the resulting failure appears at `session/new` as a
+/// generic rejection — far from the actual cause. Checking at initialize turns
+/// that into one sentence naming the fix.
+fn check_remote_mcp_supported(
+    mcp_url: Option<&str>,
+    init_result: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(url) = mcp_url.filter(|u| !u.trim().is_empty()) else {
+        return Ok(());
+    };
+    let supported = init_result
+        .get("agentCapabilities")
+        .and_then(|c| c.get("mcpCapabilities"))
+        .and_then(|m| m.get("http"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if supported {
+        return Ok(());
+    }
+    let name = init_result
+        .get("agentInfo")
+        .or_else(|| init_result.get("serverInfo"))
+        .and_then(|info| info.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("this agent");
+    Err(format!(
+        "remote tools were requested (--mcp-url {url}) but {name} does not support \
+         them: it did not advertise mcpCapabilities.http. Use an agent that does \
+         (claude-agent-acp), or drop --mcp-url to run tools locally."
+    ))
+}
+
 fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
+    // A remote tool server wins over spawning a local one: the operator has
+    // said the tools live on another machine, which is the whole point of
+    // running the model here and the hands there.
+    //
+    // Nothing is passed as env — the sandbox already holds its own identity and
+    // configuration, and its environment is fixed at deploy time. The only
+    // per-request material is the NIP-98 signature, which the agent's HTTP
+    // client attaches per call rather than carrying in static headers.
+    if let Some(url) = config.mcp_url.as_deref().filter(|u| !u.trim().is_empty()) {
+        return vec![McpServer::Http {
+            transport: acp::HttpTransportTag::Http,
+            name: "buzz-dev-mcp".to_string(),
+            url: url.trim().to_string(),
+            headers: vec![],
+        }];
+    }
+
     if config.mcp_command.is_empty() {
         return vec![];
     }
-    vec![McpServer {
+    vec![McpServer::Stdio {
         name: std::path::Path::new(&config.mcp_command)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -5053,6 +5120,89 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
             env
         },
     }]
+}
+
+#[cfg(test)]
+mod remote_mcp_tests {
+    use super::*;
+
+    fn init_with_http(supported: bool) -> serde_json::Value {
+        serde_json::json!({
+            "protocolVersion": 1,
+            "agentInfo": {"name": "test-agent"},
+            "agentCapabilities": {"mcpCapabilities": {"http": supported, "sse": supported}}
+        })
+    }
+
+    #[test]
+    fn allows_remote_tools_when_the_agent_advertises_http() {
+        assert!(check_remote_mcp_supported(Some("http://h/mcp"), &init_with_http(true)).is_ok());
+    }
+
+    /// The mismatch this guard exists for: without it the failure surfaces at
+    /// session/new as an opaque rejection.
+    #[test]
+    fn refuses_remote_tools_when_the_agent_cannot_speak_http() {
+        let err = check_remote_mcp_supported(Some("http://h/mcp"), &init_with_http(false))
+            .expect_err("must refuse");
+        assert!(err.contains("test-agent"), "should name the agent: {err}");
+        assert!(err.contains("--mcp-url"), "should name the flag: {err}");
+    }
+
+    /// An agent that omits the capability block entirely (older adapters) must
+    /// be treated as not supporting remote tools, not as unknown-so-allow.
+    #[test]
+    fn treats_a_missing_capability_block_as_unsupported() {
+        let init = serde_json::json!({"protocolVersion": 1, "agentCapabilities": {}});
+        assert!(check_remote_mcp_supported(Some("http://h/mcp"), &init).is_err());
+    }
+
+    /// Local (stdio) tools must stay unaffected by the guard.
+    #[test]
+    fn ignores_the_check_when_no_remote_url_is_configured() {
+        assert!(check_remote_mcp_supported(None, &init_with_http(false)).is_ok());
+        assert!(check_remote_mcp_supported(Some("   "), &init_with_http(false)).is_ok());
+    }
+
+    /// The wire shape the ACP schema requires for a remote server: a `type`
+    /// discriminator of "http", a url, and headers — and crucially no
+    /// `command`, which would make it parse as the stdio variant.
+    #[test]
+    fn http_variant_serializes_to_the_schema_shape() {
+        let server = McpServer::Http {
+            transport: acp::HttpTransportTag::Http,
+            name: "buzz-dev-mcp".into(),
+            url: "http://127.0.0.1:9320/mcp".into(),
+            headers: vec![],
+        };
+        let v = serde_json::to_value(&server).expect("serialize");
+        assert_eq!(v["type"], "http");
+        assert_eq!(v["url"], "http://127.0.0.1:9320/mcp");
+        assert_eq!(v["name"], "buzz-dev-mcp");
+        assert!(v.get("command").is_none(), "must not look like stdio: {v}");
+    }
+
+    /// The stdio variant must keep its existing shape — every current agent
+    /// depends on it, and the enum change must not alter the wire format.
+    #[test]
+    fn stdio_variant_keeps_its_existing_shape() {
+        let server = McpServer::Stdio {
+            name: "buzz-dev-mcp".into(),
+            command: "buzz-dev-mcp".into(),
+            args: vec![],
+            env: vec![EnvVar {
+                name: "K".into(),
+                value: "V".into(),
+            }],
+        };
+        let v = serde_json::to_value(&server).expect("serialize");
+        assert_eq!(v["command"], "buzz-dev-mcp");
+        assert_eq!(v["env"][0]["name"], "K");
+        assert!(
+            v.get("type").is_none(),
+            "stdio carries no discriminator: {v}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6728,6 +6878,7 @@ mod build_mcp_servers_tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
+            mcp_url: None,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -6774,9 +6925,9 @@ mod build_mcp_servers_tests {
         let servers = build_mcp_servers(&config);
         assert_eq!(servers.len(), 1);
         let server = &servers[0];
-        assert_eq!(server.name, "test-mcp-server");
+        assert_eq!(server.name(), "test-mcp-server");
 
-        let names: Vec<&str> = server.env.iter().map(|e| e.name.as_str()).collect();
+        let names: Vec<&str> = server.env().iter().map(|e| e.name.as_str()).collect();
         assert!(
             names.contains(&"BUZZ_RELAY_URL"),
             "missing BUZZ_RELAY_URL; got {names:?}"
@@ -6796,7 +6947,7 @@ mod build_mcp_servers_tests {
         std::env::remove_var("BUZZ_AUTH_TAG");
 
         let server = &servers[0];
-        let auth_tag_env = server.env.iter().find(|e| e.name == "BUZZ_AUTH_TAG");
+        let auth_tag_env = server.env().iter().find(|e| e.name == "BUZZ_AUTH_TAG");
         assert!(
             auth_tag_env.is_some(),
             "BUZZ_AUTH_TAG should be forwarded when set"
@@ -6813,7 +6964,7 @@ mod build_mcp_servers_tests {
         std::env::remove_var("BUZZ_AUTH_TAG");
 
         let server = &servers[0];
-        let has_auth_tag = server.env.iter().any(|e| e.name == "BUZZ_AUTH_TAG");
+        let has_auth_tag = server.env().iter().any(|e| e.name == "BUZZ_AUTH_TAG");
         assert!(!has_auth_tag, "empty BUZZ_AUTH_TAG should not be forwarded");
     }
 
@@ -6826,7 +6977,7 @@ mod build_mcp_servers_tests {
         std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
 
         let entry = servers[0]
-            .env
+            .env()
             .iter()
             .find(|e| e.name == "BUZZ_ACP_DISPLAY_NAME");
         assert_eq!(
@@ -6847,7 +6998,7 @@ mod build_mcp_servers_tests {
         // falls back to the npub when the key is missing or blank.
         assert!(
             !servers[0]
-                .env
+                .env()
                 .iter()
                 .any(|e| e.name == "BUZZ_ACP_DISPLAY_NAME"),
             "unset display name should not add the key"
@@ -6864,7 +7015,7 @@ mod build_mcp_servers_tests {
 
         assert!(
             !servers[0]
-                .env
+                .env()
                 .iter()
                 .any(|e| e.name == "BUZZ_ACP_DISPLAY_NAME"),
             "empty display name should not be forwarded"
@@ -6888,7 +7039,7 @@ mod build_mcp_servers_tests {
         config.mcp_command = "/opt/bin/my-mcp-server".into();
         let servers = build_mcp_servers(&config);
         assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].name, "my-mcp-server");
+        assert_eq!(servers[0].name(), "my-mcp-server");
     }
 
     #[test]
@@ -6910,7 +7061,8 @@ mod build_mcp_servers_tests {
         let servers = build_mcp_servers(&config);
         assert_eq!(servers.len(), 1);
         assert_eq!(
-            servers[0].name, "mcp",
+            servers[0].name(),
+            "mcp",
             "Path::new(\".\").file_stem() is None — should fall back to \"mcp\""
         );
     }
@@ -6951,6 +7103,7 @@ mod error_outcome_emission_tests {
             agent_command: "true".into(),
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
+            mcp_url: None,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,

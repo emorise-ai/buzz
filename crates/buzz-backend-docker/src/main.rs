@@ -15,12 +15,22 @@
 
 mod broker;
 mod config;
-mod env;
 mod naming;
-mod wire;
+
+// The wire protocol and environment rules are the spec's, not Docker's, so they
+// live in buzz-backend-common and are shared with every other binding rather
+// than copied per substrate.
+use buzz_backend_common::{env, wire};
 
 use std::io::Read;
 use wire::{Request, Response};
+
+/// Why the shared environment rules fail on this substrate specifically.
+const DIAGNOSTICS: env::SubstrateDiagnostics = env::SubstrateDiagnostics {
+    non_posix_key_reason: "a non-POSIX name is not reliably visible to the \
+                           process inside the container",
+    env_too_large_reason: "the container would fail to exec",
+};
 
 /// The provider a shared-compute agent resolves to. Refused here as the spec's
 /// backstop: a mesh agent runs on the relay's compute, so deploying it as a
@@ -64,7 +74,11 @@ fn respond(input: &str) -> Response {
     };
 
     match request {
-        Request::Info => Response::info(),
+        Request::Info => Response::info(
+            "docker",
+            "Runs agents as sandboxed containers via a sandbox broker",
+            config::schema(),
+        ),
         Request::Deploy(deploy) => {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -111,6 +125,7 @@ async fn deploy_agent(request: &wire::DeployRequest) -> Result<String, String> {
             generation: &generation,
             inactivity_seconds: Some(cfg.inactivity_seconds),
         },
+        DIAGNOSTICS,
     )?;
 
     let sandbox_id = broker::create(

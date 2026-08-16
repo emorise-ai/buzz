@@ -43,6 +43,14 @@ futures-util = { workspace = true }
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 buzz-core = { workspace = true }
+# Remote tool serving: the agent's brain runs elsewhere and drives these tools
+# over authenticated HTTP. axum carries the transport, buzz-auth verifies the
+# NIP-98 signature on every call, chrono bounds replay.
+axum = { workspace = true }
+buzz-auth = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal", "process"] }

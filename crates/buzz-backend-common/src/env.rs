@@ -171,9 +171,26 @@ pub struct AuthoritativeInputs<'a> {
 /// Order is the spec's, and the function body is deliberately three writes in
 /// that order — tier 1, tier 2, tier 3 — so "later wins" is visible rather
 /// than argued.
+/// Substrate-specific wording for the two validation failures whose *cause*
+/// differs by substrate even though the *rule* does not.
+///
+/// The rules themselves — POSIX key names, the 1 MB environment ceiling — are
+/// the spec's and identical everywhere. Only the explanation of what breaks
+/// differs (a Kubernetes Secret limit versus an `execve` failure), and a wrong
+/// explanation sends the reader to the wrong place. Passing them in keeps one
+/// implementation of the rule with an accurate message on each substrate.
+#[derive(Debug, Clone, Copy)]
+pub struct SubstrateDiagnostics {
+    /// Why a non-POSIX environment variable name is unusable here.
+    pub non_posix_key_reason: &'static str,
+    /// Why exceeding the environment byte ceiling breaks the launch here.
+    pub env_too_large_reason: &'static str,
+}
+
 pub fn build_env(
     agent: &AgentPayload,
     auth: AuthoritativeInputs<'_>,
+    diagnostics: SubstrateDiagnostics,
 ) -> Result<BTreeMap<String, String>, String> {
     let default_launch = LaunchBlock::default();
     let launch = agent.launch.as_ref().unwrap_or(&default_launch);
@@ -204,8 +221,8 @@ pub fn build_env(
         if !is_posix_env_key(key) {
             return Err(format!(
                 "env key {key:?} is not a POSIX environment variable name \
-                 ([A-Za-z_][A-Za-z0-9_]*); a non-POSIX name is not reliably \
-                 visible to the process inside the container"
+                 ([A-Za-z_][A-Za-z0-9_]*); {}",
+                diagnostics.non_posix_key_reason
             ));
         }
         if key.eq_ignore_ascii_case(FORBIDDEN_KEY) {
@@ -297,7 +314,8 @@ pub fn build_env(
     if total > MAX_SECRET_BYTES {
         return Err(format!(
             "agent environment is {total} bytes, over the {MAX_SECRET_BYTES} \
-             byte cap; the container would fail to exec"
+             byte cap; {}",
+            diagnostics.env_too_large_reason
         ));
     }
 
@@ -324,6 +342,13 @@ mod tests {
         serde_json::from_value(agent).unwrap()
     }
 
+    /// Wording used only to satisfy the signature; these tests assert the
+    /// shared rules, not any substrate's explanation of them.
+    const TEST_DIAGNOSTICS: SubstrateDiagnostics = SubstrateDiagnostics {
+        non_posix_key_reason: "test substrate would reject it",
+        env_too_large_reason: "test substrate would reject it",
+    };
+
     fn build(agent: &AgentPayload) -> Result<BTreeMap<String, String>, String> {
         build_env(
             agent,
@@ -331,6 +356,7 @@ mod tests {
                 generation: "gen0001",
                 inactivity_seconds: Some(7200),
             },
+            TEST_DIAGNOSTICS,
         )
     }
 
@@ -560,6 +586,7 @@ mod tests {
                 generation: "g",
                 inactivity_seconds: None,
             },
+            TEST_DIAGNOSTICS,
         )
         .unwrap();
         assert!(!env.contains_key("BUZZ_ACP_EXIT_AFTER_INACTIVITY"));
