@@ -144,6 +144,21 @@ impl AuthConfig {
     }
 }
 
+/// Paths an MCP client probes to discover an OAuth authorization server.
+///
+/// Listed explicitly rather than matched by prefix so that a tool path can
+/// never be mistaken for discovery and served without authentication.
+fn is_oauth_discovery(path: &str) -> bool {
+    matches!(
+        path,
+        "/.well-known/oauth-authorization-server"
+            | "/.well-known/oauth-protected-resource"
+            | "/.well-known/oauth-protected-resource/mcp"
+            | "/.well-known/openid-configuration"
+            | "/register"
+    )
+}
+
 /// Axum middleware rejecting anything that fails `AuthConfig::verify`.
 ///
 /// Runs before the MCP service sees the request, so an unauthorized caller
@@ -156,6 +171,25 @@ pub async fn require_owner(
     let (parts, body) = request.into_parts();
     let method = parts.method.as_str().to_string();
     let path = parts.uri.path().to_string();
+
+    // An MCP client that meets a 401 assumes OAuth and goes looking for an
+    // authorization server. Claude Code probes these five paths, and answering
+    // any of them with a 401 reads as "the OAuth endpoint needs auth", which
+    // sends it round the same loop; it then gives up and silently falls back to
+    // local tools, so the sandbox is quietly unused rather than visibly broken.
+    //
+    // 404 is the honest answer: this server has no OAuth. It ends discovery in
+    // one round trip and leaves the NIP-98 challenge below as the only route to
+    // authenticate.
+    if is_oauth_discovery(&path) {
+        tracing::debug!(%path, "declining OAuth discovery: this server authenticates with NIP-98");
+        return Err((
+            StatusCode::NOT_FOUND,
+            "this server does not use OAuth; sign requests with NIP-98 \
+             (Authorization: Nostr <base64 event>)"
+                .to_string(),
+        ));
+    }
 
     // The origin the caller signed, reconstructed from the request itself. The
     // scheme is not observable here (TLS, if any, terminates upstream), so it
@@ -320,6 +354,29 @@ mod tests {
         assert!(cfg
             .verify(&headers_with(&auth), "POST", "/mcp", b"", origin)
             .is_ok());
+    }
+
+    /// The bug this guard exists for: answering discovery with 401 made Claude
+    /// Code loop, give up, and silently use local tools instead of the sandbox.
+    #[test]
+    fn declines_every_oauth_discovery_path() {
+        for p in [
+            "/.well-known/oauth-authorization-server",
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/openid-configuration",
+            "/register",
+        ] {
+            assert!(is_oauth_discovery(p), "{p} must end discovery");
+        }
+    }
+
+    /// Discovery must never be a way to reach a tool unauthenticated.
+    #[test]
+    fn tool_paths_are_not_treated_as_discovery() {
+        for p in ["/mcp", "/mcp/tools", "/", "/.well-known/../mcp"] {
+            assert!(!is_oauth_discovery(p), "{p} must still require auth");
+        }
     }
 
     #[test]
