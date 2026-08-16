@@ -154,12 +154,14 @@ runbook.
 - **The viewer needs a tunnel.** `BUZZ_SANDBOX_VIEWER_URL` is unset, so events
   carry no viewer link. Opening a sandbox desktop currently means an SSH tunnel
   to its port 6080.
-- **`env.rs` and `wire.rs` are duplicated** between `buzz-backend-kubernetes`
-  and `buzz-backend-docker` — deliberate (the rules are the spec's), but a third
-  binding should extract them to a shared crate.
-- **Claude credentials sit inside the sandbox.** Unavoidable for this design and
-  accepted by Ron. Brokering inference through the relay is the way out if it
-  ever matters — it would keep the credential out of the agent entirely.
+- ~~`env.rs` and `wire.rs` duplicated between the two providers~~ — **fixed**.
+  Both now live in `buzz-backend-common`; substrate-specific error wording is
+  passed in via `SubstrateDiagnostics` rather than forking the rule.
+- **Credentials in the sandbox — now avoidable.** The agent's brain can run on
+  the trusted side and drive the sandbox's tools over authenticated HTTP
+  (`BUZZ_DEV_MCP_BIND` on the sandbox, `--mcp-url` on the harness), so no LLM
+  credential need enter the sandbox at all. See `SANDBOX-ARCHITECTURE-OPTIONS.md`.
+  The in-sandbox arrangement still works and remains the default.
 
 ---
 
