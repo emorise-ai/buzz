@@ -8,7 +8,9 @@
 //! Trust boundary, stated plainly: this process can create containers on the
 //! host, so it is deliberately small, and every limit it enforces is decided
 //! in `sandbox.rs` rather than accepted from a caller. It binds to loopback by
-//! default and authenticates every mutating request with a bearer token.
+//! default and authenticates every mutating request by Buzz identity (NIP-98),
+//! deferring authorization to the relay's membership answer — one identity
+//! system rather than two, and no shared secret to distribute or rotate.
 
 mod docker;
 mod events;
