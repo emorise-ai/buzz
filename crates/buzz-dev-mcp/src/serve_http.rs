@@ -22,9 +22,11 @@
 //!   membership list. There is no "open" mode: without `--owner` the server
 //!   refuses to start rather than listening unauthenticated.
 //!
-//! Replay is bounded by the same 60s window the broker uses, and the signed URL
-//! is rebuilt from the operator-supplied public URL rather than the `Host`
-//! header, so a caller cannot move the signature to a different origin.
+//! Replay is bounded by the same 60s window the broker uses. The signature
+//! covers the method, path, and body — which tool runs, with which arguments —
+//! so those cannot be altered. The origin is verified only when an operator
+//! pins one (`BUZZ_DEV_MCP_PUBLIC_URL`); see [`AuthConfig::allowed_origins`]
+//! for why a sandbox generally cannot know its own address.
 
 use std::time::Duration;
 
@@ -40,22 +42,40 @@ const MAX_AGE: Duration = Duration::from_secs(60);
 pub struct AuthConfig {
     /// The single pubkey permitted to drive these tools, hex-encoded.
     owner_pubkey: String,
-    /// Origin the caller signed. NIP-98 signs the exact URL, and verification
-    /// rebuilds it from this rather than the `Host` header — otherwise a proxy
-    /// (or an attacker setting `Host`) would change what counts as valid.
-    public_url: String,
+    /// Origins this server accepts a signature for, lowercased and without a
+    /// trailing slash. Empty means "any origin", the sandbox default.
+    ///
+    /// A sandbox cannot know the address its agent will use: it is created
+    /// before it has an IP, may be reached by container IP, hostname, or
+    /// through a tunnel, and each would produce a different signed URL. Pinning
+    /// one would reject every request that arrived by another route, and the
+    /// failure would look like a broken signature.
+    ///
+    /// Leaving it open is safe here because the origin is not what authorizes
+    /// the call. The signature still covers the **method, path, and body** —
+    /// which tool runs, with which arguments — and the key must still be the
+    /// owner's. An attacker who could replay a captured header against a
+    /// different host would need that header, and holding it already means
+    /// holding a valid signed request for this exact body.
+    ///
+    /// An operator who does front this with a fixed origin can still pin it
+    /// via `BUZZ_DEV_MCP_PUBLIC_URL`, which narrows the check.
+    allowed_origins: Vec<String>,
 }
 
 impl AuthConfig {
-    pub fn new(owner_pubkey: String, public_url: String) -> Result<Self, String> {
+    /// `public_url` pins the accepted origin; `None` accepts any.
+    pub fn new(owner_pubkey: String, public_url: Option<String>) -> Result<Self, String> {
         let owner = owner_pubkey.trim().to_ascii_lowercase();
         // Parse rather than merely length-check: a malformed key here would
         // fail every comparison at runtime and look like a signing bug.
         nostr::PublicKey::parse(&owner)
-            .map_err(|e| format!("--owner is not a valid public key: {e}"))?;
+            .map_err(|e| format!("owner is not a valid public key: {e}"))?;
         Ok(Self {
             owner_pubkey: owner,
-            public_url: public_url.trim_end_matches('/').to_string(),
+            allowed_origins: public_url
+                .map(|u| vec![u.trim().trim_end_matches('/').to_ascii_lowercase()])
+                .unwrap_or_default(),
         })
     }
 
@@ -69,7 +89,18 @@ impl AuthConfig {
         method: &str,
         path: &str,
         body: &[u8],
+        origin: &str,
     ) -> Result<String, String> {
+        if !self.allowed_origins.is_empty()
+            && !self
+                .allowed_origins
+                .iter()
+                .any(|o| o == &origin.to_ascii_lowercase())
+        {
+            return Err(format!(
+                "request origin {origin} is not one this server accepts signatures for"
+            ));
+        }
         let raw = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
@@ -88,7 +119,7 @@ impl AuthConfig {
             String::from_utf8(bytes).map_err(|_| "auth header is not valid UTF-8".to_string())?
         };
 
-        let url = format!("{}{path}", self.public_url);
+        let url = format!("{origin}{path}");
         let pubkey = buzz_auth::verify_nip98_event(&json, &url, method, Some(body))
             .map_err(|e| format!("NIP-98 verification failed: {e}"))?;
 
@@ -126,13 +157,31 @@ pub async fn require_owner(
     let method = parts.method.as_str().to_string();
     let path = parts.uri.path().to_string();
 
+    // The origin the caller signed, reconstructed from the request itself. The
+    // scheme is not observable here (TLS, if any, terminates upstream), so it
+    // is taken from `X-Forwarded-Proto` when a proxy states it and assumed
+    // plain HTTP otherwise — which is what a direct sandbox connection is.
+    let host = parts
+        .headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| parts.uri.host())
+        .unwrap_or_default()
+        .to_string();
+    let scheme = parts
+        .headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    let origin = format!("{scheme}://{host}");
+
     // The body is part of what NIP-98 signs, so it must be buffered before
     // verification and put back afterwards.
     let bytes = axum::body::to_bytes(body, usize::MAX)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("could not read body: {e}")))?;
 
-    if let Err(e) = auth.verify(&parts.headers, &method, &path, &bytes) {
+    if let Err(e) = auth.verify(&parts.headers, &method, &path, &bytes, &origin) {
         tracing::warn!(error = %e, %method, %path, "rejected an unauthenticated tool call");
         return Err((StatusCode::UNAUTHORIZED, e));
     }
@@ -148,6 +197,8 @@ pub async fn require_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ORIGIN: &str = "http://127.0.0.1:9320";
 
     fn keys() -> nostr::Keys {
         nostr::Keys::generate()
@@ -186,18 +237,17 @@ mod tests {
 
     #[test]
     fn rejects_a_malformed_owner_key() {
-        assert!(AuthConfig::new("not-a-key".into(), "http://x".into()).is_err());
+        assert!(AuthConfig::new("not-a-key".into(), None).is_err());
     }
 
     #[test]
     fn accepts_a_request_signed_by_the_owner() {
         let k = keys();
-        let cfg = AuthConfig::new(k.public_key().to_hex(), "http://127.0.0.1:9320".into())
-            .expect("config");
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None).expect("config");
         let body = br#"{"jsonrpc":"2.0"}"#;
         let auth = signed_header(&k, "POST", "http://127.0.0.1:9320/mcp", body);
         assert_eq!(
-            cfg.verify(&headers_with(&auth), "POST", "/mcp", body)
+            cfg.verify(&headers_with(&auth), "POST", "/mcp", body, ORIGIN)
                 .expect("verify"),
             k.public_key().to_hex()
         );
@@ -209,22 +259,76 @@ mod tests {
     fn rejects_a_valid_signature_from_another_identity() {
         let owner = keys();
         let intruder = keys();
-        let cfg = AuthConfig::new(owner.public_key().to_hex(), "http://127.0.0.1:9320".into())
-            .expect("config");
+        let cfg = AuthConfig::new(owner.public_key().to_hex(), None).expect("config");
         let body = br#"{"jsonrpc":"2.0"}"#;
         let auth = signed_header(&intruder, "POST", "http://127.0.0.1:9320/mcp", body);
         let err = cfg
-            .verify(&headers_with(&auth), "POST", "/mcp", body)
+            .verify(&headers_with(&auth), "POST", "/mcp", body, ORIGIN)
             .expect_err("must refuse a non-owner");
         assert!(err.contains("not owned"), "unexpected error: {err}");
+    }
+
+    /// The sandbox default: reached by container IP, hostname, or a tunnel,
+    /// each producing a different signed URL. All must verify, because the
+    /// signature's authority is the method, path, body, and key — not the host.
+    #[test]
+    fn accepts_any_origin_when_none_is_pinned() {
+        let k = keys();
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None).expect("config");
+        for origin in [
+            "http://172.16.240.2:9320",
+            "http://sandbox-abc:9320",
+            "http://127.0.0.1:19320",
+        ] {
+            let auth = signed_header(&k, "POST", &format!("{origin}/mcp"), b"");
+            assert!(
+                cfg.verify(&headers_with(&auth), "POST", "/mcp", b"", origin)
+                    .is_ok(),
+                "should accept {origin}"
+            );
+        }
+    }
+
+    /// An operator fronting the server with a fixed origin can narrow the
+    /// check, and then a signature for another host is refused.
+    #[test]
+    fn rejects_a_foreign_origin_when_one_is_pinned() {
+        let k = keys();
+        let cfg = AuthConfig::new(k.public_key().to_hex(), Some(ORIGIN.into())).expect("config");
+
+        let ok = signed_header(&k, "POST", &format!("{ORIGIN}/mcp"), b"");
+        assert!(cfg
+            .verify(&headers_with(&ok), "POST", "/mcp", b"", ORIGIN)
+            .is_ok());
+
+        let other = "http://evil.example";
+        let bad = signed_header(&k, "POST", &format!("{other}/mcp"), b"");
+        let err = cfg
+            .verify(&headers_with(&bad), "POST", "/mcp", b"", other)
+            .expect_err("must refuse a foreign origin");
+        assert!(err.contains("origin"), "unexpected error: {err}");
+    }
+
+    /// A pinned origin must not be defeated by case or a trailing slash.
+    #[test]
+    fn pinned_origin_comparison_is_normalized() {
+        let k = keys();
+        let cfg = AuthConfig::new(k.public_key().to_hex(), Some("HTTP://Host:9320/".into()))
+            .expect("cfg");
+        let origin = "http://host:9320";
+        let auth = signed_header(&k, "POST", &format!("{origin}/mcp"), b"");
+        assert!(cfg
+            .verify(&headers_with(&auth), "POST", "/mcp", b"", origin)
+            .is_ok());
     }
 
     #[test]
     fn rejects_a_missing_header() {
         let k = keys();
-        let cfg = AuthConfig::new(k.public_key().to_hex(), "http://127.0.0.1:9320".into())
-            .expect("config");
-        assert!(cfg.verify(&HeaderMap::new(), "POST", "/mcp", b"").is_err());
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None).expect("config");
+        assert!(cfg
+            .verify(&HeaderMap::new(), "POST", "/mcp", b"", ORIGIN)
+            .is_err());
     }
 
     /// A signature captured from one path must not authorize another — the URL
@@ -232,11 +336,10 @@ mod tests {
     #[test]
     fn rejects_a_signature_bound_to_a_different_path() {
         let k = keys();
-        let cfg = AuthConfig::new(k.public_key().to_hex(), "http://127.0.0.1:9320".into())
-            .expect("config");
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None).expect("config");
         let auth = signed_header(&k, "POST", "http://127.0.0.1:9320/mcp", b"");
         assert!(cfg
-            .verify(&headers_with(&auth), "POST", "/other", b"")
+            .verify(&headers_with(&auth), "POST", "/other", b"", ORIGIN)
             .is_err());
     }
 
@@ -245,11 +348,10 @@ mod tests {
     #[test]
     fn rejects_a_tampered_body() {
         let k = keys();
-        let cfg = AuthConfig::new(k.public_key().to_hex(), "http://127.0.0.1:9320".into())
-            .expect("config");
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None).expect("config");
         let auth = signed_header(&k, "POST", "http://127.0.0.1:9320/mcp", b"original");
         assert!(cfg
-            .verify(&headers_with(&auth), "POST", "/mcp", b"tampered")
+            .verify(&headers_with(&auth), "POST", "/mcp", b"tampered", ORIGIN)
             .is_err());
     }
 }

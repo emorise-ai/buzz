@@ -287,19 +287,49 @@ async fn serve_over_http(
              the agent that owns this sandbox.",
         )?;
 
-    // NIP-98 signs the exact URL the caller used, and verification rebuilds it
-    // from this value rather than the Host header. It must match the origin the
-    // agent actually reaches, or every request fails in a way that looks like a
-    // broken signature rather than a misconfiguration.
-    let public_url =
-        std::env::var("BUZZ_DEV_MCP_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}"));
+    // NIP-98 signs the exact URL the caller used, so verification needs to know
+    // which origins count as this server. A sandbox generally cannot know that
+    // — it is created before it has an IP, and may be reached by container IP,
+    // hostname, or a tunnel — so by default any origin is accepted and the
+    // signature's authority comes from the method, path, body, and owner key.
+    // An operator fronting this with a fixed origin can pin it here.
+    let public_url = std::env::var("BUZZ_DEV_MCP_PUBLIC_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
 
     let auth = serve_http::AuthConfig::new(owner, public_url.clone())?;
+
+    // rmcp defaults to accepting loopback `Host` values only, guarding a
+    // browser-driven DNS-rebinding attack against a server bound to localhost.
+    // A sandbox is reached by container IP or hostname, so that default rejects
+    // every legitimate request with "Host header is not allowed".
+    //
+    // Relaxing it is safe here for a reason the default cannot assume: rebinding
+    // attacks work because a local server trusts anyone who can reach it, and
+    // this one trusts nobody — every call must carry a NIP-98 signature from the
+    // owning key, checked before the request reaches this service. A browser
+    // tricked into calling the port cannot produce one.
+    //
+    // `BUZZ_DEV_MCP_HOSTS` narrows it again for an operator who knows the
+    // hostname in advance.
+    let allowed_hosts: Vec<String> = std::env::var("BUZZ_DEV_MCP_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .collect();
+    let mut http_config =
+        rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig::default();
+    http_config = if allowed_hosts.is_empty() {
+        http_config.disable_allowed_hosts()
+    } else {
+        http_config.with_allowed_hosts(allowed_hosts)
+    };
 
     let service = StreamableHttpService::new(
         move || Ok(DevMcp::new(state.clone())),
         LocalSessionManager::default().into(),
-        Default::default(),
+        http_config,
     );
 
     let app = axum::Router::new().nest_service("/mcp", service).layer(
@@ -309,7 +339,7 @@ async fn serve_over_http(
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(
         %bind,
-        %public_url,
+        pinned_origin = public_url.as_deref().unwrap_or("<any>"),
         "serving tools over authenticated HTTP (NIP-98, single owner)"
     );
     axum::serve(listener, app).await?;
