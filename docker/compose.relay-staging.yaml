@@ -1,0 +1,185 @@
+# Buzz relay — staging stack for Matterhorn (Dokploy compose project).
+#
+# Serves relay.staging.emorise.com. Exists so agents running in VPS sandboxes
+# have a network-reachable relay to connect back to: a laptop's
+# ws://localhost:3000 is unreachable from a container on the server
+# (SANDBOX-PLAN.md §Phase 2, "Blocking prerequisite").
+#
+# Conventions follow the other Emorise staging stacks on this host:
+#   - internal services publish NO host ports; only `relay` is reachable
+#   - `relay` joins both `default` and `dokploy-network`
+#   - NO Traefik labels here — Dokploy injects its own routers when a Domain
+#     is configured in the UI. Adding labels creates a duplicate-router
+#     conflict and Let's Encrypt issuance silently fails.
+#   - IP allowlisting is a separate Traefik dynamic file
+#     (/etc/dokploy/traefik/dynamic/buzz-relay-staging-access-control.yml)
+#
+# Secrets come from the Dokploy environment, never from this file.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: buzz
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in Dokploy}
+      POSTGRES_DB: buzz
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - relay-postgres:/var/lib/postgresql/data
+    networks: [default]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U buzz"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
+    volumes:
+      - relay-redis:/data
+    networks: [default]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    restart: unless-stopped
+
+  # Object storage for media + git packs. Not optional: the relay runs a git
+  # conformance probe against S3 at startup and refuses to boot if it fails
+  # ("git conformance probe failed: s3 backend error"). The default endpoint is
+  # localhost:9000, which in a container means the relay itself.
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY in Dokploy}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set S3_SECRET_KEY in Dokploy}
+    volumes:
+      - relay-minio:/data
+    networks: [default]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    restart: unless-stopped
+
+  # One-shot: create the media bucket the relay expects.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks: [default]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" &&
+        mc mb --ignore-existing local/buzz-media &&
+        mc anonymous set none local/buzz-media
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?}
+    restart: "no"
+
+  # One-shot: give the repos volume to the relay's UID.
+  #
+  # Docker only auto-chowns a named volume when its mount target already exists
+  # in the image. /var/lib/buzz/repos does not, so the volume is created
+  # root-owned and the relay (uid 1000 "buzz") cannot create its pack cache
+  # inside it — it crash-loops on "Permission denied" at config validation,
+  # before any migration runs.
+  init-repos:
+    image: alpine:3.22
+    command: ["sh", "-c", "mkdir -p /repos && chown -R 1000:1000 /repos"]
+    volumes:
+      - relay-repos:/repos
+    networks: [default]
+    restart: "no"
+
+  relay:
+    # Digest-pinned at deploy time. Bump deliberately; :main moves.
+    image: ${RELAY_IMAGE:-ghcr.io/block/buzz:main}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      init-repos:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://buzz:${POSTGRES_PASSWORD:?}@postgres:5432/buzz
+      # Migrations are OPT-IN, despite what CLAUDE.md/README say about them
+      # being "auto-applied on relay startup" (see main.rs
+      # `buzz_auto_migrate_is_opt_in`). Without this the relay boots against an
+      # empty schema and dies on 'relation "communities" does not exist'.
+      # Safe for a single-replica staging stack; a multi-replica deploy should
+      # run migrations as a separate one-shot step instead.
+      BUZZ_AUTO_MIGRATE: "true"
+      REDIS_URL: redis://redis:6379
+      BUZZ_BIND_ADDR: 0.0.0.0:3000
+      # Public URL — used in NIP-42 auth challenges, so it must match the
+      # externally reachable origin exactly, wss:// not ws://.
+      RELAY_URL: ${RELAY_PUBLIC_URL:-wss://relay.staging.emorise.com}
+      # Stable relay identity across restarts; without it, relay-authored
+      # events change author on every deploy.
+      BUZZ_RELAY_PRIVATE_KEY: ${BUZZ_RELAY_PRIVATE_KEY:?set BUZZ_RELAY_PRIVATE_KEY in Dokploy}
+      # Stated explicitly rather than relying on the "./repos" default, which
+      # resolves against the image's WORKDIR (/var/lib/buzz) and would silently
+      # move if that ever changed — taking the volume mount out from under it.
+      BUZZ_GIT_REPO_PATH: /var/lib/buzz/repos
+      # Object storage. Path-style addressing keeps the bucket in the URL path,
+      # which is what MinIO expects here.
+      BUZZ_S3_ENDPOINT: http://minio:9000
+      BUZZ_S3_ACCESS_KEY: ${S3_ACCESS_KEY:?}
+      BUZZ_S3_SECRET_KEY: ${S3_SECRET_KEY:?}
+      BUZZ_S3_BUCKET: buzz-media
+      BUZZ_S3_REGION: us-east-1
+      BUZZ_S3_ADDRESSING_STYLE: path
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - relay-repos:/var/lib/buzz/repos
+    networks: [default, dokploy-network]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+    restart: unless-stopped
+
+volumes:
+  relay-postgres:
+  relay-redis:
+  relay-repos:
+  relay-minio:
+
+networks:
+  default:
+  dokploy-network:
+    external: true

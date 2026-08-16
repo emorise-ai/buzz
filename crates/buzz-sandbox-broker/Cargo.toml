@@ -1,0 +1,40 @@
+[package]
+name = "buzz-sandbox-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sandbox broker — creates and reaps agent containers on a sandbox host (SANDBOX-PLAN.md)"
+
+[[bin]]
+name = "buzz-sandbox-broker"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+# Buzz identity rather than a bearer token: the broker reuses the relay's own
+# NIP-98 verification and event kinds instead of inventing a second scheme.
+buzz-auth = { path = "../buzz-auth" }
+buzz-core = { path = "../buzz-core" }
+nostr = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+
+# Docker is driven over its unix-socket HTTP API rather than through a Docker
+# SDK: the surface needed here is four endpoints, and a thin client keeps the
+# dependency footprint (and the audit surface for a service that can create
+# containers) small.
+hex = { workspace = true }
+sha2 = { workspace = true }
+hyper = { version = "1", features = ["client", "http1"] }
+tower-service = "0.3"
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"

@@ -29,6 +29,8 @@ members = [
     "crates/buzz-dev-mcp",
     "crates/buzz-voice",
     "crates/buzz-backend-kubernetes",
+    "crates/buzz-backend-docker",
+    "crates/buzz-sandbox-broker",
     "crates/buzz-datastore-tracing",
     "examples/countdown-bot",
 ]

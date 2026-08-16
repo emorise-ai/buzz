@@ -949,6 +949,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-backend-docker"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "hex",
+ "nostr 0.44.7",
+ "rand 0.10.1",
+ "reqwest 0.13.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+]
+
+[[package]]
 name = "buzz-backend-kubernetes"
 version = "0.1.0"
 dependencies = [
@@ -1097,6 +1113,7 @@ dependencies = [
  "base64 0.22.1",
  "buzz-cli",
  "buzz-core",
+ "futures-util",
  "git-credential-nostr",
  "git-sign-nostr",
  "ignore",
@@ -1112,6 +1129,7 @@ dependencies = [
  "similar",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.29.0",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
@@ -1339,6 +1357,32 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "buzz-sandbox-broker"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "buzz-auth",
+ "buzz-core",
+ "chrono",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "nostr 0.44.7",
+ "rand 0.10.1",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tower-service",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

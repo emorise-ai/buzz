@@ -1,0 +1,61 @@
+# Buzz relay staging — routing + IP allowlist.
+#
+# Unlike the Dokploy-managed stacks on this host, this stack is a plain compose
+# project under /opt/buzz-relay-staging, so there is no Dokploy-generated
+# @docker service to borrow. This file therefore defines BOTH the router and
+# its loadBalancer service, pointing at the container by name on
+# dokploy-network.
+#
+# No ipStrategy/excludedIPs — the websecure entryPoint already trusts
+# Cloudflare via forwardedHeaders.trustedIPs in traefik.yml, so the connection
+# IP is the real origin by the time this middleware runs.
+#
+# Ranges are deliberately NARROW. An earlier draft used 10.0.0.0/8 as a
+# catch-all for "docker networks"; that swallows the whole private 10.x space
+# including the 10.13.13.0/24 WireGuard VPN, so it silently allowed anything
+# that could reach the box over any 10.x path. Enforcement was verified by
+# temporarily narrowing the list until a VPN client got 403, then restoring
+# these exact subnets.
+#
+# Docker subnets below are the real ones on this host:
+#   dokploy-network 10.0.1.0/24   ingress 10.0.0.0/24   bridge 172.17.0.0/16
+#
+# Sandboxed agents reach the relay through the PUBLIC hostname (they must — the
+# NIP-42 auth challenge pins wss://relay.staging.emorise.com, so an internal
+# shortcut would fail auth). Traefik sits on dokploy-network only, so traffic
+# from the buzz-sandboxes bridge arrives NAT'd via the docker_gwbridge gateway
+# and presents as 172.18.0.1 — NOT the container IP and NOT the host public IP.
+# Allowlisting the sandbox subnet itself does nothing; verified with a whoami
+# echo service. That single gateway address is what must be allowed.
+
+http:
+  middlewares:
+    buzz-relay-staging-allowlist:
+      ipAllowList:
+        sourceRange:
+          - "10.13.13.0/24"        # WireGuard VPN (mac/phone/office)
+          - "127.0.0.1/32"         # on-box probes
+          - "138.201.205.173/32"   # Matterhorn host
+          - "10.0.0.0/24"          # docker swarm ingress
+          - "10.0.1.0/24"          # dokploy-network
+          - "172.17.0.0/16"        # docker default bridge
+          - "172.18.0.1/32"        # docker_gwbridge gateway — see note below
+
+  services:
+    buzz-relay-staging:
+      loadBalancer:
+        servers:
+          - url: "http://buzz-relay-staging-relay-1:3000"
+        passHostHeader: true
+
+  routers:
+    buzz-relay-staging-guarded:
+      rule: "Host(`relay.staging.emorise.com`)"
+      entryPoints:
+        - websecure
+      middlewares:
+        - buzz-relay-staging-allowlist
+      service: buzz-relay-staging
+      tls:
+        certResolver: letsencrypt
+      priority: 200

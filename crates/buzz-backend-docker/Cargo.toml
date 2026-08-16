@@ -1,0 +1,29 @@
+[package]
+name = "buzz-backend-docker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Docker backend provider for Buzz remote agents via a sandbox broker (docs/remote-agents.md)"
+
+[[bin]]
+name = "buzz-backend-docker"
+path = "src/main.rs"
+
+[dependencies]
+nostr = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+
+# Explicit rustls dep with the ring provider — required to install the
+# process-level CryptoProvider at startup. Same dependency and reason as
+# crates/buzz-backend-kubernetes/Cargo.toml: the release build compiles every
+# sidecar in one cargo invocation, which unifies both ring and aws-lc-rs
+# features and leaves rustls unable to auto-select a provider.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

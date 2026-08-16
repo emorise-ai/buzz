@@ -597,6 +597,14 @@ pub const KIND_HUDDLE_ENDED: u32 = 48103;
 /// Huddle channel guidelines/rules document.
 pub const KIND_HUDDLE_GUIDELINES: u32 = 48106;
 
+// Sandboxes (48200–48299)
+/// A sandbox was created for an agent — the agent now has a computer.
+/// Carries the image, its resource budget, and how to reach the live desktop,
+/// so Buzz can show "this agent has a computer" without querying the broker.
+pub const KIND_SANDBOX_CREATED: u32 = 48200;
+/// A sandbox was destroyed, whether by request or by its lifetime expiring.
+pub const KIND_SANDBOX_DESTROYED: u32 = 48201;
+
 // Media (49000–49999)
 /// Internal kind for media upload audit entries. Not a relay event kind.
 pub const KIND_MEDIA_UPLOAD: u32 = 49001;
@@ -746,6 +754,8 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_WORKFLOW_APPROVAL_GRANTED,
     KIND_WORKFLOW_APPROVAL_DENIED,
     KIND_AUDIT_ENTRY,
+    KIND_SANDBOX_CREATED,
+    KIND_SANDBOX_DESTROYED,
     KIND_HUDDLE_STARTED,
     KIND_HUDDLE_PARTICIPANT_JOINED,
     KIND_HUDDLE_PARTICIPANT_LEFT,

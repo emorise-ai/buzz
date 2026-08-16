@@ -1,8 +1,16 @@
 name: Sprig image
 
-# Builds and publishes the public agent container image as
-# ghcr.io/block/buzz-sprig — the digest-pinned box the Kubernetes backend
-# deploys agents into (see Dockerfile.sprig and docs/remote-agents.md).
+# Builds and publishes the public agent container images — the digest-pinned
+# boxes a backend provider deploys agents into (see docs/remote-agents.md).
+# Two variants, same tags, separate image names:
+#
+#   ghcr.io/block/buzz-sprig      Dockerfile.sprig      minimal (bash/curl/git)
+#   ghcr.io/block/buzz-sprig-dev  Dockerfile.sprig-dev  + Node, Python, gh,
+#                                                       build-essential
+#
+# They are separate image names rather than separate tags on purpose: an agent
+# config pins a digest, and a pinned digest for one must never be silently
+# satisfied by the other.
 #
 # Strategy mirrors docker.yml (the relay image): each architecture builds on
 # its native runner, pushes to GHCR by digest, then a merge job stitches the
@@ -26,6 +34,8 @@ on:
     tags: ["sprig-v[0-9]*"]
     paths:
       - "Dockerfile.sprig"
+      - "Dockerfile.sprig-dev"
+      - ".dockerignore"
       - "scripts/sprig-entrypoint.sh"
       - ".github/workflows/sprig-image.yml"
       - "Cargo.toml"
@@ -35,6 +45,8 @@ on:
   pull_request:
     paths:
       - "Dockerfile.sprig"
+      - "Dockerfile.sprig-dev"
+      - ".dockerignore"
       - "scripts/sprig-entrypoint.sh"
       - ".github/workflows/sprig-image.yml"
   workflow_dispatch: {}
@@ -52,7 +64,7 @@ env:
 
 jobs:
   build:
-    name: Build (${{ matrix.platform }})
+    name: Build ${{ matrix.variant }} (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
@@ -63,11 +75,43 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # variant × arch, written out explicitly: a bare `include` cannot
+        # cross-product two independent axes. `min` is the historical minimal
+        # image and keeps the unsuffixed image name and tags. `dev` adds the
+        # language toolchain (Dockerfile.sprig-dev) and publishes under a `-dev`
+        # image name, so a digest-pinned config for one is never silently
+        # satisfied by the other.
         include:
-          - platform: linux/amd64
+          - variant: min
+            dockerfile: ./Dockerfile.sprig
+            suffix: ""
+            title: Buzz Sprig
+            description: Agent runtime image for Buzz remote agents (buzz-acp multicall + git + curl)
+            platform: linux/amd64
             runner: ubuntu-24.04
             arch: amd64
-          - platform: linux/arm64
+          - variant: min
+            dockerfile: ./Dockerfile.sprig
+            suffix: ""
+            title: Buzz Sprig
+            description: Agent runtime image for Buzz remote agents (buzz-acp multicall + git + curl)
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+          - variant: dev
+            dockerfile: ./Dockerfile.sprig-dev
+            suffix: "-dev"
+            title: Buzz Sprig (dev toolchain)
+            description: Agent runtime image with the coding toolchain (Node, Python, gh, build-essential) for Buzz remote agents
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - variant: dev
+            dockerfile: ./Dockerfile.sprig-dev
+            suffix: "-dev"
+            title: Buzz Sprig (dev toolchain)
+            description: Agent runtime image with the coding toolchain (Node, Python, gh, build-essential) for Buzz remote agents
+            platform: linux/arm64
             runner: ubuntu-24.04-arm
             arch: arm64
 
@@ -98,7 +142,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9  # v6.1.0
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ${{ env.IMAGE_NAME }}${{ matrix.suffix }}
           # match=^sprig-v(.*)$ strips the tag prefix for the semver parser,
           # exactly as docker.yml does for relay-v. :latest comes from
           # flavor.latest=auto — stable semver only, never main pushes.
@@ -108,8 +152,8 @@ jobs:
             type=semver,pattern={{version}},match=^sprig-v(.*)$
             type=semver,pattern={{major}}.{{minor}},match=^sprig-v(.*)$
           labels: |
-            org.opencontainers.image.title=Buzz Sprig
-            org.opencontainers.image.description=Agent runtime image for Buzz remote agents (buzz-acp multicall + git + curl)
+            org.opencontainers.image.title=${{ matrix.title }}
+            org.opencontainers.image.description=${{ matrix.description }}
             org.opencontainers.image.licenses=Apache-2.0
 
       - name: Build and push by digest
@@ -117,14 +161,14 @@ jobs:
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:
           context: .
-          file: ./Dockerfile.sprig
+          file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }}${{ matrix.suffix }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
           cache-from: |
-            type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}
+            type=registry,ref=${{ env.IMAGE_NAME }}${{ matrix.suffix }}-buildcache:${{ matrix.arch }}
           cache-to: |
-            ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}
+            ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref={0}{1}-buildcache:{2},mode=max,compression=zstd', env.IMAGE_NAME, matrix.suffix, matrix.arch) || '' }}
 
       - name: Export digest
         if: github.event_name != 'pull_request'
@@ -138,17 +182,25 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: sprig-digest-${{ matrix.arch }}
+          name: sprig-digest-${{ matrix.variant }}-${{ matrix.arch }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
   merge:
-    name: Merge multi-arch manifest
+    name: Merge multi-arch manifest (${{ matrix.variant }})
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     needs: build
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: min
+            suffix: ""
+          - variant: dev
+            suffix: "-dev"
     permissions:
       contents: read
       packages: write
@@ -160,7 +212,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           path: /tmp/digests
-          pattern: sprig-digest-*
+          pattern: sprig-digest-${{ matrix.variant }}-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -177,7 +229,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9  # v6.1.0
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ${{ env.IMAGE_NAME }}${{ matrix.suffix }}
           # Must mirror the build job's tag matrix exactly (see docker.yml).
           flavor: |
             latest=auto
@@ -191,7 +243,7 @@ jobs:
         id: manifest
         working-directory: /tmp/digests
         env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}${{ matrix.suffix }}
           META_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           set -euo pipefail
@@ -216,13 +268,13 @@ jobs:
         # Verify with: gh attestation verify oci://ghcr.io/block/buzz-sprig:<tag> --owner block
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
         with:
-          subject-name: ${{ env.IMAGE_NAME }}
+          subject-name: ${{ env.IMAGE_NAME }}${{ matrix.suffix }}
           subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
 
       - name: Summary
         env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}${{ matrix.suffix }}
           DIGEST: ${{ steps.manifest.outputs.digest }}
         run: |
           {

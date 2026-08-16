@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1.7
+#
+# Sprig CLAUDE image — the agent thinks using a Claude subscription, not an
+# API key.
+#
+# Layered on the desktop image, so an agent here has: the Buzz toolchain, a
+# visible browser a human can take over, AND Claude Code as its reasoning
+# engine. This is the combination Buzz is actually used with — the desktop's
+# `KnownAcpRuntime` entry for `claude` declares no model or provider env var
+# at all (`provider_locked: true`), because authentication is a CLI login
+# rather than a credential the agent carries.
+#
+# Two pieces, exactly as the desktop's runtime table specifies them:
+#   claude                       the Claude Code CLI
+#   @agentclientprotocol/claude-agent-acp   the ACP adapter buzz-acp speaks to
+#
+# Credentials are NOT baked in. They are injected at deploy time into
+# /home/agent/.claude/.credentials.json (the path the CLI reads on Linux —
+# macOS keeps the same JSON in the Keychain instead). Baking them would put a
+# long-lived refresh token in an image layer that outlives any one sandbox.
+
+ARG BASE=buzz-sprig-desktop:latest
+FROM ${BASE}
+
+USER root
+
+# The Claude installer writes to ~/.local/bin and expects a real HOME. Running
+# it as the agent user means the binary lands where that user can execute it
+# without a second copy step.
+USER agent
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+USER root
+# The adapter is a node package; install it globally so it resolves on PATH for
+# any process, not just an interactive shell.
+RUN npm install -g @agentclientprotocol/claude-agent-acp \
+    && npm cache clean --force
+
+# ~/.local/bin is where the Claude installer puts the CLI. Prepending it keeps
+# the multicall shim's own entries ahead of the system PATH but behind nothing
+# that matters.
+ENV PATH=/home/agent/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
+    BUZZ_ACP_AGENT_COMMAND=claude-agent-acp
+
+# The credentials directory must exist and be owned by the agent before any
+# deploy-time injection writes into it.
+RUN install -d -o agent -g agent -m 0700 /home/agent/.claude
+
+USER agent
+WORKDIR /home/agent
+
+ENTRYPOINT ["/usr/local/bin/sprig-desktop-entrypoint"]

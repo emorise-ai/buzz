@@ -10,6 +10,7 @@ use rmcp::{
 use std::path::Path;
 use std::sync::Arc;
 
+mod browser;
 mod paths;
 mod read_file;
 mod rg;
@@ -69,6 +70,66 @@ impl DevMcp {
         Parameters(p): Parameters<view_image::ViewImageParams>,
     ) -> Result<CallToolResult, ErrorData> {
         view_image::run(&self.state, p).await
+    }
+
+    #[tool(
+        name = "browser_navigate",
+        description = "Open a URL in the agent's own Chromium. This is a REAL browser on a visible desktop that a human can watch and take over — so for anything needing a login, navigate to the login page and ask the person to sign in via the desktop viewer rather than asking them for a password. Sessions persist, so a site signed into once stays signed in."
+    )]
+    async fn browser_navigate(
+        &self,
+        Parameters(p): Parameters<browser::NavigateParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        browser::navigate(p).await
+    }
+
+    #[tool(
+        name = "browser_read",
+        description = "Read the visible text of the current page, optionally scoped to a CSS selector. Prefer this over screenshots for extracting information — it is far cheaper and exact. Output is truncated at ~20k characters."
+    )]
+    async fn browser_read(
+        &self,
+        Parameters(p): Parameters<browser::ReadParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        browser::read_page(p).await
+    }
+
+    #[tool(
+        name = "browser_click",
+        description = "Click the first element matching a CSS selector on the current page. Returns the URL afterwards so you can tell whether it navigated."
+    )]
+    async fn browser_click(
+        &self,
+        Parameters(p): Parameters<browser::ClickParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        browser::click(p).await
+    }
+
+    #[tool(
+        name = "browser_type",
+        description = "Type text into the input matching a CSS selector, optionally submitting afterwards. NEVER type passwords, 2FA codes, or other credentials with this tool — ask the person to enter those in the desktop viewer instead, so they stay out of the conversation."
+    )]
+    async fn browser_type(
+        &self,
+        Parameters(p): Parameters<browser::TypeParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        browser::type_text(p).await
+    }
+
+    #[tool(
+        name = "browser_screenshot",
+        description = "Capture the current page as an image you can look at. Use when layout or visual appearance matters; use browser_read for text."
+    )]
+    async fn browser_screenshot(&self) -> Result<CallToolResult, ErrorData> {
+        browser::screenshot().await
+    }
+
+    #[tool(
+        name = "browser_tabs",
+        description = "List the pages currently open in the agent's browser, newest first. The newest is the one the other browser tools act on."
+    )]
+    async fn browser_tabs(&self) -> Result<CallToolResult, ErrorData> {
+        browser::tabs().await
     }
 
     #[tool(

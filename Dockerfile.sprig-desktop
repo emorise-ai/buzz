@@ -1,0 +1,73 @@
+# syntax=docker/dockerfile:1.7
+#
+# Sprig DESKTOP image — the agent gets a visible, shared Linux desktop.
+#
+# Built ON TOP of buzz-sprig-dev rather than beside it, so the agent keeps its
+# entire toolchain and multicall surface (buzz, rg, tree, git signing) and gains
+# a screen. One container, one filesystem: a file the agent writes with its file
+# tools is the same file the browser can upload, and a download lands where the
+# agent can read it. A separate browser-appliance container cannot do that
+# without extra plumbing.
+#
+# The point of this image is the HANDOFF. The agent drives Chromium over the
+# DevTools protocol while a human watches the same X display over VNC and can
+# take the mouse and keyboard at any moment — to log into a site, solve a
+# CAPTCHA, or approve something. Both controllers act on ONE browser profile,
+# so a session the human authenticates stays authenticated for the agent.
+# Credentials the human types are never handed to the model: they go into the
+# browser's own password store, not into the agent's context.
+#
+# Layers of the stack, innermost first:
+#   Xvfb        headless X server (the screen that exists without a monitor)
+#   openbox     window manager (so Chromium has decorations and focus)
+#   chromium    the actual browser, with --remote-debugging-port for the agent
+#   x11vnc      exports that X display over RFB
+#   websockify  wraps RFB in a websocket so a browser tab can be the client
+#   novnc       the in-browser client itself, served as static files
+#
+# Everything is a Debian package — no third-party repos, no vendored binaries.
+
+ARG BASE=buzz-sprig-dev:latest
+FROM ${BASE}
+
+USER root
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    DISPLAY=:1 \
+    SCREEN_GEOMETRY=1920x1080x24 \
+    VNC_PORT=5901 \
+    DESKTOP_PORT=6080 \
+    CDP_PORT=9222
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      chromium \
+      dbus-x11 \
+      fonts-liberation \
+      fonts-noto-color-emoji \
+      novnc \
+      openbox \
+      procps \
+      websockify \
+      x11-utils \
+      x11vnc \
+      xdotool \
+      xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
+# Chromium's profile and the VNC state live under the agent's home, which is
+# where a volume gets mounted — that is what makes a login survive a restart.
+RUN install -d -o agent -g agent \
+      /home/agent/.config/chromium \
+      /home/agent/.vnc \
+      /home/agent/Downloads
+
+COPY --chmod=0755 scripts/sprig-desktop-entrypoint.sh /usr/local/bin/sprig-desktop-entrypoint
+COPY --chmod=0755 scripts/sprig-desktop-supervise.sh /usr/local/bin/sprig-desktop-supervise
+
+USER agent
+WORKDIR /home/agent
+
+# Same contract as the base image: the entrypoint execs the harness as PID 1
+# after starting the desktop in the background, so buzz-acp still receives
+# SIGTERM directly and the L1 signal obligation holds.
+ENTRYPOINT ["/usr/local/bin/sprig-desktop-entrypoint"]
