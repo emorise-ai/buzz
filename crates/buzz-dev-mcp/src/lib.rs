@@ -297,7 +297,13 @@ async fn serve_over_http(
         .ok()
         .filter(|s| !s.trim().is_empty());
 
-    let auth = serve_http::AuthConfig::new(owner, public_url.clone())?;
+    // The broker mints this per sandbox and returns it to the launcher. Absent
+    // when a sandbox was started without one, leaving NIP-98 as the only route.
+    let bearer_token = std::env::var("BUZZ_DEV_MCP_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+
+    let auth = serve_http::AuthConfig::new(owner, public_url.clone(), bearer_token.clone())?;
 
     // rmcp defaults to accepting loopback `Host` values only, guarding a
     // browser-driven DNS-rebinding attack against a server bound to localhost.
@@ -340,7 +346,8 @@ async fn serve_over_http(
     tracing::info!(
         %bind,
         pinned_origin = public_url.as_deref().unwrap_or("<any>"),
-        "serving tools over authenticated HTTP (NIP-98, single owner)"
+        bearer_token = bearer_token.is_some(),
+        "serving tools over authenticated HTTP (Bearer and/or NIP-98, single owner)"
     );
     axum::serve(listener, app).await?;
     Ok(())

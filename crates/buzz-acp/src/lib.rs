@@ -5058,11 +5058,29 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
     // per-request material is the NIP-98 signature, which the agent's HTTP
     // client attaches per call rather than carrying in static headers.
     if let Some(url) = config.mcp_url.as_deref().filter(|u| !u.trim().is_empty()) {
+        // The sandbox's bearer token, when the launcher was given one.
+        //
+        // This is what lets *any* MCP client drive the sandbox: the
+        // authorization spec expects `Authorization: Bearer`, and every client
+        // implements it. An agent that can sign NIP-98 (buzz-agent) does not
+        // need this and authenticates per request instead, so the token is
+        // optional rather than required.
+        let headers = std::env::var("BUZZ_ACP_MCP_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| {
+                vec![acp::HttpHeader {
+                    name: "Authorization".to_string(),
+                    value: format!("Bearer {}", t.trim()),
+                }]
+            })
+            .unwrap_or_default();
+
         return vec![McpServer::Http {
             transport: acp::HttpTransportTag::Http,
             name: "buzz-dev-mcp".to_string(),
             url: url.trim().to_string(),
-            headers: vec![],
+            headers,
         }];
     }
 

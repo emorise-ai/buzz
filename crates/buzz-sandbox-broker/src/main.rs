@@ -289,10 +289,27 @@ async fn create_sandbox(
     let cpuset = sandbox::assign_cpuset(state.host_cpus, limits.cpus, slot);
     let name = format!("buzz-sandbox-{}", short_id());
 
+    // A bearer token for the sandbox's tool port.
+    //
+    // The MCP authorization spec expects an HTTP tool server that authenticates
+    // to do so with `Authorization: Bearer`, and every MCP client implements
+    // that. NIP-98 is stronger — it signs each request's body — but it is a
+    // scheme the standard does not define, so a conforming client has no way to
+    // know it should sign, and simply connects unauthenticated. Both are
+    // accepted; this is the one that interoperates.
+    //
+    // Minted here rather than by the sandbox because the caller needs it in the
+    // create response: the sandbox has no channel back to whoever launched it.
+    // It is scoped to one sandbox and dies with it, so its blast radius is a
+    // container that is disposable by design.
+    let tools_token = mint_tools_token();
+    let mut env = req.env.clone();
+    env.insert("BUZZ_DEV_MCP_TOKEN".to_string(), tools_token.clone());
+
     let spec = sandbox::container_spec(sandbox::SpecInputs {
         image: &req.image,
         limits,
-        env: &req.env,
+        env: &env,
         owner: req.owner.as_deref(),
         expires_at,
         cpuset: &cpuset,
@@ -379,6 +396,10 @@ async fn create_sandbox(
             // needs remote tools should treat that as "not drivable" rather
             // than guessing an address.
             "tools_url": tools_url,
+            // Present it as `Authorization: Bearer <token>`. Returned only
+            // here, on the one response the launcher receives: the broker does
+            // not store it, and `GET /sandboxes` never discloses it.
+            "tools_token": tools_token,
         })),
     )
         .into_response()
@@ -609,6 +630,18 @@ fn is_safe_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+/// A bearer token for one sandbox's tool port.
+///
+/// 256 bits from the OS CSPRNG, hex-encoded. Long enough that guessing is not a
+/// threat model, and carrying no structure — it is compared for equality, never
+/// parsed, so there is nothing in it to get wrong.
+fn mint_tools_token() -> String {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    let bytes: [u8; 32] = rng.random();
+    hex::encode(bytes)
 }
 
 fn short_id() -> String {

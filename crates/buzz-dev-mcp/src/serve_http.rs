@@ -38,10 +38,30 @@ use axum::http::{HeaderMap, StatusCode};
 const MAX_AGE: Duration = Duration::from_secs(60);
 
 /// Everything the auth layer needs, shared with each request.
+///
+/// Two credentials are accepted, because the strongest scheme is not the one
+/// every client can speak:
+///
+/// * **`Bearer <token>`** — what the MCP authorization spec expects of an HTTP
+///   tool server that authenticates, and what every MCP client implements. The
+///   token is minted per sandbox by the broker and dies with it.
+/// * **`Nostr <event>`** — NIP-98, signing each request's method, path, and
+///   body. Strictly stronger, and free for `buzz-agent`, which already holds
+///   the key. But the standard defines no such scheme, so a conforming client
+///   has no way to know it should sign.
+///
+/// Accepting both means an off-spec client is not required, while a client that
+/// can sign gets the better guarantee.
 #[derive(Clone)]
 pub struct AuthConfig {
     /// The single pubkey permitted to drive these tools, hex-encoded.
     owner_pubkey: String,
+    /// Bearer token for this sandbox, if one was issued.
+    ///
+    /// Compared in constant time: a token is a secret compared for equality,
+    /// which is exactly the shape that leaks through timing if compared with
+    /// `==`.
+    bearer_token: Option<String>,
     /// Origins this server accepts a signature for, lowercased and without a
     /// trailing slash. Empty means "any origin", the sandbox default.
     ///
@@ -65,25 +85,106 @@ pub struct AuthConfig {
 
 impl AuthConfig {
     /// `public_url` pins the accepted origin; `None` accepts any.
-    pub fn new(owner_pubkey: String, public_url: Option<String>) -> Result<Self, String> {
+    /// `bearer_token` enables the spec-standard scheme; `None` leaves NIP-98 as
+    /// the only way in.
+    pub fn new(
+        owner_pubkey: String,
+        public_url: Option<String>,
+        bearer_token: Option<String>,
+    ) -> Result<Self, String> {
         let owner = owner_pubkey.trim().to_ascii_lowercase();
         // Parse rather than merely length-check: a malformed key here would
         // fail every comparison at runtime and look like a signing bug.
         nostr::PublicKey::parse(&owner)
             .map_err(|e| format!("owner is not a valid public key: {e}"))?;
+        let bearer_token = bearer_token
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        // A short token is almost always a placeholder that would otherwise
+        // become the sandbox's real credential.
+        if let Some(t) = &bearer_token {
+            if t.len() < 32 {
+                return Err(
+                    "the tools token is too short; it must be at least 32 characters".to_string(),
+                );
+            }
+        }
         Ok(Self {
             owner_pubkey: owner,
+            bearer_token,
             allowed_origins: public_url
                 .map(|u| vec![u.trim().trim_end_matches('/').to_ascii_lowercase()])
                 .unwrap_or_default(),
         })
     }
 
-    /// Verify one request. Returns the caller's pubkey on success.
+    /// Verify one request, by whichever scheme it presents.
     ///
-    /// Verification is entirely local — a signature check over the method, URL,
-    /// and body — so an unauthenticated caller never causes a network call.
+    /// Verification is entirely local, so an unauthenticated caller never
+    /// causes a network call.
     fn verify(
+        &self,
+        headers: &HeaderMap,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        origin: &str,
+    ) -> Result<String, String> {
+        let header = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .ok_or_else(|| self.challenge())?;
+
+        // `Bearer` first: it is the spec's scheme and the common case.
+        if let Some(token) = header.strip_prefix("Bearer ") {
+            return self.verify_bearer(token.trim());
+        }
+        if header.starts_with("Nostr ") {
+            return self.verify_nip98(headers, method, path, body, origin);
+        }
+        Err(self.challenge())
+    }
+
+    /// What to tell a caller that presented nothing usable.
+    ///
+    /// Names only the schemes actually available, so a sandbox without a token
+    /// does not advertise one.
+    fn challenge(&self) -> String {
+        if self.bearer_token.is_some() {
+            "missing credentials: present the sandbox's token as \
+             `Authorization: Bearer <token>`, or sign the request with the \
+             agent's Buzz identity (`Authorization: Nostr <base64 event>`)"
+                .to_string()
+        } else {
+            "missing NIP-98 auth: sign the request with the agent's Buzz \
+             identity (Authorization: Nostr <base64 event>)"
+                .to_string()
+        }
+    }
+
+    /// Compare the presented token with this sandbox's, in constant time.
+    fn verify_bearer(&self, presented: &str) -> Result<String, String> {
+        let expected = self
+            .bearer_token
+            .as_deref()
+            .ok_or("this sandbox was not issued a token; sign the request instead")?;
+
+        // Equal lengths first — `ct_eq` requires them, and a length mismatch is
+        // already a mismatch, so revealing it costs nothing.
+        let matches = presented.len() == expected.len() && {
+            use subtle::ConstantTimeEq;
+            presented.as_bytes().ct_eq(expected.as_bytes()).into()
+        };
+        if !matches {
+            return Err("the presented token is not this sandbox's".to_string());
+        }
+        // The token *is* the authorization: it was minted for this sandbox and
+        // handed only to its launcher, so presenting it stands for the owner.
+        Ok(self.owner_pubkey.clone())
+    }
+
+    fn verify_nip98(
         &self,
         headers: &HeaderMap,
         method: &str,
@@ -271,13 +372,13 @@ mod tests {
 
     #[test]
     fn rejects_a_malformed_owner_key() {
-        assert!(AuthConfig::new("not-a-key".into(), None).is_err());
+        assert!(AuthConfig::new("not-a-key".into(), None, None).is_err());
     }
 
     #[test]
     fn accepts_a_request_signed_by_the_owner() {
         let k = keys();
-        let cfg = AuthConfig::new(k.public_key().to_hex(), None).expect("config");
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None, None).expect("config");
         let body = br#"{"jsonrpc":"2.0"}"#;
         let auth = signed_header(&k, "POST", "http://127.0.0.1:9320/mcp", body);
         assert_eq!(
@@ -293,7 +394,7 @@ mod tests {
     fn rejects_a_valid_signature_from_another_identity() {
         let owner = keys();
         let intruder = keys();
-        let cfg = AuthConfig::new(owner.public_key().to_hex(), None).expect("config");
+        let cfg = AuthConfig::new(owner.public_key().to_hex(), None, None).expect("config");
         let body = br#"{"jsonrpc":"2.0"}"#;
         let auth = signed_header(&intruder, "POST", "http://127.0.0.1:9320/mcp", body);
         let err = cfg
@@ -308,7 +409,7 @@ mod tests {
     #[test]
     fn accepts_any_origin_when_none_is_pinned() {
         let k = keys();
-        let cfg = AuthConfig::new(k.public_key().to_hex(), None).expect("config");
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None, None).expect("config");
         for origin in [
             "http://172.16.240.2:9320",
             "http://sandbox-abc:9320",
@@ -328,7 +429,8 @@ mod tests {
     #[test]
     fn rejects_a_foreign_origin_when_one_is_pinned() {
         let k = keys();
-        let cfg = AuthConfig::new(k.public_key().to_hex(), Some(ORIGIN.into())).expect("config");
+        let cfg =
+            AuthConfig::new(k.public_key().to_hex(), Some(ORIGIN.into()), None).expect("config");
 
         let ok = signed_header(&k, "POST", &format!("{ORIGIN}/mcp"), b"");
         assert!(cfg
@@ -347,8 +449,12 @@ mod tests {
     #[test]
     fn pinned_origin_comparison_is_normalized() {
         let k = keys();
-        let cfg = AuthConfig::new(k.public_key().to_hex(), Some("HTTP://Host:9320/".into()))
-            .expect("cfg");
+        let cfg = AuthConfig::new(
+            k.public_key().to_hex(),
+            Some("HTTP://Host:9320/".into()),
+            None,
+        )
+        .expect("cfg");
         let origin = "http://host:9320";
         let auth = signed_header(&k, "POST", &format!("{origin}/mcp"), b"");
         assert!(cfg
@@ -379,10 +485,104 @@ mod tests {
         }
     }
 
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn bearer(v: &str) -> HeaderMap {
+        headers_with(&format!("Bearer {v}"))
+    }
+
+    /// The spec-standard path, and the one every MCP client can speak.
+    #[test]
+    fn accepts_the_sandbox_token_as_a_bearer() {
+        let k = keys();
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None, Some(TOKEN.into())).expect("cfg");
+        assert_eq!(
+            cfg.verify(&bearer(TOKEN), "POST", "/mcp", b"x", ORIGIN)
+                .expect("verify"),
+            k.public_key().to_hex(),
+            "a valid token stands for the owner"
+        );
+    }
+
+    #[test]
+    fn rejects_a_wrong_token() {
+        let k = keys();
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None, Some(TOKEN.into())).expect("cfg");
+        let wrong = "f".repeat(TOKEN.len());
+        assert!(cfg
+            .verify(&bearer(&wrong), "POST", "/mcp", b"", ORIGIN)
+            .is_err());
+    }
+
+    /// A truncated token must not pass on a prefix match.
+    #[test]
+    fn rejects_a_truncated_token() {
+        let k = keys();
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None, Some(TOKEN.into())).expect("cfg");
+        assert!(cfg
+            .verify(
+                &bearer(&TOKEN[..TOKEN.len() - 1]),
+                "POST",
+                "/mcp",
+                b"",
+                ORIGIN
+            )
+            .is_err());
+    }
+
+    /// A sandbox with no token must not accept an empty or any bearer.
+    #[test]
+    fn refuses_bearer_when_no_token_was_issued() {
+        let k = keys();
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None, None).expect("cfg");
+        let err = cfg
+            .verify(&bearer(TOKEN), "POST", "/mcp", b"", ORIGIN)
+            .expect_err("must refuse");
+        assert!(err.contains("not issued a token"), "unexpected: {err}");
+    }
+
+    /// A placeholder-length token would otherwise become a real credential.
+    #[test]
+    fn refuses_to_start_with_a_short_token() {
+        let k = keys();
+        assert!(AuthConfig::new(k.public_key().to_hex(), None, Some("short".into())).is_err());
+    }
+
+    /// Both schemes must work on the same server: buzz-agent signs, everything
+    /// else presents the token.
+    #[test]
+    fn accepts_either_scheme_when_both_are_available() {
+        let k = keys();
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None, Some(TOKEN.into())).expect("cfg");
+        assert!(cfg
+            .verify(&bearer(TOKEN), "POST", "/mcp", b"", ORIGIN)
+            .is_ok());
+        let signed = signed_header(&k, "POST", &format!("{ORIGIN}/mcp"), b"");
+        assert!(cfg
+            .verify(&headers_with(&signed), "POST", "/mcp", b"", ORIGIN)
+            .is_ok());
+    }
+
+    /// An unknown scheme must be refused, not silently treated as one we know.
+    #[test]
+    fn rejects_an_unknown_auth_scheme() {
+        let k = keys();
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None, Some(TOKEN.into())).expect("cfg");
+        assert!(cfg
+            .verify(
+                &headers_with(&format!("Basic {TOKEN}")),
+                "POST",
+                "/mcp",
+                b"",
+                ORIGIN
+            )
+            .is_err());
+    }
+
     #[test]
     fn rejects_a_missing_header() {
         let k = keys();
-        let cfg = AuthConfig::new(k.public_key().to_hex(), None).expect("config");
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None, None).expect("config");
         assert!(cfg
             .verify(&HeaderMap::new(), "POST", "/mcp", b"", ORIGIN)
             .is_err());
@@ -393,7 +593,7 @@ mod tests {
     #[test]
     fn rejects_a_signature_bound_to_a_different_path() {
         let k = keys();
-        let cfg = AuthConfig::new(k.public_key().to_hex(), None).expect("config");
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None, None).expect("config");
         let auth = signed_header(&k, "POST", "http://127.0.0.1:9320/mcp", b"");
         assert!(cfg
             .verify(&headers_with(&auth), "POST", "/other", b"", ORIGIN)
@@ -405,7 +605,7 @@ mod tests {
     #[test]
     fn rejects_a_tampered_body() {
         let k = keys();
-        let cfg = AuthConfig::new(k.public_key().to_hex(), None).expect("config");
+        let cfg = AuthConfig::new(k.public_key().to_hex(), None, None).expect("config");
         let auth = signed_header(&k, "POST", "http://127.0.0.1:9320/mcp", b"original");
         assert!(cfg
             .verify(&headers_with(&auth), "POST", "/mcp", b"tampered", ORIGIN)

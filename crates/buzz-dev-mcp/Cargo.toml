@@ -49,6 +49,9 @@ buzz-core = { workspace = true }
 axum = { workspace = true }
 buzz-auth = { workspace = true }
 chrono = { workspace = true }
+# Constant-time token comparison: a bearer token is a secret compared for
+# equality, the exact shape that leaks through timing with `==`.
+subtle = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 
