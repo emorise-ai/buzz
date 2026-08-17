@@ -41,6 +41,12 @@ export const KIND_HUDDLE_STARTED = 48100;
 export const KIND_HUDDLE_PARTICIPANT_JOINED = 48101;
 export const KIND_HUDDLE_PARTICIPANT_LEFT = 48102;
 export const KIND_HUDDLE_ENDED = 48103;
+// Sandboxes (48200–48299): a sandbox is a remote computer (desktop + browser)
+// an agent drives. 48200 announces one exists with its budget, expiry, and a
+// URL to open the live screen; 48201 announces it is gone. Mirrors
+// buzz-core/src/kind.rs.
+export const KIND_SANDBOX_CREATED = 48200;
+export const KIND_SANDBOX_DESTROYED = 48201;
 // NIP-78 application-specific data. All use kind 30078; the relay
 // differentiates them by d-tag ("read-state:<slotId>", "channel-sections", "channel-mutes", "channel-stars", "channel-sort").
 export const KIND_READ_STATE = 30078;

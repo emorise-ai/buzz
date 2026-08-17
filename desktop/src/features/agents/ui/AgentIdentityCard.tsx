@@ -9,6 +9,8 @@ type AgentIdentityCardProps = {
   ariaLabel: string;
   avatar?: ReactNode;
   avatarUrl?: string | null;
+  /** Optional badge pinned to the top-left corner (e.g. a "has a computer" glyph). */
+  cornerBadge?: ReactNode;
   dataTestId: string;
   label: string;
   modelLabel?: string | null;
@@ -22,6 +24,7 @@ export function AgentIdentityCard({
   ariaLabel,
   avatar,
   avatarUrl,
+  cornerBadge,
   dataTestId,
   label,
   modelLabel,
@@ -63,6 +66,12 @@ export function AgentIdentityCard({
             ))}
         </div>
       </div>
+
+      {cornerBadge ? (
+        <div className="pointer-events-auto absolute top-3 left-3 z-40">
+          {cornerBadge}
+        </div>
+      ) : null}
 
       {actions ? (
         <div className="absolute top-3 right-3 z-40">{actions}</div>

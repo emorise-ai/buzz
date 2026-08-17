@@ -1189,6 +1189,24 @@ declare global {
       pubkey?: string;
       threadHeadId?: string;
     }) => RelayEvent;
+    /**
+     * Emit a sandbox lifecycle event (kind:48200 created / 48201 destroyed) to
+     * any live owner-scoped subscription, so the agent-card sandbox preview can
+     * be exercised in specs. `ownerPubkey` is the agent the sandbox belongs to
+     * (the `#p` value the card filters on).
+     */
+    __BUZZ_E2E_EMIT_MOCK_SANDBOX__?: (input: {
+      ownerPubkey: string;
+      destroyed?: boolean;
+      sandboxId?: string;
+      name?: string;
+      image?: string;
+      cpus?: number;
+      memoryMb?: number;
+      expiresAt?: number;
+      viewerUrl?: string;
+      reason?: string;
+    }) => RelayEvent;
     __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: (
       command: string,
       payload?: Record<string, unknown>,
@@ -4277,6 +4295,26 @@ function emitMockLiveEvent(channelId: string, event: RelayEvent) {
       if (
         (subscription.channelId === channelId ||
           subscription.channelId === GLOBAL_MOCK_SUBSCRIPTION) &&
+        (!subscription.kinds || subscription.kinds.includes(event.kind))
+      ) {
+        sendWsText(socket.handler, ["EVENT", subId, event]);
+      }
+    }
+  }
+}
+
+/**
+ * Dispatch an event to every live subscription whose `#p` owner filter contains
+ * `ownerPubkey` and whose kind filter admits the event. The owner-scoped analog
+ * of `emitMockLiveEvent` — used for sandbox lifecycle events, which are keyed by
+ * the owning agent, not a channel.
+ */
+function emitMockOwnerLiveEvent(ownerPubkey: string, event: RelayEvent) {
+  const owner = ownerPubkey.toLowerCase();
+  for (const socket of mockSockets.values()) {
+    for (const [subId, subscription] of socket.subscriptions) {
+      if (
+        subscription.ownerPubkeys.some((p) => p.toLowerCase() === owner) &&
         (!subscription.kinds || subscription.kinds.includes(event.kind))
       ) {
         sendWsText(socket.handler, ["EVENT", subId, event]);
@@ -10336,6 +10374,43 @@ export function maybeInstallE2eTauriMocks() {
     );
   };
   window.__BUZZ_E2E_PREPEND_MOCK_HISTORY__ = prependMockHistory;
+  window.__BUZZ_E2E_EMIT_MOCK_SANDBOX__ = ({
+    ownerPubkey,
+    destroyed,
+    sandboxId = "mock-sandbox",
+    name = "buzz-sandbox-mock",
+    image = "sprig-desktop",
+    cpus = 2,
+    memoryMb = 4096,
+    expiresAt = Math.floor(Date.now() / 1000) + 3600,
+    viewerUrl,
+    reason = "destroyed",
+  }) => {
+    const tags: string[][] = destroyed
+      ? [
+          ["d", sandboxId],
+          ["reason", reason],
+          ["p", ownerPubkey],
+        ]
+      : [
+          ["d", sandboxId],
+          ["name", name],
+          ["image", image],
+          ["cpus", String(cpus)],
+          ["memory_mb", String(memoryMb)],
+          ["expires_at", String(expiresAt)],
+          ["p", ownerPubkey],
+          ...(viewerUrl ? [["viewer", viewerUrl]] : []),
+        ];
+    const event = createMockEvent(
+      destroyed ? 48201 : 48200,
+      "",
+      tags,
+      "broker",
+    );
+    emitMockOwnerLiveEvent(ownerPubkey, event);
+    return event;
+  };
   window.__BUZZ_E2E_EMIT_MOCK_TYPING__ = ({
     channelName,
     createdAt,
@@ -11526,6 +11601,13 @@ export function maybeInstallE2eTauriMocks() {
           },
           activeConfig,
         );
+      case "mint_sandbox_viewer_url": {
+        // The real command signs a NIP-98 token; the mock just echoes the URL
+        // with a placeholder token so the viewer dialog can render in specs.
+        const url = (payload as { viewerUrl?: string } | null)?.viewerUrl ?? "";
+        const separator = url.includes("?") ? "&" : "?";
+        return `${url}${separator}t=mock-token`;
+      }
       case "get_os_idle_seconds":
         // e2e runs headless with no OS idle API; the presence hook falls back
         // to in-app activity tracking.

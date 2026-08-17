@@ -54,6 +54,7 @@ export default defineConfig({
         "**/voice-settings.spec.ts",
         "**/agent-readiness-screenshots.spec.ts",
         "**/agent-error-state-screenshots.spec.ts",
+        "**/sandbox-preview-screenshots.spec.ts",
         "**/edit-agent.spec.ts",
         "**/doctor-cta-screenshots.spec.ts",
         "**/pubkey-display-screenshots.spec.ts",

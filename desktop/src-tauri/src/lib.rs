@@ -34,6 +34,7 @@ mod ptt_shortcut;
 mod relay;
 mod relay_admission;
 mod reset;
+mod sandbox_viewer;
 mod secret_store;
 mod shutdown;
 mod templates;
@@ -532,44 +533,8 @@ pub fn run() {
                     .store(true, Ordering::Release);
             }
 
-            // Periodic sweep: reap orphaned agents from dead instances every 60s.
-            // Catches agents that escaped both the Justfile trap and boot-time
-            // reaping (e.g. a `just staging` Ctrl+C leak that only gets collected
-            // by a different instance's periodic sweep).
-            let sweep_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                use std::collections::HashSet;
-                use std::time::Duration;
-                use tauri::Manager;
-                let instance_id = managed_agents::current_instance_id(&sweep_handle);
-                let state = sweep_handle.state::<AppState>();
-                // Two-tick grace: only reap same-instance orphans seen on two
-                // consecutive sweeps. Prevents killing a legitimately-starting
-                // agent that spawned between the skip-list snapshot and the scan.
-                let mut prev_orphans: HashSet<u32> = HashSet::new();
-                loop {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    // Collect PIDs of our own live agents to avoid killing them.
-                    let skip_pids: Vec<u32> = state
-                        .managed_agent_processes
-                        .lock()
-                        .map(|runtimes| runtimes.values().map(|rt| rt.child.id()).collect())
-                        .unwrap_or_default();
-                    let prev = prev_orphans.clone();
-                    let inst = instance_id.clone();
-                    // Run the blocking syscall work off the async executor.
-                    let new_orphans = tauri::async_runtime::spawn_blocking(move || {
-                        let orphans = managed_agents::sweep_system_agent_processes_with_grace(
-                            &inst, &skip_pids, &prev,
-                        );
-                        managed_agents::reap_dead_instance_agents(&inst, &skip_pids);
-                        orphans
-                    })
-                    .await
-                    .unwrap_or_default();
-                    prev_orphans = new_orphans;
-                }
-            });
+            // Periodic orphaned-agent sweep — see `spawn_periodic_orphan_sweep`.
+            managed_agents::spawn_periodic_orphan_sweep(app.handle().clone());
 
             // Drain events the retention store flagged `pending_sync` (UI
             // create/edit, delete tombstones, launch reconcile) to the relay.
@@ -609,6 +574,17 @@ pub fn run() {
             terminal_runtime::terminal_ack,
             terminal_runtime::terminal_viewport_ready,
             terminal_runtime::terminal_focus,
+            sandbox_viewer::mint_sandbox_viewer_url,
+            sandbox_viewer::create_agent_sandbox,
+            sandbox_viewer::destroy_agent_sandbox,
+            sandbox_viewer::sandbox_fs_list,
+            sandbox_viewer::sandbox_fs_download,
+            sandbox_viewer::sandbox_fs_upload,
+            sandbox_viewer::sandbox_fs_rename,
+            sandbox_viewer::sandbox_fs_delete,
+            sandbox_viewer::sandbox_launch_app,
+            sandbox_viewer::sandbox_list_windows,
+            sandbox_viewer::sandbox_window_action,
             take_pending_community_deep_link,
             acknowledge_pending_community_deep_link,
             take_pending_navigation_deep_link,

@@ -8,6 +8,7 @@ import {
 } from "@/features/agents/lib/managedAgentControlActions";
 import { RestartDiffBadge } from "@/features/agents/ui/RestartDiffBadge";
 import { AgentConfigPanel } from "@/features/agents/ui/AgentConfigPanel";
+import { AgentSandboxPreview } from "@/features/agents/sandbox/AgentSandboxPreview";
 import type { IdentityArchiveActions } from "@/features/identity-archive/hooks";
 import { getPresenceLabel } from "@/features/presence/lib/presence";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
@@ -471,6 +472,8 @@ export function ProfileSummaryView({
           restartDiff={managedAgent.restartDiff}
         />
       ) : null}
+
+      {isBot && pubkey ? <AgentSandboxPreview agentPubkey={pubkey} /> : null}
 
       {showTabSection ? (
         <section className={cn(isBot ? "space-y-0" : "space-y-3")}>

@@ -48,8 +48,7 @@ mod orphan_sweep;
 #[cfg(target_os = "macos")]
 use orphan_sweep::proc_pidinfo;
 pub(crate) use orphan_sweep::{
-    sweep_orphaned_agent_processes, sweep_system_agent_processes,
-    sweep_system_agent_processes_with_grace,
+    spawn_periodic_orphan_sweep, sweep_orphaned_agent_processes, sweep_system_agent_processes,
 };
 #[cfg(target_os = "macos")]
 use orphan_sweep::{BSDInfo, PROC_PIDTBSDINFO};
