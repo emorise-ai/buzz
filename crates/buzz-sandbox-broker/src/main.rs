@@ -15,12 +15,13 @@
 mod docker;
 mod events;
 mod identity;
+mod proxy;
 mod sandbox;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, RawQuery, Request, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use sandbox::{CreateRequest, Limits, SandboxSummary};
 use std::sync::Arc;
@@ -33,6 +34,13 @@ use tracing::{error, info, warn};
 /// discover the port would need a second round trip to learn it.
 const TOOLS_PORT: u16 = 9320;
 
+/// Port the sandbox desktop (noVNC over websockify) serves on inside the
+/// container. Matches `DESKTOP_PORT` in `Dockerfile.sprig-desktop`.
+const DESKTOP_PORT: u16 = 6080;
+
+/// Port the sandbox terminal (ttyd) serves on inside the container.
+const TERMINAL_PORT: u16 = 7681;
+
 #[derive(Clone)]
 struct AppState {
     docker: docker::Docker,
@@ -43,9 +51,14 @@ struct AppState {
     /// Announces sandbox lifecycle to the relay so Buzz can show that an agent
     /// has a computer. Absent when no relay is configured.
     publisher: Option<Arc<events::Publisher>>,
-    /// Public base URL a human uses to open a sandbox's live desktop. Absent
-    /// when no viewer is exposed, in which case events carry no viewer link
-    /// rather than an address that would not resolve.
+    /// Public base URL to advertise in a sandbox's `viewer` event tag, e.g.
+    /// `https://sandbox.example.com` or `https://relay.example.com/sandbox-viewer`.
+    /// Only the *published link* depends on this — token verification derives the
+    /// origin from the request's forwarded host (`public_base_from_request`), so
+    /// access control does not depend on this being set correctly. It exists
+    /// because the create call arrives over a private tunnel with no public host
+    /// to read. Absent when no viewer is exposed, in which case events carry no
+    /// viewer link rather than an address that would not resolve.
     viewer_base: Option<Arc<String>>,
     allowed_images: Arc<Vec<String>>,
     network: Arc<String>,
@@ -54,6 +67,33 @@ struct AppState {
     disk_limit: Option<Arc<str>>,
     host_cpus: usize,
     slot: Arc<std::sync::atomic::AtomicUsize>,
+    /// Live expiry per container id — the authority the reaper reads.
+    ///
+    /// Docker labels are immutable on a running container, so an extend cannot
+    /// rewrite `com.buzz.sandbox.expires-at`. The label stays as the *initial*
+    /// expiry and crash-recovery seed; this map is the live truth. Absent
+    /// entries fall back to the label (and, at startup, to the latest 48200 on
+    /// the relay — the only record that survives a broker restart after an
+    /// extend). See `seed_expiries`.
+    expiry: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
+}
+
+impl AppState {
+    fn set_expiry(&self, id: &str, expires_at: i64) {
+        if let Ok(mut map) = self.expiry.lock() {
+            map.insert(id.to_string(), expires_at);
+        }
+    }
+
+    fn forget_expiry(&self, id: &str) {
+        if let Ok(mut map) = self.expiry.lock() {
+            map.remove(id);
+        }
+    }
+
+    fn expiry_of(&self, id: &str) -> Option<i64> {
+        self.expiry.lock().ok()?.get(id).copied()
+    }
 }
 
 #[tokio::main]
@@ -77,8 +117,11 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    // The exact origin clients call, because NIP-98 signs the full URL and a
-    // mismatch rejects every otherwise-valid request.
+    // The exact origin(s) clients call, because NIP-98 signs the full URL and
+    // a mismatch rejects every otherwise-valid request. Comma-separated: the
+    // broker legitimately answers on several addresses at once (loopback
+    // tunnel, its container DNS name on the sandbox network, a public
+    // reverse-proxy path).
     let public_url = std::env::var("BUZZ_SANDBOX_PUBLIC_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:9310".to_string());
 
@@ -163,16 +206,13 @@ async fn main() {
             .map(|s| Arc::from(s.trim())),
         host_cpus,
         slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        expiry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
+    seed_expiries(&state).await;
     tokio::spawn(reaper(state.clone()));
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/sandboxes", get(list_sandboxes).post(create_sandbox))
-        .route("/sandboxes/{id}", get(get_sandbox).delete(delete_sandbox))
-        .route("/sandboxes/{id}/stop", post(delete_sandbox))
-        .with_state(state);
+    let app = build_router(state);
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
         Ok(l) => l,
@@ -186,6 +226,57 @@ async fn main() {
         error!(error = %e, "server stopped");
         std::process::exit(1);
     }
+}
+
+/// Build the broker's route table.
+///
+/// Split out from `main` so a test can drive the real router (via
+/// `tower::ServiceExt::oneshot`) without binding a socket — router-level
+/// regressions (a route that 404s before ever reaching its handler) are
+/// invisible to a handler-level unit test.
+fn build_router(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/sandboxes", get(list_sandboxes).post(create_sandbox))
+        .route("/sandboxes/{id}", get(get_sandbox).delete(delete_sandbox))
+        .route("/sandboxes/{id}/stop", post(delete_sandbox))
+        .route("/sandboxes/{id}/extend", post(extend_sandbox))
+        // The live desktop: a signed-token-gated reverse proxy to the sandbox's
+        // in-container noVNC server. Two routes because the noVNC client fetches
+        // sibling assets (`vnc.html`, `websockify`, …) under the same prefix.
+        .route("/sandboxes/{id}/desktop", any(desktop))
+        // The token embedded as a path segment: every relative asset the noVNC
+        // page fetches — and its websockify WebSocket — resolves under this
+        // prefix and so carries the token without any cookie or header games.
+        // The bare `/desktop` entry above verifies the query token and
+        // redirects here.
+        .route("/sandboxes/{id}/desktop/t/{token}/{*rest}", any(desktop))
+        // The live terminal: same signed-token gate and token-segment shape as
+        // the desktop, proxied to ttyd instead of websockify.
+        .route("/sandboxes/{id}/terminal", any(terminal))
+        // ttyd's own index lives at exactly `/`, so the redirect below lands
+        // on the bare trailing-slash form — unlike the desktop, which always
+        // redirects to a non-empty `view` tail. axum's `{*rest}` wildcard
+        // does not match a request with nothing after the final `/`, so that
+        // exact URL needs its own literal route (no `rest` param; the shared
+        // handler already treats an absent `rest` as empty, same as the
+        // proxy treating an empty `rest` as `/`).
+        .route("/sandboxes/{id}/terminal/t/{token}/", any(terminal))
+        .route("/sandboxes/{id}/terminal/t/{token}/{*rest}", any(terminal))
+        // The file API: NIP-98 header auth (not a viewer token — these are
+        // ordinary agent-facing calls made by whoever holds a Buzz identity,
+        // the same as create/delete/extend above).
+        .route("/sandboxes/{id}/fs", get(fs_list).delete(fs_delete))
+        .route("/sandboxes/{id}/fs/file", get(fs_download).put(fs_upload))
+        .route("/sandboxes/{id}/fs/rename", post(fs_rename))
+        // Opens a real window on the sandbox desktop for one of a fixed set
+        // of apps — the dock's icons drive this instead of switching a flat
+        // view, so multiple terminals/file windows can coexist and the
+        // window manager handles drag/arrange.
+        .route("/sandboxes/{id}/launch", post(launch_app))
+        .route("/sandboxes/{id}/windows", get(windows_list))
+        .route("/sandboxes/{id}/windows/action", post(window_action))
+        .with_state(state)
 }
 
 /// Unauthenticated: it reports only that the process is up, so a health probe
@@ -328,6 +419,7 @@ async fn create_sandbox(
         let _ = state.docker.remove_container(&id).await;
         return internal(format!("container created but would not start: {e}"));
     }
+    state.set_expiry(&id, expires_at);
 
     // Where the agent's brain reaches this sandbox's tools.
     //
@@ -405,6 +497,44 @@ async fn create_sandbox(
         .into_response()
 }
 
+/// Reconstruct the broker's public origin from a reverse proxy's forwarded
+/// headers, the way the relay derives its host from the request rather than a
+/// baked-in URL. Returns e.g. `https://sandbox.example.com` or, when the viewer
+/// is mounted under a stripped path prefix, `https://relay.example.com/sandbox-viewer`.
+///
+/// `X-Forwarded-Prefix` is honored so the signed URL matches whether the viewer
+/// is served at a hostname's root (its own machine) or a sub-path (sharing the
+/// relay's host). Returns `None` when no forwarded host is present — a request
+/// that reached the broker directly, with no proxy in front to trust.
+fn public_base_from_request(headers: &axum::http::HeaderMap) -> Option<String> {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+
+    // A forwarded host is the signal that a trusted proxy set these; the bare
+    // Host header on a direct request is not something to sign against.
+    let host = header("x-forwarded-host")?.split(',').next()?.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let proto = header("x-forwarded-proto")
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("https");
+    // A proxy reports a WebSocket upgrade as ws/wss, but the token was signed
+    // over the https page URL — same origin, different scheme spelling. Fold
+    // them together or every websockify handshake 401s on a "URL mismatch".
+    let proto = match proto {
+        "wss" => "https",
+        "ws" => "http",
+        p => p,
+    };
+    let prefix = header("x-forwarded-prefix")
+        .map(|p| p.trim_end_matches('/'))
+        .unwrap_or("");
+
+    Some(format!("{proto}://{host}{prefix}"))
+}
+
 /// The sandbox's IP on its own bridge network.
 ///
 /// Prefers the network the broker places sandboxes on. Falls back to any
@@ -436,7 +566,18 @@ async fn list_sandboxes(
     }
     match state.docker.list_managed(sandbox::MANAGED_LABEL).await {
         Ok(list) => {
-            let out: Vec<SandboxSummary> = list.iter().map(summarize).collect();
+            let out: Vec<SandboxSummary> = list
+                .iter()
+                .map(|c| {
+                    let mut s = summarize(c);
+                    // Live expiry wins over the (immutable) label after an
+                    // extend — same rule as `get_sandbox`.
+                    if let Some(live) = state.expiry_of(&s.id) {
+                        s.expires_at = Some(live);
+                    }
+                    s
+                })
+                .collect();
             (StatusCode::OK, Json(out)).into_response()
         }
         Err(e) => internal(e),
@@ -473,10 +614,19 @@ async fn get_sandbox(
                     "state": v.pointer("/State/Status"),
                     "started_at": v.pointer("/State/StartedAt"),
                     "image": v.pointer("/Config/Image"),
+                    // Live state first: after an extend the label still holds
+                    // the initial expiry, and reporting that would show a
+                    // countdown the reaper no longer honors. The map keys on
+                    // the full container id, not whatever alias the caller
+                    // used, so the lookup goes through the inspected Id.
                     "expires_at": v
-                        .get("Config")
-                        .and_then(|c| c.get("Labels"))
-                        .and_then(|l| l.get(sandbox::LABEL_EXPIRES)),
+                        .get("Id")
+                        .and_then(|x| x.as_str())
+                        .and_then(|full| state.expiry_of(full))
+                        .or_else(|| {
+                            inspect_label(&v, sandbox::LABEL_EXPIRES)
+                                .and_then(|s| s.parse::<i64>().ok())
+                        }),
                 })),
             )
                 .into_response()
@@ -488,6 +638,228 @@ async fn get_sandbox(
             .into_response(),
         Err(e) => internal(e),
     }
+}
+
+/// Path params of a `/sandboxes/{id}/{surface}[/t/{token}/{*rest}]` route,
+/// pulled out positionally since axum hands wildcard routes a flat list.
+struct SurfaceParams {
+    id: String,
+    path_token: Option<String>,
+    rest: String,
+}
+
+fn surface_params(params: &[(String, String)]) -> SurfaceParams {
+    SurfaceParams {
+        id: params.first().map(|(_, v)| v.clone()).unwrap_or_default(),
+        path_token: params
+            .iter()
+            .find(|(k, _)| k == "token")
+            .map(|(_, v)| v.clone()),
+        rest: params
+            .iter()
+            .find(|(k, _)| k == "rest")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default(),
+    }
+}
+
+/// Shared gate for a signed-token-proxied surface (desktop, terminal): checks
+/// the id, resolves the token from either the path segment or the `?t=`
+/// query, verifies it against `{public_base}/sandboxes/{id}/{surface}` (the
+/// one bare link Buzz is ever handed), and checks membership.
+///
+/// Returns the caller's pubkey and the resolved public base on success —
+/// callers need the base again to build the redirect location.
+async fn verify_surface_token(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    surface: &str,
+    id: &str,
+    path_token: &Option<String>,
+    query: &std::collections::HashMap<String, String>,
+) -> Result<(String, String), axum::response::Response> {
+    if !is_safe_id(id) {
+        return Err(bad_request("malformed sandbox id"));
+    }
+
+    let entry_token = query.get("t").cloned();
+    let Some(token) = path_token.clone().or(entry_token) else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            format!("missing viewer token — open the {surface} from Buzz"),
+        )
+            .into_response());
+    };
+
+    // Host-derived, like the relay: the public origin is whatever host the
+    // request arrived on (from the reverse proxy's forwarded headers), not a
+    // baked-in URL. The configured base is only a fallback for a request that
+    // reaches the broker directly (no proxy), e.g. a local tunnel in dev.
+    let Some(public_base) = public_base_from_request(headers)
+        .or_else(|| state.viewer_base.as_ref().map(|b| b.to_string()))
+    else {
+        return Err((StatusCode::NOT_FOUND, "viewer host is not known").into_response());
+    };
+
+    // The app signed a GET over the exact URL the broker published, which is
+    // always the bare surface path (the app is handed one link, not the asset
+    // URLs the client fetches afterwards). Verify against that.
+    let signed_url = format!("{public_base}/sandboxes/{id}/{surface}");
+    let caller = state
+        .verifier
+        .verify_token(&token, &signed_url)
+        .map_err(|e| (StatusCode::UNAUTHORIZED, e).into_response())?;
+    if !state.verifier.is_member(&caller).await {
+        return Err((StatusCode::FORBIDDEN, "not a member of this Buzz community").into_response());
+    }
+
+    Ok((caller, public_base))
+}
+
+/// The sandbox's address on its own bridge network, or a `NOT_FOUND` /
+/// `BAD_GATEWAY` response when it cannot be resolved — shared by every proxy
+/// surface (desktop, terminal) so each just answers "what port".
+async fn resolve_sandbox_ip(
+    state: &AppState,
+    id: &str,
+) -> Result<String, axum::response::Response> {
+    let inspect = match state.docker.inspect_container(id).await {
+        Ok(v) if is_managed(&v) => v,
+        _ => return Err((StatusCode::NOT_FOUND, "no such sandbox").into_response()),
+    };
+    sandbox_ip(&inspect, &state.network)
+        .ok_or_else(|| (StatusCode::BAD_GATEWAY, "sandbox has no address").into_response())
+}
+
+/// The live desktop, gated by a signed token. Two routes land here:
+///
+/// * `/desktop?t=<token>` — the single link Buzz is handed. Verifies the query
+///   token, then redirects to the noVNC client *under a token path segment*
+///   (`/desktop/t/<token>/vnc.html?autoconnect=…`). The redirect is what makes
+///   the rest of the page work: a browser does not carry a query string over
+///   to relative asset fetches or a WebSocket, but every URL under the token
+///   segment inherits it by construction.
+/// * `/desktop/t/<token>/{rest}` — the client's assets and its `websockify`
+///   WebSocket. Verifies the same token (still signed over the bare desktop
+///   URL) and hands the request to the reverse proxy.
+async fn desktop(
+    State(state): State<AppState>,
+    Path(params): Path<Vec<(String, String)>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    req: Request,
+) -> axum::response::Response {
+    let SurfaceParams {
+        id,
+        path_token,
+        rest,
+    } = surface_params(&params);
+
+    let (_caller, _public_base) = match verify_surface_token(
+        &state,
+        req.headers(),
+        "desktop",
+        &id,
+        &path_token,
+        &query,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    let Some(token) = path_token.clone().or_else(|| query.get("t").cloned()) else {
+        return (StatusCode::UNAUTHORIZED, "missing viewer token").into_response();
+    };
+
+    // Bare entry: bounce into the token-segment world, straight to the noVNC
+    // client with autoconnect. `path` is how the client finds its websockify
+    // WebSocket — the same token-carrying prefix, expressed from the host
+    // root without a leading slash (noVNC joins it onto ws(s)://host/).
+    if path_token.is_none() {
+        let prefix = req
+            .headers()
+            .get("x-forwarded-prefix")
+            .and_then(|v| v.to_str().ok())
+            .map(|p| p.trim_end_matches('/'))
+            .unwrap_or("");
+        let location = format!("{prefix}/sandboxes/{id}/desktop/t/{token}/view");
+        return axum::response::Redirect::temporary(&location).into_response();
+    }
+
+    // Buzz's own viewer page: the live screen and nothing else. Serving our
+    // own page instead of the stock noVNC UI removes its branding, connect
+    // dialog, and control bar — the engine (core/rfb.js, proxied statically
+    // from the sandbox like any other asset) is invisible.
+    if rest == "view" {
+        return (
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            VIEWER_PAGE,
+        )
+            .into_response();
+    }
+
+    // Resolve the sandbox's address on its own network. A stopped or reaped
+    // sandbox has none — say so rather than proxying into the void.
+    let ip = match resolve_sandbox_ip(&state, &id).await {
+        Ok(ip) => ip,
+        Err(response) => return response,
+    };
+
+    proxy::desktop_proxy(&format!("{ip}:{DESKTOP_PORT}"), &rest, req).await
+}
+
+/// The live terminal, gated the same way as the desktop: a signed `?t=` token
+/// on the bare entry, redirecting into a token-path-segment world that the
+/// proxy then tunnels straight to ttyd.
+///
+/// Unlike the desktop, ttyd serves its own index page at `/` (there is no
+/// Buzz-branded wrapper to inject), so the entry redirects to the bare token
+/// prefix with a trailing slash rather than to a `view` sub-path — ttyd's
+/// relative asset fetches (and its `/ws` WebSocket) resolve from there.
+async fn terminal(
+    State(state): State<AppState>,
+    Path(params): Path<Vec<(String, String)>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    req: Request,
+) -> axum::response::Response {
+    let SurfaceParams {
+        id,
+        path_token,
+        rest,
+    } = surface_params(&params);
+
+    let (_caller, _public_base) =
+        match verify_surface_token(&state, req.headers(), "terminal", &id, &path_token, &query)
+            .await
+        {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
+    let Some(token) = path_token.clone().or_else(|| query.get("t").cloned()) else {
+        return (StatusCode::UNAUTHORIZED, "missing viewer token").into_response();
+    };
+
+    if path_token.is_none() {
+        let prefix = req
+            .headers()
+            .get("x-forwarded-prefix")
+            .and_then(|v| v.to_str().ok())
+            .map(|p| p.trim_end_matches('/'))
+            .unwrap_or("");
+        // Trailing slash: ttyd serves its index at exactly `/`, and every
+        // relative asset/WebSocket URL it emits is resolved against that.
+        let location = format!("{prefix}/sandboxes/{id}/terminal/t/{token}/");
+        return axum::response::Redirect::temporary(&location).into_response();
+    }
+
+    let ip = match resolve_sandbox_ip(&state, &id).await {
+        Ok(ip) => ip,
+        Err(response) => return response,
+    };
+
+    // Empty `rest` under the token prefix is ttyd's own root, not this
+    // broker's — the proxy already treats an empty path as "/".
+    proxy::desktop_proxy(&format!("{ip}:{TERMINAL_PORT}"), &rest, req).await
 }
 
 async fn delete_sandbox(
@@ -505,7 +877,7 @@ async fn delete_sandbox(
     }
     // Refuse to remove anything this broker did not create, even if the caller
     // knows its id.
-    match state.docker.inspect_container(&id).await {
+    let owner = match state.docker.inspect_container(&id).await {
         Ok(v) if !is_managed(&v) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -513,22 +885,876 @@ async fn delete_sandbox(
             )
                 .into_response()
         }
-        Ok(_) => {}
+        Ok(v) => {
+            // Track state by the full container id even when the caller used a
+            // name or prefix alias.
+            if let Some(full) = v.get("Id").and_then(|x| x.as_str()) {
+                state.forget_expiry(full);
+            }
+            inspect_label(&v, sandbox::LABEL_OWNER)
+        }
         Err(e) if e.contains("404") || e.to_lowercase().contains("no such container") => {
             // Already gone is success: the caller's intent is satisfied.
             return (StatusCode::NO_CONTENT, ()).into_response();
         }
         Err(e) => return internal(e),
-    }
+    };
     match state.docker.remove_container(&id).await {
         Ok(()) => {
             if let Some(publisher) = state.publisher.as_ref() {
-                publisher.sandbox_destroyed(&id, None, "destroyed").await;
+                // The owner rides along so the desktop can clear the right
+                // agent's card without correlating ids itself.
+                publisher
+                    .sandbox_destroyed(&id, owner.as_deref(), "destroyed")
+                    .await;
             }
             info!(sandbox = %id, "sandbox destroyed");
             (StatusCode::NO_CONTENT, ()).into_response()
         }
         Err(e) => internal(e),
+    }
+}
+
+/// Extend (or shorten) a running sandbox's lifetime.
+///
+/// Owner-only: the sandbox is the *agent's* resource, so only the key it
+/// belongs to may buy it more time — not any member who learns the id. The
+/// new expiry is clamped so total lifetime never exceeds `MAX_TTL_SECONDS`
+/// from creation, and the change is re-announced as a fresh kind:48200 so the
+/// desktop's countdown follows.
+async fn extend_sandbox(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if !is_safe_id(&id) {
+        return bad_request("malformed sandbox id");
+    }
+    let caller = match authorize(
+        &state,
+        &headers,
+        "POST",
+        &format!("/sandboxes/{id}/extend"),
+        &body,
+    )
+    .await
+    {
+        Ok(pubkey) => pubkey,
+        Err(response) => return response,
+    };
+    let req: sandbox::ExtendRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return bad_request(format!("invalid request body: {e}")),
+    };
+
+    let inspect = match state.docker.inspect_container(&id).await {
+        Ok(v) if is_managed(&v) => v,
+        Ok(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "no such sandbox"})),
+            )
+                .into_response()
+        }
+        Err(e) if e.contains("404") || e.to_lowercase().contains("no such container") => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "no such sandbox"})),
+            )
+                .into_response()
+        }
+        Err(e) => return internal(e),
+    };
+
+    // Ownership lives on the container label, so the check is local and works
+    // even when the relay is unreachable. A sandbox created without an owner
+    // has no key that may extend it — that is refusal, not a fallback to
+    // "anyone".
+    let owner = inspect_label(&inspect, sandbox::LABEL_OWNER);
+    if owner.as_deref() != Some(caller.as_str()) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "only the sandbox's owner may extend it"
+            })),
+        )
+            .into_response();
+    }
+
+    // The lifetime ceiling is measured from the container's creation, which
+    // Docker records authoritatively — not from the label, which a future
+    // change might alter.
+    let created_at = inspect
+        .get("Created")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.timestamp());
+    let Some(created_at) = created_at else {
+        return internal("container has no readable creation time");
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let expires_at = sandbox::extended_expiry(now, created_at, req.ttl_seconds);
+    // Key on the full container id: the caller may have used a name or a
+    // short-id prefix, but the reaper looks up by the id Docker lists.
+    let full_id = inspect
+        .get("Id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&id)
+        .to_string();
+    state.set_expiry(&full_id, expires_at);
+
+    // Re-announce with the new expiry. The desktop reconstructs from the
+    // latest 48200, so a fresh announcement moves its countdown; it also
+    // becomes the crash-recovery record `seed_expiries` reads after a broker
+    // restart.
+    if let Some(publisher) = state.publisher.as_ref() {
+        let name = inspect
+            .get("Name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim_start_matches('/')
+            .to_string();
+        let image = inspect
+            .pointer("/Config/Image")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let cpus = inspect
+            .pointer("/HostConfig/NanoCpus")
+            .and_then(|v| v.as_i64())
+            .map(|n| n as f64 / 1e9)
+            .unwrap_or(0.0);
+        let memory_mb = inspect
+            .pointer("/HostConfig/Memory")
+            .and_then(|v| v.as_i64())
+            .map(|b| (b / (1024 * 1024)) as u64)
+            .unwrap_or(0);
+        let viewer = state.viewer_base.as_ref().map(|base| {
+            format!(
+                "{base}/sandboxes/{}/desktop",
+                &full_id[..12.min(full_id.len())]
+            )
+        });
+        publisher
+            .sandbox_created(events::SandboxFacts {
+                // The full id, so the re-announcement lands on the same `d`
+                // tag as the original and replaces it in the desktop's view
+                // rather than appearing as a second sandbox.
+                sandbox_id: &full_id,
+                name: &name,
+                image: &image,
+                owner: owner.as_deref(),
+                cpus,
+                memory_mb,
+                expires_at,
+                viewer_url: viewer.as_deref(),
+            })
+            .await;
+    }
+
+    info!(sandbox = %id, expires_at, "sandbox extended");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "id": id, "expires_at": expires_at })),
+    )
+        .into_response()
+}
+
+/// The Unix identity every file-API exec runs as: the unprivileged agent
+/// user, uid/gid 10001 (matches `RUN_AS_UID`/`RUN_AS_GID`, see
+/// `Dockerfile.sprig-dev`). Never root — the file API acts inside the
+/// sandbox with the same privilege the agent process itself has.
+const FS_EXEC_USER: &str = "10001:10001";
+
+/// Cap on a file upload body. Large enough for source files and small
+/// artifacts, small enough that a caller cannot use the file API to fill the
+/// host's disk in one request — the TTL reaper and concurrency cap bound
+/// sandbox count and lifetime, not bytes written per call.
+const FS_MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
+
+/// One entry of a directory listing, as emitted by the in-container `python3
+/// -c` scan and reported back to the caller.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct FsEntry {
+    name: String,
+    kind: String,
+    size: u64,
+    mtime: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct FsPathQuery {
+    path: String,
+}
+
+#[derive(serde::Deserialize)]
+struct FsRenameRequest {
+    from: String,
+    to: String,
+}
+
+#[derive(serde::Deserialize)]
+struct LaunchRequest {
+    app: String,
+}
+
+#[derive(serde::Deserialize)]
+struct WindowActionRequest {
+    window: String,
+    action: String,
+}
+
+/// Authorize an fs-API call and validate its `path`, in that order — the
+/// signature check is local and must run before anything path-shaped is
+/// interpreted, and the path policy applies regardless of *who* is calling
+/// (matching the existing DELETE routes, any community member may act).
+async fn authorize_fs(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    id: &str,
+    fs_path: &str,
+) -> Result<(), axum::response::Response> {
+    if !is_safe_id(id) {
+        return Err(bad_request("malformed sandbox id"));
+    }
+    authorize(state, headers, method, path, body).await?;
+    sandbox::validate_fs_path(fs_path).map_err(bad_request)?;
+    Ok(())
+}
+
+async fn fs_list(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+    Query(q): Query<FsPathQuery>,
+) -> axum::response::Response {
+    if let Err(response) = authorize_fs(
+        &state,
+        &headers,
+        "GET",
+        &format!("/sandboxes/{id}/fs?{}", raw.unwrap_or_default()),
+        b"",
+        &id,
+        &q.path,
+    )
+    .await
+    {
+        return response;
+    }
+
+    // A small Python scan emits one JSON object per line: precise types
+    // (file/dir/other), sizes, and mtimes without shelling out to `ls` and
+    // parsing column-aligned text. The path travels as an environment
+    // variable (`BUZZ_FS_PATH`), never interpolated into the script's source,
+    // so it needs no Python-string escaping regardless of what characters the
+    // (already `validate_fs_path`-checked) path contains.
+    const LIST_SCRIPT: &str = "import os, json\nfor e in os.scandir(os.environ['BUZZ_FS_PATH']):\n    try:\n        st = e.stat(follow_symlinks=False)\n    except OSError:\n        continue\n    kind = 'dir' if e.is_dir(follow_symlinks=False) else ('file' if e.is_file(follow_symlinks=False) else 'other')\n    print(json.dumps({'name': e.name, 'kind': kind, 'size': st.st_size, 'mtime': int(st.st_mtime)}))\n";
+    let (exit_code, output) = match state
+        .docker
+        .exec_with_env(
+            &id,
+            &["python3", "-c", LIST_SCRIPT],
+            FS_EXEC_USER,
+            &[format!("BUZZ_FS_PATH={}", q.path)],
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    if exit_code != 0 {
+        let detail = String::from_utf8_lossy(&output);
+        if detail.contains("FileNotFoundError") || detail.contains("No such file") {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "no such path"})),
+            )
+                .into_response();
+        }
+        return internal(format!("listing failed: {}", detail.trim()));
+    }
+
+    let mut entries = Vec::new();
+    for line in String::from_utf8_lossy(&output).lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<FsEntry>(line) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                // Defensive: one malformed line (e.g. a `NameError` traceback
+                // fragment) should not sink the whole listing.
+                warn!(error = %e, line, "skipping unparseable fs listing line");
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "path": q.path, "entries": entries })),
+    )
+        .into_response()
+}
+
+async fn fs_download(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+    Query(q): Query<FsPathQuery>,
+) -> axum::response::Response {
+    if let Err(response) = authorize_fs(
+        &state,
+        &headers,
+        "GET",
+        &format!("/sandboxes/{id}/fs/file?{}", raw.unwrap_or_default()),
+        b"",
+        &id,
+        &q.path,
+    )
+    .await
+    {
+        return response;
+    }
+
+    let tar_bytes = match state.docker.get_archive(&id, &q.path).await {
+        Ok(b) => b,
+        Err(e) if e.contains("404") || e.to_lowercase().contains("no such") => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "no such path"})),
+            )
+                .into_response()
+        }
+        Err(e) => return internal(e),
+    };
+
+    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+    let entries = match archive.entries() {
+        Ok(e) => e,
+        Err(e) => return internal(format!("could not read archive: {e}")),
+    };
+    for entry in entries {
+        let mut entry = match entry {
+            Ok(e) => e,
+            Err(e) => return internal(format!("could not read archive entry: {e}")),
+        };
+        let is_dir = entry.header().entry_type().is_dir();
+        if is_dir {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "path is a directory, not a file"})),
+            )
+                .into_response();
+        }
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        if let Err(e) = std::io::Read::read_to_end(&mut entry, &mut bytes) {
+            return internal(format!("could not read file contents: {e}"));
+        }
+        let filename = std::path::Path::new(&q.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("download");
+        return (
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "application/octet-stream".to_string(),
+                ),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{filename}\""),
+                ),
+            ],
+            bytes,
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "no such path"})),
+    )
+        .into_response()
+}
+
+async fn fs_upload(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+    Query(q): Query<FsPathQuery>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if body.len() > FS_MAX_UPLOAD_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!("upload exceeds the {FS_MAX_UPLOAD_BYTES}-byte limit")
+            })),
+        )
+            .into_response();
+    }
+    if let Err(response) = authorize_fs(
+        &state,
+        &headers,
+        "PUT",
+        &format!("/sandboxes/{id}/fs/file?{}", raw.unwrap_or_default()),
+        &body,
+        &id,
+        &q.path,
+    )
+    .await
+    {
+        return response;
+    }
+
+    let path = std::path::Path::new(&q.path);
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return bad_request("path has no parent directory");
+    };
+    let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+        return bad_request("path has no file name");
+    };
+
+    // Parent directories are created broker-side (exec `mkdir -p`) rather than
+    // relying on Docker's put-archive to create them, since put-archive only
+    // guarantees the *named* directory exists, not arbitrary depth beneath it.
+    if let Err(e) = state
+        .docker
+        .exec(
+            &id,
+            &["mkdir", "-p", "--", &parent.to_string_lossy()],
+            FS_EXEC_USER,
+        )
+        .await
+    {
+        return internal(format!("could not prepare parent directory: {e}"));
+    }
+
+    let tar_bytes = match build_single_file_tar(filename, &body) {
+        Ok(b) => b,
+        Err(e) => return internal(format!("could not build upload archive: {e}")),
+    };
+    if let Err(e) = state
+        .docker
+        .put_archive(&id, &parent.to_string_lossy(), tar_bytes)
+        .await
+    {
+        return internal(e);
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({ "path": q.path }))).into_response()
+}
+
+/// Build a tar containing exactly one regular file, owned by the sandbox's
+/// agent user (uid/gid 10001) with mode 0644 — readable and writable by that
+/// user regardless of what wrote the tar.
+fn build_single_file_tar(filename: &str, contents: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(contents.len() as u64);
+    header.set_mode(0o644);
+    header.set_uid(10001);
+    header.set_gid(10001);
+    header.set_mtime(chrono::Utc::now().timestamp() as u64);
+    header.set_cksum();
+    builder.append_data(&mut header, filename, contents)?;
+    builder.into_inner()
+}
+
+async fn fs_rename(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if !is_safe_id(&id) {
+        return bad_request("malformed sandbox id");
+    }
+    if let Err(response) = authorize(
+        &state,
+        &headers,
+        "POST",
+        &format!("/sandboxes/{id}/fs/rename"),
+        &body,
+    )
+    .await
+    {
+        return response;
+    }
+    let req: FsRenameRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return bad_request(format!("invalid request body: {e}")),
+    };
+    if let Err(e) = sandbox::validate_fs_path(&req.from) {
+        return bad_request(e);
+    }
+    if let Err(e) = sandbox::validate_fs_path(&req.to) {
+        return bad_request(e);
+    }
+
+    let (exit_code, output) = match state
+        .docker
+        .exec(&id, &["mv", "--", &req.from, &req.to], FS_EXEC_USER)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    if exit_code != 0 {
+        let detail = String::from_utf8_lossy(&output);
+        if detail.contains("No such file") {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "no such path"})),
+            )
+                .into_response();
+        }
+        return internal(format!("rename failed: {}", detail.trim()));
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "from": req.from, "to": req.to })),
+    )
+        .into_response()
+}
+
+async fn fs_delete(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+    Query(q): Query<FsPathQuery>,
+) -> axum::response::Response {
+    if let Err(response) = authorize_fs(
+        &state,
+        &headers,
+        "DELETE",
+        &format!("/sandboxes/{id}/fs?{}", raw.unwrap_or_default()),
+        b"",
+        &id,
+        &q.path,
+    )
+    .await
+    {
+        return response;
+    }
+
+    let (exit_code, output) = match state
+        .docker
+        .exec(&id, &["rm", "-rf", "--", &q.path], FS_EXEC_USER)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    if exit_code != 0 {
+        return internal(format!(
+            "delete failed: {}",
+            String::from_utf8_lossy(&output).trim()
+        ));
+    }
+
+    (StatusCode::NO_CONTENT, ()).into_response()
+}
+
+/// Launch one of the fixed desktop apps as a real window under the sandbox's
+/// window manager.
+///
+/// `app` selects among exactly three constant argv vectors in
+/// `sandbox::LAUNCH_APPS` — no field of the request body ever reaches the
+/// container's argv, so there is nothing here for a caller to inject through.
+/// The process is started detached (`Docker::exec_detached`): these are GUI
+/// apps meant to keep running until the user closes their window, and a
+/// wait-for-exit exec (`Docker::exec`) would block the request for as long as
+/// the app stayed open.
+async fn launch_app(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if !is_safe_id(&id) {
+        return bad_request("malformed sandbox id");
+    }
+    if let Err(response) = authorize(
+        &state,
+        &headers,
+        "POST",
+        &format!("/sandboxes/{id}/launch"),
+        &body,
+    )
+    .await
+    {
+        return response;
+    }
+    let req: LaunchRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return bad_request(format!("invalid request body: {e}")),
+    };
+    let argv = match sandbox::launch_argv(&req.app) {
+        Ok(argv) => argv,
+        Err(e) => return bad_request(e),
+    };
+
+    // DISPLAY/HOME so the app finds the X server and its own config/profile
+    // directories under the agent's home, same as everything else on this
+    // desktop image (see Dockerfile.sprig-desktop).
+    let env = ["DISPLAY=:1".to_string(), "HOME=/home/agent".to_string()];
+    if let Err(e) = state
+        .docker
+        .exec_detached(&id, argv, FS_EXEC_USER, &env)
+        .await
+    {
+        return internal(e);
+    }
+
+    (StatusCode::NO_CONTENT, ()).into_response()
+}
+
+/// List the open windows on the sandbox's desktop, for the dock's taskbar
+/// segment: the window manager's own EWMH client list (`_NET_CLIENT_LIST`,
+/// exactly what an in-desktop taskbar would show), each with its title and
+/// whether it is the active window. The script is a fixed string — nothing
+/// caller-supplied reaches the exec.
+async fn windows_list(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if !is_safe_id(&id) {
+        return bad_request("malformed sandbox id");
+    }
+    if let Err(response) = authorize(
+        &state,
+        &headers,
+        "GET",
+        &format!("/sandboxes/{id}/windows"),
+        b"",
+    )
+    .await
+    {
+        return response;
+    }
+
+    const LIST_SCRIPT: &str = r#"
+list=$(xprop -root -notype _NET_CLIENT_LIST 2>/dev/null | sed 's/.*# *//; s/,/ /g')
+active=$(xprop -root -notype _NET_ACTIVE_WINDOW 2>/dev/null | sed 's/.*# *//; s/,.*//')
+for w in $list; do
+  # Panels/docks are furniture, not windows a taskbar should list.
+  xprop -id "$w" -notype _NET_WM_WINDOW_TYPE 2>/dev/null | grep -q _NET_WM_WINDOW_TYPE_DOCK && continue
+  name=$(xdotool getwindowname "$w" 2>/dev/null) || continue
+  # WM_CLASS = "instance", "Class" — take the class (last field): the
+  # instance can embed launch details (chromium appends its profile dir).
+  class=$(xprop -id "$w" -notype WM_CLASS 2>/dev/null | sed 's/.*, *//; s/"//g')
+  if [ "$w" = "$active" ]; then a=1; else a=0; fi
+  printf '%s\t%s\t%s\t%s\n' "$w" "$a" "$class" "$name"
+done
+"#;
+    let env = ["DISPLAY=:1".to_string(), "HOME=/home/agent".to_string()];
+    let (exit_code, output) = match state
+        .docker
+        .exec_with_env(&id, &["sh", "-c", LIST_SCRIPT], FS_EXEC_USER, &env)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    if exit_code != 0 {
+        return internal(format!(
+            "window listing failed: {}",
+            String::from_utf8_lossy(&output).trim()
+        ));
+    }
+
+    let mut windows = Vec::new();
+    for line in String::from_utf8_lossy(&output).lines() {
+        // Title comes last: it is the one field that may itself contain tabs.
+        let mut parts = line.splitn(4, '\t');
+        let (Some(wid), Some(active), Some(class), Some(title)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if sandbox::validate_window_id(wid).is_err() {
+            continue;
+        }
+        windows.push(serde_json::json!({
+            "id": wid,
+            "title": title,
+            "class": class,
+            "active": active == "1",
+        }));
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "windows": windows })),
+    )
+        .into_response()
+}
+
+/// Act on one desktop window (activate / minimize / close) — the dock's
+/// taskbar clicks. The action name resolves to a fixed argv
+/// ([`sandbox::window_action_argv`]) and the validated window id travels in
+/// the `BUZZ_WINDOW` environment variable, mirroring the fs API's
+/// path-in-env pattern so no caller string is ever interpolated into a
+/// command.
+async fn window_action(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if !is_safe_id(&id) {
+        return bad_request("malformed sandbox id");
+    }
+    if let Err(response) = authorize(
+        &state,
+        &headers,
+        "POST",
+        &format!("/sandboxes/{id}/windows/action"),
+        &body,
+    )
+    .await
+    {
+        return response;
+    }
+    let req: WindowActionRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return bad_request(format!("invalid request body: {e}")),
+    };
+    if let Err(e) = sandbox::validate_window_id(&req.window) {
+        return bad_request(e);
+    }
+    let argv = match sandbox::window_action_argv(&req.action) {
+        Ok(argv) => argv,
+        Err(e) => return bad_request(e),
+    };
+
+    let env = [
+        "DISPLAY=:1".to_string(),
+        "HOME=/home/agent".to_string(),
+        format!("BUZZ_WINDOW={}", req.window),
+    ];
+    let (exit_code, output) = match state
+        .docker
+        .exec_with_env(&id, argv, FS_EXEC_USER, &env)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    if exit_code != 0 {
+        // xdotool exits nonzero when the window is already gone — a race
+        // every taskbar has; tell the caller so it can just refresh.
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no such window"})),
+        )
+            .into_response();
+    }
+    let _ = output;
+
+    (StatusCode::NO_CONTENT, ()).into_response()
+}
+
+/// The brand-free sandbox viewer: a full-bleed live screen, nothing else.
+///
+/// Served by the broker (not the sandbox) so it needs no assets of its own —
+/// it imports the RFB engine module relatively, which the desktop proxy
+/// serves from the sandbox's static tree under the same token path. Scaling
+/// is remote-cursor + local fit; a dropped connection retries quietly until
+/// the token ages out, at which point reopening from Buzz mints a fresh one.
+const VIEWER_PAGE: &str = r##"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Agent desktop</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #101014; overflow: hidden; }
+  #screen { width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<div id="screen"></div>
+<script type="module">
+  import RFB from "./core/rfb.js";
+  const base = location.pathname.replace(/\/view$/, "");
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const url = `${proto}://${location.host}${base}/websockify`;
+  let retry = 0;
+  function connect() {
+    const rfb = new RFB(document.getElementById("screen"), url);
+    rfb.scaleViewport = true;
+    rfb.background = "#101014";
+    rfb.addEventListener("connect", () => { retry = 0; });
+    rfb.addEventListener("disconnect", () => {
+      // Quiet backoff; a token past its window keeps failing until the
+      // viewer is reopened from Buzz, which mints a fresh one.
+      retry += 1;
+      if (retry <= 30) setTimeout(connect, Math.min(1000 * retry, 5000));
+    });
+  }
+  connect();
+</script>
+</body>
+</html>
+"##;
+
+/// A label from a container *inspect* payload (labels live under
+/// `Config.Labels` there, unlike the flat `Labels` of a list entry).
+fn inspect_label(inspect: &serde_json::Value, key: &str) -> Option<String> {
+    inspect
+        .pointer("/Config/Labels")?
+        .get(key)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Seed the live expiry map at startup.
+///
+/// The label holds each sandbox's *initial* expiry; an extend only ever moves
+/// broker state and the relay's 48200. After a restart the relay is therefore
+/// the record of any extension, so it is preferred, falling back to the label
+/// when the relay has no answer. Failing to seed leaves the map empty and the
+/// reaper on labels — old behavior, never a crash.
+async fn seed_expiries(state: &AppState) {
+    let listed = match state.docker.list_managed(sandbox::MANAGED_LABEL).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(error = %e, "could not seed sandbox expiries");
+            return;
+        }
+    };
+    for c in listed {
+        let Some(id) = c.get("Id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let from_label = c
+            .get("Labels")
+            .and_then(|l| l.get(sandbox::LABEL_EXPIRES))
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<i64>().ok());
+        let from_relay = match state.publisher.as_ref() {
+            Some(p) => p.fetch_latest_expiry(id).await,
+            None => None,
+        };
+        if let Some(expires_at) = from_relay.or(from_label) {
+            state.set_expiry(id, expires_at);
+        }
     }
 }
 
@@ -548,21 +1774,31 @@ async fn reaper(state: AppState) {
                 continue;
             }
         };
-        for c in listed {
+        for c in &listed {
             let Some(id) = c.get("Id").and_then(|v| v.as_str()) else {
                 continue;
             };
-            let expires = c
-                .get("Labels")
-                .and_then(|l| l.get(sandbox::LABEL_EXPIRES))
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<i64>().ok());
+            let label = |k: &str| {
+                c.get("Labels")
+                    .and_then(|l| l.get(k))
+                    .and_then(|v| v.as_str())
+            };
+            // Broker state is the live authority (an extend moves only it);
+            // the label is the initial expiry, good enough for a sandbox that
+            // was never extended.
+            let expires = state
+                .expiry_of(id)
+                .or_else(|| label(sandbox::LABEL_EXPIRES).and_then(|s| s.parse::<i64>().ok()));
             if let Some(expires) = expires {
                 if now >= expires {
+                    let owner = label(sandbox::LABEL_OWNER).map(str::to_string);
                     match state.docker.remove_container(id).await {
                         Ok(()) => {
+                            state.forget_expiry(id);
                             if let Some(publisher) = state.publisher.as_ref() {
-                                publisher.sandbox_destroyed(id, None, "expired").await;
+                                publisher
+                                    .sandbox_destroyed(id, owner.as_deref(), "expired")
+                                    .await;
                             }
                             info!(sandbox = %id, "sandbox reaped (ttl expired)")
                         }
@@ -570,6 +1806,15 @@ async fn reaper(state: AppState) {
                     }
                 }
             }
+        }
+        // Drop expiry entries for containers that no longer exist (removed by
+        // hand, or reaped above) so the map tracks reality rather than growing.
+        if let Ok(mut map) = state.expiry.lock() {
+            let live: std::collections::HashSet<&str> = listed
+                .iter()
+                .filter_map(|c| c.get("Id").and_then(|v| v.as_str()))
+                .collect();
+            map.retain(|id, _| live.contains(id.as_str()));
         }
     }
 }
@@ -716,6 +1961,100 @@ mod sandbox_ip_tests {
 }
 
 #[cfg(test)]
+mod public_base_tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn derives_origin_at_a_hostname_root() {
+        // A sandbox host with its own domain: origin is proto + host, no prefix.
+        let h = headers(&[
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-host", "sandbox.example.com"),
+        ]);
+        assert_eq!(
+            public_base_from_request(&h).as_deref(),
+            Some("https://sandbox.example.com")
+        );
+    }
+
+    #[test]
+    fn honors_a_stripped_path_prefix() {
+        // Sharing the relay host under /sandbox-viewer: the stripped prefix must
+        // reappear in the signed URL, or the token signature will not match.
+        let h = headers(&[
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-host", "relay.example.com"),
+            ("x-forwarded-prefix", "/sandbox-viewer"),
+        ]);
+        assert_eq!(
+            public_base_from_request(&h).as_deref(),
+            Some("https://relay.example.com/sandbox-viewer")
+        );
+    }
+
+    #[test]
+    fn websocket_protos_fold_into_their_http_spelling() {
+        // The viewer token is signed over the https page URL; a websockify
+        // upgrade arrives with X-Forwarded-Proto: wss. Same origin — must
+        // verify against the same URL.
+        for (fwd, want) in [("wss", "https"), ("ws", "http")] {
+            let h = headers(&[
+                ("x-forwarded-proto", fwd),
+                ("x-forwarded-host", "relay.example.com"),
+                ("x-forwarded-prefix", "/sandbox-viewer"),
+            ]);
+            assert_eq!(
+                public_base_from_request(&h).as_deref(),
+                Some(format!("{want}://relay.example.com/sandbox-viewer").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn defaults_proto_to_https_when_unset() {
+        let h = headers(&[("x-forwarded-host", "sandbox.example.com")]);
+        assert_eq!(
+            public_base_from_request(&h).as_deref(),
+            Some("https://sandbox.example.com")
+        );
+    }
+
+    #[test]
+    fn takes_the_first_value_of_a_forwarded_list() {
+        // A chain of proxies produces comma-lists; the client-facing origin is
+        // the first entry.
+        let h = headers(&[
+            ("x-forwarded-proto", "https, http"),
+            ("x-forwarded-host", "sandbox.example.com, internal:9310"),
+        ]);
+        assert_eq!(
+            public_base_from_request(&h).as_deref(),
+            Some("https://sandbox.example.com")
+        );
+    }
+
+    #[test]
+    fn none_without_a_forwarded_host() {
+        // No trusted proxy set the header — the bare request is not something to
+        // sign against, so verification falls back to the configured base.
+        assert!(public_base_from_request(&HeaderMap::new()).is_none());
+        assert!(public_base_from_request(&headers(&[("host", "127.0.0.1:9310")])).is_none());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -764,5 +2103,131 @@ mod tests {
         assert_eq!(s.name, "buzz-sandbox-abc");
         assert_eq!(s.owner.as_deref(), Some("tyler"));
         assert_eq!(s.expires_at, Some(1750000000));
+    }
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    /// An `AppState` fit only for router-level tests: the Docker socket path
+    /// is never dialed (no test here reaches a handler that calls Docker) and
+    /// no relay is configured, so `require_membership` stays irrelevant — the
+    /// request never gets past token verification.
+    fn test_state() -> AppState {
+        AppState {
+            docker: docker::Docker::new("/nonexistent/docker.sock"),
+            verifier: Arc::new(identity::Verifier::new(
+                "https://relay.example".to_string(),
+                "https://broker.example".to_string(),
+                nostr::Keys::generate(),
+                true,
+            )),
+            publisher: None,
+            viewer_base: None,
+            allowed_images: Arc::new(Vec::new()),
+            network: Arc::new("bridge".to_string()),
+            disk_limit: None,
+            host_cpus: 1,
+            slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            expiry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// A request as it actually arrives in production: through a reverse
+    /// proxy that sets `X-Forwarded-Host`. Without it, `verify_surface_token`
+    /// has no public origin to build the signed URL from (no `viewer_base`
+    /// is configured in `test_state`, matching a deployment that relies on
+    /// forwarded headers rather than a baked-in fallback) and answers 404
+    /// itself — a false positive this test must not be confused with the
+    /// router-level 404 it exists to catch.
+    fn forwarded_request(method: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-forwarded-proto", "https")
+            .header("x-forwarded-host", "broker.example")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_route_reaches_its_handler() {
+        let app = build_router(test_state());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Pin the bug where axum's `{*rest}` wildcard does not match a request
+    /// with nothing after the final `/`: `terminal()`'s own redirect target
+    /// for a bare entry (`.../terminal/t/{token}/`, load-bearing because
+    /// ttyd's client resolves its WebSocket relative to `window.location`,
+    /// so it cannot be a synthetic non-empty path) must reach the handler
+    /// rather than 404 at the routing layer.
+    ///
+    /// A bogus token is what makes the distinction provable: 404 means axum
+    /// never matched the route at all (the bug); 401/403 means it matched,
+    /// ran the handler, and the handler correctly refused the fake token —
+    /// the routing question this test asks is answered before auth is ever
+    /// evaluated.
+    #[tokio::test]
+    async fn terminal_trailing_slash_reaches_the_handler_and_fails_auth() {
+        let app = build_router(test_state());
+        let uri = "/sandboxes/abc123def456/terminal/t/not-a-real-token/";
+        let resp = app.oneshot(forwarded_request("GET", uri)).await.unwrap();
+        assert!(
+            resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
+            "the trailing-slash terminal URL must route to the handler and fail \
+             auth (401/403) on a bogus token, not 404 at the axum router layer \
+             — a 404 here means the redirect this broker itself issues points \
+             at a URL its own router rejects; got {}",
+            resp.status()
+        );
+    }
+
+    /// The equivalent non-empty-tail URL (ttyd's index.html, or any other
+    /// asset) already worked before this fix — kept as a control so a
+    /// regression in the wildcard route itself would also be caught.
+    #[tokio::test]
+    async fn terminal_non_empty_tail_reaches_the_handler_and_fails_auth() {
+        let app = build_router(test_state());
+        let uri = "/sandboxes/abc123def456/terminal/t/not-a-real-token/index.html";
+        let resp = app.oneshot(forwarded_request("GET", uri)).await.unwrap();
+        assert!(
+            resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
+            "got {}",
+            resp.status()
+        );
+    }
+
+    /// Mirrors the terminal routing test above for the header-authenticated
+    /// launch endpoint: a request with no `Authorization` header must reach
+    /// `launch_app` and be refused there (401), not 404 before the handler
+    /// ever runs — proving the route is wired, independent of whether a
+    /// caller happens to hold a valid signature.
+    #[tokio::test]
+    async fn launch_reaches_the_handler_and_fails_auth_without_a_signature() {
+        let app = build_router(test_state());
+        let body = serde_json::json!({ "app": "terminal" }).to_string();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/sandboxes/abc123def456/launch")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unsigned request must reach launch_app and be refused there \
+             (401), not 404 at the router layer"
+        );
     }
 }

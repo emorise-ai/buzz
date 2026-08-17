@@ -38,3 +38,14 @@ hyper = { version = "1", features = ["client", "http1"] }
 tower-service = "0.3"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
+
+# The file API packs single files into (and unpacks them from) the tar streams
+# Docker's container archive endpoints speak — not a general archiver, just the
+# format those two endpoints require.
+tar = "0.4"
+
+[dev-dependencies]
+# `ServiceExt::oneshot` drives the real `Router` end to end in router-level
+# tests (e.g. pinning a route that must not 404 before it ever reaches a
+# handler) without binding a socket.
+tower = { workspace = true }

@@ -186,6 +186,270 @@ impl Docker {
             .await?;
         Ok(listed.as_array().cloned().unwrap_or_default())
     }
+
+    /// Run `argv` inside `id` as `user` (e.g. `"10001:10001"`) and return
+    /// `(exit_code, stdout+stderr)`.
+    ///
+    /// Always an argv vector, never a shell string: `sandbox.rs`'s file routes
+    /// build commands from caller-controlled paths, and a shell would let a
+    /// crafted path break out of its argument.
+    ///
+    /// The output stream is Docker's own multiplexed stdout/stderr framing
+    /// (8-byte header per chunk); this demultiplexes and concatenates both
+    /// streams, which is enough for exec/list operations that don't need to
+    /// tell them apart.
+    pub async fn exec(
+        &self,
+        id: &str,
+        argv: &[&str],
+        user: &str,
+    ) -> Result<(i64, Vec<u8>), String> {
+        self.exec_with_env(id, argv, user, &[]).await
+    }
+
+    /// Like [`Docker::exec`], but with additional `KEY=value` environment
+    /// entries for the exec'd process — used to hand a caller-controlled
+    /// string (a filesystem path) to an in-container script without ever
+    /// interpolating it into that script's source text.
+    pub async fn exec_with_env(
+        &self,
+        id: &str,
+        argv: &[&str],
+        user: &str,
+        env: &[String],
+    ) -> Result<(i64, Vec<u8>), String> {
+        let create = self
+            .request(
+                hyper::Method::POST,
+                &format!("/containers/{id}/exec"),
+                Some(serde_json::json!({
+                    "AttachStdout": true,
+                    "AttachStderr": true,
+                    "Cmd": argv,
+                    "User": user,
+                    "Env": env,
+                })),
+            )
+            .await?;
+        let exec_id = create
+            .get("Id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "docker did not return an exec id".to_string())?;
+
+        let output = self
+            .exec_start_raw(
+                exec_id,
+                &serde_json::json!({ "Detach": false, "Tty": false }),
+            )
+            .await?;
+
+        let inspect = self
+            .request(hyper::Method::GET, &format!("/exec/{exec_id}/json"), None)
+            .await?;
+        let exit_code = inspect
+            .get("ExitCode")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1);
+
+        Ok((exit_code, demux_docker_stream(&output)))
+    }
+
+    /// Start `argv` inside `id` as `user` with `env`, detached: the exec is
+    /// created and started with `Detach: true`, so Docker starts the process
+    /// and returns immediately rather than streaming its output — this
+    /// returns as soon as the process is launched, not when it exits.
+    ///
+    /// For long-running foreground processes (a GUI app under a window
+    /// manager, here) rather than the short commands [`Docker::exec`] and
+    /// [`Docker::exec_with_env`] run to completion and collect output from.
+    /// Those two would hang for as long as the launched process runs, since
+    /// their `Detach: false` start blocks until the stream closes.
+    pub async fn exec_detached(
+        &self,
+        id: &str,
+        argv: &[&str],
+        user: &str,
+        env: &[String],
+    ) -> Result<(), String> {
+        let create = self
+            .request(
+                hyper::Method::POST,
+                &format!("/containers/{id}/exec"),
+                Some(serde_json::json!({
+                    "AttachStdout": false,
+                    "AttachStderr": false,
+                    "Cmd": argv,
+                    "User": user,
+                    "Env": env,
+                })),
+            )
+            .await?;
+        let exec_id = create
+            .get("Id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "docker did not return an exec id".to_string())?;
+
+        self.exec_start_raw(
+            exec_id,
+            &serde_json::json!({ "Detach": true, "Tty": false }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `POST /exec/{id}/start`, returning the raw (possibly multiplexed) body
+    /// rather than parsing it as JSON — exec output is a byte stream, not a
+    /// Docker Engine JSON document.
+    async fn exec_start_raw(
+        &self,
+        exec_id: &str,
+        body: &serde_json::Value,
+    ) -> Result<Vec<u8>, String> {
+        let uri = hyperlocal_uri(
+            &self.socket,
+            &format!("/{API_VERSION}/exec/{exec_id}/start"),
+        )
+        .ok_or_else(|| "could not build a docker request URI for exec/start".to_string())?;
+        let req = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(uri)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(body.to_string())))
+            .map_err(|e| format!("could not build the docker request: {e}"))?;
+
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .map_err(|e| format!("could not reach the docker daemon: {e}"))?;
+        let status = resp.status();
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| format!("could not read the docker response: {e}"))?
+            .to_bytes();
+        if !status.is_success() {
+            let detail = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| {
+                    v.get("message")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).trim().to_string());
+            return Err(format!("docker returned {status}: {detail}"));
+        }
+        Ok(bytes.to_vec())
+    }
+
+    /// Fetch a tar stream of the single path `path` inside `id`.
+    ///
+    /// Docker's archive endpoint always returns a tar even for one file — the
+    /// caller (`main.rs`) unpacks the single entry it expects.
+    pub async fn get_archive(&self, id: &str, path: &str) -> Result<Vec<u8>, String> {
+        let encoded = urlencode(path);
+        let uri = hyperlocal_uri(
+            &self.socket,
+            &format!("/{API_VERSION}/containers/{id}/archive?path={encoded}"),
+        )
+        .ok_or_else(|| "could not build a docker request URI for archive".to_string())?;
+        let req = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(uri)
+            .body(Full::new(Bytes::new()))
+            .map_err(|e| format!("could not build the docker request: {e}"))?;
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .map_err(|e| format!("could not reach the docker daemon: {e}"))?;
+        let status = resp.status();
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| format!("could not read the docker response: {e}"))?
+            .to_bytes();
+        if !status.is_success() {
+            let detail = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| {
+                    v.get("message")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).trim().to_string());
+            return Err(format!("docker returned {status}: {detail}"));
+        }
+        Ok(bytes.to_vec())
+    }
+
+    /// Upload a tar stream (built by the caller with [`tar`]) into `id` at
+    /// `dir` — the directory the tar's paths are relative to.
+    pub async fn put_archive(&self, id: &str, dir: &str, tar_bytes: Vec<u8>) -> Result<(), String> {
+        let encoded = urlencode(dir);
+        let uri = hyperlocal_uri(
+            &self.socket,
+            &format!("/{API_VERSION}/containers/{id}/archive?path={encoded}"),
+        )
+        .ok_or_else(|| "could not build a docker request URI for archive".to_string())?;
+        let req = hyper::Request::builder()
+            .method(hyper::Method::PUT)
+            .uri(uri)
+            .header(hyper::header::CONTENT_TYPE, "application/x-tar")
+            .body(Full::new(Bytes::from(tar_bytes)))
+            .map_err(|e| format!("could not build the docker request: {e}"))?;
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .map_err(|e| format!("could not reach the docker daemon: {e}"))?;
+        let status = resp.status();
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| format!("could not read the docker response: {e}"))?
+            .to_bytes();
+        if !status.is_success() {
+            let detail = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| {
+                    v.get("message")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).trim().to_string());
+            return Err(format!("docker returned {status}: {detail}"));
+        }
+        Ok(())
+    }
+}
+
+/// Demultiplex Docker's exec/attach stream framing: each chunk is an 8-byte
+/// header (`[stream_type, 0, 0, 0, size_be_u32...]`) followed by `size` bytes
+/// of payload. Stdout and stderr are concatenated in stream order — exec
+/// output for a file-listing or delete command has no need to tell them apart.
+///
+/// Malformed framing (a truncated header, a size that overruns the buffer)
+/// stops demuxing and returns what was parsed so far rather than failing the
+/// whole call — Docker's raw stream should always be well-formed, but a
+/// partial parse is more useful than none if it ever is not.
+fn demux_docker_stream(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i + 8 <= raw.len() {
+        let size = u32::from_be_bytes([raw[i + 4], raw[i + 5], raw[i + 6], raw[i + 7]]) as usize;
+        let start = i + 8;
+        let end = start + size;
+        if end > raw.len() {
+            break;
+        }
+        out.extend_from_slice(&raw[start..end]);
+        i = end;
+    }
+    out
 }
 
 /// Percent-encode the bytes that matter inside a query string value.

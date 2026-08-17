@@ -53,6 +53,28 @@ pub struct CreateRequest {
     pub env: std::collections::BTreeMap<String, String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ExtendRequest {
+    /// Seconds of lifetime wanted from *now*. The result is clamped so the
+    /// sandbox's total lifetime never exceeds [`MAX_TTL_SECONDS`] from its
+    /// creation — repeated extends must not make a sandbox immortal, because
+    /// the TTL is the only bound on disk the host has (see `container_spec`).
+    pub ttl_seconds: u64,
+}
+
+/// New expiry for an extend request: `now + ttl`, clamped to the lifetime
+/// ceiling measured from creation.
+///
+/// The request's TTL goes through the same floor/ceiling as a create, then the
+/// absolute cap applies. An extend can also *shorten* a sandbox's remaining
+/// time — an agent that knows it needs only five more minutes may say so, and
+/// the host gets its resources back sooner.
+pub fn extended_expiry(now: i64, created_at: i64, ttl_seconds: u64) -> i64 {
+    let requested = now + ttl_seconds.clamp(60, MAX_TTL_SECONDS) as i64;
+    let cap = created_at + MAX_TTL_SECONDS as i64;
+    requested.min(cap)
+}
+
 #[derive(Debug, Serialize)]
 pub struct SandboxSummary {
     pub id: String,
@@ -187,6 +209,143 @@ pub fn container_spec(inputs: SpecInputs<'_>) -> serde_json::Value {
     spec
 }
 
+/// Directories the file API may touch inside a sandbox.
+///
+/// Everything else — `/etc`, `/proc`, `/root`, the container's own binaries —
+/// is off limits even though the exec runs as the unprivileged agent user;
+/// this is a second, independent boundary rather than relying on Unix
+/// permissions alone.
+const FS_ALLOWED_ROOTS: [&str; 2] = ["/workspace", "/home/agent"];
+
+/// Validate a path handed to the file API before it ever reaches an exec
+/// argv or a Docker archive call.
+///
+/// Rejects anything not absolute, any `.`/`..` segment (traversal, even
+/// disguised inside a longer component boundary check would miss), and any
+/// path outside the sandbox's own directories. A `\0` or newline is refused
+/// outright — Docker's archive `path` query parameter and exec argv both
+/// treat the string as a single token, so either character existing in a
+/// "path" means it is not one.
+pub fn validate_fs_path(path: &str) -> Result<(), String> {
+    if path.is_empty() || !path.starts_with('/') {
+        return Err("path must be absolute".to_string());
+    }
+    if path.contains('\0') || path.contains('\n') {
+        return Err("path contains an invalid character".to_string());
+    }
+    for segment in path.split('/') {
+        if segment == "." || segment == ".." {
+            return Err("path must not contain \".\" or \"..\" segments".to_string());
+        }
+    }
+    let under_allowed_root = FS_ALLOWED_ROOTS
+        .iter()
+        .any(|root| path == *root || path.starts_with(&format!("{root}/")));
+    if !under_allowed_root {
+        return Err(format!(
+            "path must be under one of: {}",
+            FS_ALLOWED_ROOTS.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// The desktop apps a sandbox's launch endpoint may open, each a fixed argv
+/// vector — never assembled from caller input. A dock icon on the desktop
+/// opens a real window for one of these under the window manager, rather than
+/// switching a flat view; the launch endpoint exists only to name *which* of
+/// exactly three known programs to start, never to run an arbitrary command.
+pub const LAUNCH_APPS: &[(&str, &[&str])] = &[
+    (
+        "browser",
+        &[
+            "buzz-browser",
+            "--new-window",
+            "--user-data-dir=/home/agent/.config/chromium",
+            "--password-store=basic",
+            "--force-dark-mode",
+            "--enable-features=WebUIDarkMode",
+            "--no-sandbox",
+            "--test-type",
+        ],
+    ),
+    ("files", &["thunar", "/workspace"]),
+    (
+        "terminal",
+        &["xfce4-terminal", "--working-directory=/workspace"],
+    ),
+];
+
+/// Resolve a launch request's `app` name to its fixed argv, or reject it.
+///
+/// The returned slice is one of the constants in [`LAUNCH_APPS`] — no
+/// caller-supplied string ever reaches the argv this builds a container exec
+/// from.
+pub fn launch_argv(app: &str) -> Result<&'static [&'static str], String> {
+    LAUNCH_APPS
+        .iter()
+        .find(|(name, _)| *name == app)
+        .map(|(_, argv)| *argv)
+        .ok_or_else(|| {
+            let allowed: Vec<&str> = LAUNCH_APPS.iter().map(|(name, _)| *name).collect();
+            format!("unknown app {app:?}; allowed: {}", allowed.join(", "))
+        })
+}
+
+/// The actions the window endpoint may perform on a desktop window, each a
+/// fixed argv — the caller-supplied window id travels in the `BUZZ_WINDOW`
+/// environment variable (validated by [`validate_window_id`] first), never
+/// interpolated into the script text, mirroring how the fs API hands paths
+/// to in-container scripts.
+pub const WINDOW_ACTIONS: &[(&str, &[&str])] = &[
+    (
+        "activate",
+        &["sh", "-c", "exec xdotool windowactivate \"$BUZZ_WINDOW\""],
+    ),
+    (
+        "minimize",
+        &["sh", "-c", "exec xdotool windowminimize \"$BUZZ_WINDOW\""],
+    ),
+    (
+        "close",
+        &["sh", "-c", "exec xdotool windowclose \"$BUZZ_WINDOW\""],
+    ),
+];
+
+/// Resolve a window request's `action` name to its fixed argv, or reject it.
+pub fn window_action_argv(action: &str) -> Result<&'static [&'static str], String> {
+    WINDOW_ACTIONS
+        .iter()
+        .find(|(name, _)| *name == action)
+        .map(|(_, argv)| *argv)
+        .ok_or_else(|| {
+            let allowed: Vec<&str> = WINDOW_ACTIONS.iter().map(|(name, _)| *name).collect();
+            format!("unknown action {action:?}; allowed: {}", allowed.join(", "))
+        })
+}
+
+/// Validate an X11 window id before it is handed to an in-container exec:
+/// `0x`-prefixed hex or plain decimal, nothing else — a window id is the
+/// only caller-controlled value the window endpoints forward, and this keeps
+/// every accepted form inert in the `BUZZ_WINDOW` environment variable.
+pub fn validate_window_id(window: &str) -> Result<(), String> {
+    let digits = window.strip_prefix("0x").unwrap_or(window);
+    let is_hex = window.starts_with("0x");
+    if digits.is_empty()
+        || digits.len() > 16
+        || !digits.bytes().all(|b| {
+            if is_hex {
+                b.is_ascii_hexdigit()
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+    {
+        return Err("malformed window id".to_string());
+    }
+    Ok(())
+}
+
 /// Is this image allowed to hold an agent's private key?
 ///
 /// Prefix match against the configured allowlist. Digest pinning is checked
@@ -243,6 +402,33 @@ mod tests {
             ttl_seconds: ttl,
             env: Default::default(),
         }
+    }
+
+    #[test]
+    fn an_extend_adds_time_from_now() {
+        let created = 1_000_000;
+        let now = created + 600;
+        assert_eq!(extended_expiry(now, created, 1800), now + 1800);
+    }
+
+    #[test]
+    fn extends_never_exceed_the_lifetime_ceiling_from_creation() {
+        let created = 1_000_000;
+        let cap = created + MAX_TTL_SECONDS as i64;
+        // Asking for the max near the end of life yields the cap, not now+max.
+        let late = cap - 60;
+        assert_eq!(extended_expiry(late, created, MAX_TTL_SECONDS), cap);
+        // Repeated maximal extends converge on the same cap — immortality is
+        // structurally impossible, not just discouraged.
+        assert_eq!(extended_expiry(cap, created, u64::MAX), cap);
+    }
+
+    #[test]
+    fn an_extend_may_shorten_the_remaining_time() {
+        let created = 1_000_000;
+        let now = created + 100;
+        // The floor still applies: one minute is the least a sandbox can hold.
+        assert_eq!(extended_expiry(now, created, 0), now + 60);
     }
 
     #[test]
@@ -445,5 +631,122 @@ mod tests {
         assert_eq!(assign_cpuset(8, 2.0, 0), "0-1");
         // Fractional rounds up to one whole core.
         assert_eq!(assign_cpuset(8, 0.5, 0), "0-0");
+    }
+
+    #[test]
+    fn fs_paths_under_the_allowed_roots_are_accepted() {
+        assert!(validate_fs_path("/workspace").is_ok());
+        assert!(validate_fs_path("/workspace/").is_ok());
+        assert!(validate_fs_path("/workspace/project/src/main.rs").is_ok());
+        assert!(validate_fs_path("/home/agent").is_ok());
+        assert!(validate_fs_path("/home/agent/.bashrc").is_ok());
+    }
+
+    #[test]
+    fn fs_paths_must_be_absolute() {
+        assert!(validate_fs_path("").is_err());
+        assert!(validate_fs_path("workspace/file").is_err());
+        assert!(validate_fs_path("relative/path").is_err());
+    }
+
+    #[test]
+    fn fs_paths_reject_dot_and_dotdot_segments() {
+        assert!(validate_fs_path("/workspace/../etc/passwd").is_err());
+        assert!(validate_fs_path("/workspace/./file").is_err());
+        assert!(validate_fs_path("/workspace/a/../../etc").is_err());
+        // A traversal disguised inside a longer, otherwise-legitimate-looking
+        // component must still be caught by the exact-segment check.
+        assert!(validate_fs_path("/workspace/..").is_err());
+    }
+
+    #[test]
+    fn fs_paths_outside_the_allowed_roots_are_rejected() {
+        assert!(validate_fs_path("/etc/passwd").is_err());
+        assert!(validate_fs_path("/root/.ssh/id_rsa").is_err());
+        assert!(validate_fs_path("/proc/1/environ").is_err());
+        // A prefix collision must not pass: "/workspace-evil" is not under
+        // "/workspace".
+        assert!(validate_fs_path("/workspace-evil/file").is_err());
+        assert!(validate_fs_path("/home/agent-evil/file").is_err());
+    }
+
+    #[test]
+    fn fs_paths_reject_nul_and_newline() {
+        assert!(validate_fs_path("/workspace/foo\0bar").is_err());
+        assert!(validate_fs_path("/workspace/foo\nbar").is_err());
+    }
+
+    #[test]
+    fn launch_argv_resolves_each_allowlisted_app_to_its_fixed_command() {
+        assert_eq!(
+            launch_argv("browser").unwrap(),
+            &[
+                "buzz-browser",
+                "--new-window",
+                "--user-data-dir=/home/agent/.config/chromium",
+                "--password-store=basic",
+                "--force-dark-mode",
+                "--enable-features=WebUIDarkMode",
+                "--no-sandbox",
+                "--test-type",
+            ]
+        );
+        assert_eq!(launch_argv("files").unwrap(), &["thunar", "/workspace"]);
+        assert_eq!(
+            launch_argv("terminal").unwrap(),
+            &["xfce4-terminal", "--working-directory=/workspace"]
+        );
+    }
+
+    #[test]
+    fn launch_argv_rejects_anything_outside_the_allowlist() {
+        // Includes attempts to smuggle a shell-meaningful string through the
+        // app name itself, which must be refused the same as any other
+        // unrecognized value — the name is looked up, never executed.
+        for bad in ["", "vim", "browser ", "Browser", "; rm -rf /", "../etc"] {
+            let err = launch_argv(bad).unwrap_err();
+            assert!(
+                err.contains("browser"),
+                "error should list allowed apps: {err}"
+            );
+            assert!(err.contains("files"));
+            assert!(err.contains("terminal"));
+        }
+    }
+
+    #[test]
+    fn window_action_argv_resolves_each_allowlisted_action_and_rejects_the_rest() {
+        for (name, _) in WINDOW_ACTIONS {
+            let argv = window_action_argv(name).unwrap();
+            // The window id must reach the command only via the environment
+            // variable — never as a literal argv slot a caller could fill.
+            assert!(argv.iter().any(|a| a.contains("$BUZZ_WINDOW")));
+        }
+        for bad in ["", "activate ", "Activate", "kill", "; reboot"] {
+            let err = window_action_argv(bad).unwrap_err();
+            assert!(
+                err.contains("activate") && err.contains("minimize") && err.contains("close"),
+                "error should list allowed actions: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn window_ids_accept_x11_forms_and_refuse_anything_shell_meaningful() {
+        for good in ["0x04000007", "0xdeadBEEF", "67108871", "1"] {
+            assert!(validate_window_id(good).is_ok(), "{good} should pass");
+        }
+        for bad in [
+            "",
+            "0x",
+            "-1",
+            "0x04000007; rm -rf /",
+            "$(reboot)",
+            "0x04 07",
+            "abc",
+            "0x11223344556677889900", // longer than any real X id
+        ] {
+            assert!(validate_window_id(bad).is_err(), "{bad:?} should fail");
+        }
     }
 }

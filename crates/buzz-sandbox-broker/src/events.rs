@@ -98,6 +98,48 @@ impl Publisher {
             .await;
     }
 
+    /// The latest announced expiry for one sandbox, from the relay.
+    ///
+    /// Crash recovery for the broker's live expiry state: an extend rewrites
+    /// broker memory and republishes the 48200, but the container label still
+    /// holds the *initial* expiry. After a broker restart the relay's latest
+    /// announcement is the only surviving record of an extension, so startup
+    /// seeds from here rather than reaping an extended sandbox early.
+    pub async fn fetch_latest_expiry(&self, sandbox_id: &str) -> Option<i64> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .ok()?;
+        let body = serde_json::json!([{
+            "kinds": [KIND_SANDBOX_CREATED],
+            "#d": [sandbox_id],
+            "limit": 1
+        }])
+        .to_string();
+        let url = format!("{}/query", self.relay_http);
+        let auth = self.sign_request("POST", &url, body.as_bytes())?;
+        let resp = client
+            .post(&url)
+            .header(reqwest::header::AUTHORIZATION, format!("Nostr {auth}"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let events: serde_json::Value = resp.json().await.ok()?;
+        let event = events.as_array()?.first()?;
+        event
+            .get("tags")?
+            .as_array()?
+            .iter()
+            .filter_map(|t| t.as_array())
+            .find(|t| t.first().and_then(|v| v.as_str()) == Some("expires_at"))
+            .and_then(|t| t.get(1)?.as_str()?.parse::<i64>().ok())
+    }
+
     /// Build a NIP-98 `Authorization` value for the broker's own HTTP request.
     ///
     /// Distinct from the event being published: this authenticates the *request*
