@@ -1,0 +1,93 @@
+!! BuzzDark — a minimal flat dark openbox theme for the agent's desktop.
+!!
+!! Goal: window chrome that looks like a modern app, not the 1980s-Motif
+!! default openbox ships with. Flat fills, no bevels/gradients, one accent
+!! color. Titlebar button glyphs are hand-shipped .xbm bitmaps (iconify /
+!! max / max_toggled / close) drawn Chromium-style: 1px strokes on a 12x12
+!! grid. Without them openbox falls back to its tiny built-in glyphs, which
+!! read as cheap next to Chromium's own titlebar buttons.
+!!
+!! There is no window.title.height key in openbox's theme format — an
+!! earlier version of this theme set one, which openbox silently ignored
+!! (unknown keys are not errors), and the titlebar rendered at whatever
+!! height the font's line-height plus padding.height produced: with
+!! padding.height left at its default and no font set, that collapsed to
+!! ~14px — enough to be visible, not enough to feel like a comfortable
+!! drag target. The real controls are padding.height (global internal
+!! padding for labels/buttons) and window.font (size drives the titlebar's
+!! actual height, since openbox sizes the bar to fit the label). Both are
+!! set explicitly below (padding.width sits with the rest of the border
+!! settings further down) to produce a ~30px bar.
+!! (No font key here: openbox reads titlebar/menu fonts from rc.xml's
+!! <theme><font place=...> entries — see sprig-desktop-openbox-rc.xml.)
+!!
+!! Colors are neutral greys matched to Chromium's dark frame (#282828
+!! active), so openbox-decorated windows (Thunar, xfce4-terminal) sit next
+!! to Chromium without a visible tint difference — an earlier aubergine
+!! tint read as purple beside the browser and was flagged by the user.
+window.active.title.bg: flat solid
+window.active.title.bg.color: #282828
+window.inactive.title.bg: flat solid
+window.inactive.title.bg.color: #1f1f1f
+
+!! Titlebar text
+window.label.text.justify: center
+window.active.label.bg: parentrelative
+window.active.label.text.color: #e8e8e8
+window.inactive.label.bg: parentrelative
+window.inactive.label.text.color: #8f8f8f
+
+!! Titlebar buttons (close / maximize / iconify) — flat, subtle hover only.
+window.*.button.*.bg: parentrelative
+window.active.button.*.hover.bg: flat solid
+window.active.button.*.hover.bg.color: #3a3a3a
+window.inactive.button.*.hover.bg: parentrelative
+window.*.button.*.pressed.bg: flat solid
+window.*.button.*.pressed.bg.color: #464646
+
+window.active.button.*.image.color: #c8c8c8
+window.active.button.disabled.image.color: #6e6e6e
+window.inactive.button.*.image.color: #6e6e6e
+window.inactive.button.disabled.image.color: #3c3c3c
+
+!! Borders — thin, no bevel/handle. window.handle.width: 0 removes the
+!! resize-grip strip below the titlebar that reads as dated. padding.width
+!! (horizontal) widens each titlebar button around its glyph — 6 spreads
+!! the buttons apart like Chromium's; padding.height gives the bar its
+!! ~30px height. window.client.padding.* is the separate, unrelated space
+!! around the app's own content and stays 0.
+window.active.border.color: #3a3a3a
+window.inactive.border.color: #1a1a1a
+border.width: 1
+padding.width: 6
+padding.height: 8
+window.handle.width: 0
+window.client.padding.width: 0
+window.client.padding.height: 0
+
+!! Menu — this is the root right-click launcher (New Browser Window /
+!! Files / Terminal / Close), the human's only way to open new windows
+!! since there's no dock. Generous padding and a real UI font so it reads
+!! as a modern app menu, not a stock 1990s window-manager popup. Same
+!! neutral greys as the titlebar above.
+menu.font: shadow=n:Inter:size=11
+menu.title.font: shadow=n:Inter Bold:size=11
+menu.items.bg: flat solid
+menu.items.bg.color: #232323
+menu.items.text.color: #e8e8e8
+menu.items.justify: left
+menu.items.disabled.text.color: #6e6e6e
+menu.title.bg: flat solid
+menu.title.bg.color: #1a1a1a
+menu.title.text.color: #e8e8e8
+menu.title.text.justify: left
+menu.items.active.bg: flat solid
+menu.items.active.bg.color: #3a3a3a
+menu.items.active.text.color: #ffffff
+menu.overlap: 0
+menu.border.color: #3a3a3a
+menu.border.width: 1
+
+!! On-screen displays (e.g. the alt-tab switcher)
+osd.bg: flat solid
+osd.bg.color: #232323

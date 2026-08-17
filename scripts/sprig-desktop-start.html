@@ -1,0 +1,40 @@
+<!doctype html>
+<!--
+  Chromium's home page on a fresh launch, before the agent or a human
+  navigates anywhere. about:blank renders white even with dark mode forced
+  (it's Chromium's own internal page, not a web page dark mode touches), and
+  a white flash is the first thing a human sees on takeover — exactly the
+  "generic Linux box" impression the rest of this image works to avoid. This
+  is a local file so it needs no network and loads instantly.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ready</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+  }
+  body {
+    /* Echoes sprig-desktop-wallpaper.png's navy-to-teal glow toward the
+       upper-right, kept subtle (single soft radial, no vignette) so this
+       page and the desktop behind it read as one system rather than two
+       different backgrounds swapping in and out. */
+    background:
+      radial-gradient(ellipse at 86% 12%, rgba(34, 122, 138, 0.35), transparent 55%),
+      #0b1421;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #5b6470;
+    font-size: 14px;
+    letter-spacing: 0.02em;
+  }
+</style>
+</head>
+<body>
+  This computer is ready.
+</body>
+</html>

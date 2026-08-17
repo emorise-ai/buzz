@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The agent desktop's root right-click menu — exactly 4 entries, no
+  submenus, none of openbox's stock "Debian menu"/ObConf/Reconfigure/
+  Restart/Exit clutter (that's what ships in the system default
+  menu.xml, and it's what silently loads instead of this file if rc.xml's
+  reference to it is missing or malformed — confirmed by hitting exactly
+  that fallback once already).
+
+  This is a SEPARATE file from rc.xml, referenced via rc.xml's
+  <menu><file>menu.xml</file></menu>. An earlier version of this theme put
+  the <menu id="root-menu"> definition directly inline inside rc.xml's own
+  <menu> block; openbox never actually loads menu content that way — the
+  <menu> block in rc.xml is only a pointer to file(s) like this one, never
+  a container for menu items itself. That mistake produced no parse error
+  (rc.xml itself was valid XML) and no log line either; it just silently
+  fell through to the stock system menu, which only showed up by actually
+  right-clicking the desktop and looking, not by checking logs.
+-->
+<openbox_menu xmlns="http://openbox.org/">
+  <menu id="root-menu" label="Buzz">
+    <item label="New Browser Window">
+      <!-- Execute's command goes in a nested <execute> tag, not a
+           <command> tag — the other half of the same mistake above.
+           Opens against the SAME user-data-dir the main browser process
+           uses (set in supervise), so a session the human logs into in
+           one Chromium window is already there in a new one. -->
+      <action name="Execute">
+        <execute>buzz-browser --new-window --user-data-dir=/home/agent/.config/chromium --password-store=basic --force-dark-mode --enable-features=WebUIDarkMode --no-sandbox --test-type</execute>
+      </action>
+    </item>
+    <item label="Files">
+      <action name="Execute">
+        <execute>thunar /workspace</execute>
+      </action>
+    </item>
+    <item label="Terminal">
+      <action name="Execute">
+        <execute>xfce4-terminal</execute>
+      </action>
+    </item>
+    <separator />
+    <item label="Close">
+      <action name="Close" />
+    </item>
+  </menu>
+</openbox_menu>
