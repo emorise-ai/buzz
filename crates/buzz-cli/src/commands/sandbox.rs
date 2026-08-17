@@ -54,7 +54,144 @@ pub async fn dispatch(cmd: crate::SandboxCmd, client: &BuzzClient) -> Result<(),
             println!("{}", serde_json::json!({ "id": id, "destroyed": true }));
             Ok(())
         }
+        crate::SandboxCmd::Exec {
+            broker,
+            sandbox,
+            timeout,
+            workdir,
+            command,
+            argv,
+        } => {
+            let id = sandbox.require()?;
+            let argv = match (command, argv.is_empty()) {
+                (Some(command), true) => vec!["bash".to_string(), "-lc".to_string(), command],
+                (None, false) => argv,
+                (Some(_), false) => {
+                    return Err(CliError::Usage(
+                        "--command and trailing arguments are mutually exclusive".to_string(),
+                    ));
+                }
+                (None, true) => {
+                    return Err(CliError::Usage(
+                        "exec requires either --command <string> or trailing arguments after --"
+                            .to_string(),
+                    ));
+                }
+            };
+            let mut body = serde_json::json!({
+                "argv": argv,
+                "timeout_secs": timeout,
+            });
+            if let Some(workdir) = workdir {
+                body["workdir"] = serde_json::json!(workdir);
+            }
+            print_json(&client.sandbox_exec(&broker.broker, &id, &body).await?)
+        }
+        crate::SandboxCmd::Screenshot {
+            broker,
+            sandbox,
+            output,
+        } => {
+            let id = sandbox.require()?;
+            let bytes = client.sandbox_screenshot(&broker.broker, &id).await?;
+            let path = output.unwrap_or_else(|| default_screenshot_path(&id));
+            std::fs::write(&path, &bytes).map_err(|e| {
+                CliError::Other(format!("failed to write screenshot to {path}: {e}"))
+            })?;
+            print_json(&serde_json::json!({ "path": path, "bytes": bytes.len() }))
+        }
+        crate::SandboxCmd::Click {
+            broker,
+            sandbox,
+            x,
+            y,
+            button,
+        } => {
+            let id = sandbox.require()?;
+            let action = serde_json::json!([{ "type": "click", "x": x, "y": y, "button": button }]);
+            print_json(&client.sandbox_input(&broker.broker, &id, action).await?)
+        }
+        crate::SandboxCmd::DoubleClick {
+            broker,
+            sandbox,
+            x,
+            y,
+        } => {
+            let id = sandbox.require()?;
+            let action = serde_json::json!([{ "type": "double_click", "x": x, "y": y }]);
+            print_json(&client.sandbox_input(&broker.broker, &id, action).await?)
+        }
+        crate::SandboxCmd::Move {
+            broker,
+            sandbox,
+            x,
+            y,
+        } => {
+            let id = sandbox.require()?;
+            let action = serde_json::json!([{ "type": "move", "x": x, "y": y }]);
+            print_json(&client.sandbox_input(&broker.broker, &id, action).await?)
+        }
+        crate::SandboxCmd::Type {
+            broker,
+            sandbox,
+            text,
+        } => {
+            let id = sandbox.require()?;
+            let action = serde_json::json!([{ "type": "type", "text": text }]);
+            print_json(&client.sandbox_input(&broker.broker, &id, action).await?)
+        }
+        crate::SandboxCmd::Key {
+            broker,
+            sandbox,
+            combo,
+        } => {
+            let id = sandbox.require()?;
+            let action = serde_json::json!([{ "type": "key", "combo": combo }]);
+            print_json(&client.sandbox_input(&broker.broker, &id, action).await?)
+        }
+        crate::SandboxCmd::Scroll {
+            broker,
+            sandbox,
+            x,
+            y,
+            direction,
+            amount,
+        } => {
+            let id = sandbox.require()?;
+            let action = serde_json::json!([{
+                "type": "scroll",
+                "x": x,
+                "y": y,
+                "direction": direction,
+                "amount": amount,
+            }]);
+            print_json(&client.sandbox_input(&broker.broker, &id, action).await?)
+        }
+        crate::SandboxCmd::Open {
+            broker,
+            sandbox,
+            app,
+            url,
+        } => {
+            let id = sandbox.require()?;
+            let mut body = serde_json::json!({ "app": app });
+            if let Some(url) = url {
+                body["url"] = serde_json::json!(url);
+            }
+            print_json(&client.sandbox_launch(&broker.broker, &id, &body).await?)
+        }
     }
+}
+
+/// Default screenshot filename: short enough to be readable, unique enough
+/// not to collide across quick successive captures.
+fn default_screenshot_path(id: &str) -> String {
+    let id8: String = id.chars().take(8).collect();
+    let unixts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("./sandbox-screenshot-{id8}-{unixts}.png")
 }
 
 fn print_json(value: &serde_json::Value) -> Result<(), CliError> {

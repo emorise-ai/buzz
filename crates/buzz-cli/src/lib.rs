@@ -1760,6 +1760,93 @@ pub struct SandboxBrokerArg {
     pub broker: String,
 }
 
+/// Which sandbox to act on. Shared by every computer-use variant — the
+/// caller can name the id explicitly, or lean on `BUZZ_SANDBOX_ID`, which
+/// the ACP harness injects into a managed agent's own sandbox process.
+#[derive(clap::Args, Clone)]
+pub struct SandboxIdArg {
+    /// Sandbox id or name. Falls back to BUZZ_SANDBOX_ID.
+    #[arg(env = "BUZZ_SANDBOX_ID")]
+    pub id: Option<String>,
+}
+
+impl SandboxIdArg {
+    /// Resolve the sandbox id: explicit positional, then `BUZZ_SANDBOX_ID`
+    /// (both handled by clap's `env` fallback — this also covers the case
+    /// where clap accepted an empty value), then self-detection from inside
+    /// the container itself.
+    ///
+    /// `BUZZ_SANDBOX_ID` can't be injected at container creation — the
+    /// broker doesn't know the container's id until after `docker create`
+    /// returns, and env vars are fixed at creation. So a sandbox's own agent
+    /// process, run without the env var wired in, falls back to reading its
+    /// own hostname: Docker sets a container's hostname to its short id by
+    /// default (verified: the broker sets no custom hostname), and the
+    /// Docker API accepts unique id prefixes, so the hostname works
+    /// unmodified as an id. Guarded so a non-hex hostname (e.g. a host
+    /// process with `/.dockerenv` coincidentally present) never gets used.
+    pub fn require(&self) -> Result<String, CliError> {
+        resolve_sandbox_id(
+            self.id.as_deref(),
+            std::path::Path::new("/.dockerenv").exists(),
+            read_hostname,
+        )
+    }
+}
+
+/// Pure resolution: explicit id, then self-detection gated on `in_container`,
+/// using `hostname` to fetch the kernel hostname lazily (only read when
+/// actually inside a container — avoids a needless syscall/file-read on the
+/// host, and lets tests inject a fake hostname without touching the fs).
+///
+/// `in_container` stands in for `/.dockerenv`'s existence and `hostname` for
+/// `/etc/hostname`'s contents so the precedence and hex-shape guard are
+/// testable without a real container.
+fn resolve_sandbox_id(
+    explicit: Option<&str>,
+    in_container: bool,
+    hostname: impl FnOnce() -> Option<String>,
+) -> Result<String, CliError> {
+    if let Some(id) = explicit {
+        if !id.is_empty() {
+            return Ok(id.to_string());
+        }
+    }
+    if in_container {
+        if let Some(id) = hostname().and_then(|h| container_id_from_hostname(&h)) {
+            return Ok(id);
+        }
+    }
+    Err(CliError::Usage(
+        "sandbox id required: pass it as an argument or set BUZZ_SANDBOX_ID \
+         (inside a Buzz computer, the id is auto-detected from the container \
+         hostname — this only fails outside a sandbox)"
+            .to_string(),
+    ))
+}
+
+/// Read the kernel hostname the same way `gethostname(2)` would, via the
+/// `/proc`-free `/etc/hostname` file so no extra crate/FFI is needed.
+fn read_hostname() -> Option<String> {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Validate (and normalize) a hostname as a Docker short container id:
+/// `^[0-9a-f]{12,64}$` case-insensitively (normalized to lowercase). Docker
+/// container ids are hex, 12-64 characters, and the daemon accepts any
+/// unique prefix, so this is safe to hand straight to the broker as-is.
+fn container_id_from_hostname(hostname: &str) -> Option<String> {
+    let candidate = hostname.trim().to_ascii_lowercase();
+    if (12..=64).contains(&candidate.len()) && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 #[derive(Subcommand)]
 pub enum SandboxCmd {
     /// Create a sandbox — a remote desktop + browser owned by this key
@@ -1808,6 +1895,110 @@ pub enum SandboxCmd {
         broker: SandboxBrokerArg,
         /// Sandbox id or name
         id: String,
+    },
+    /// Run a command on the sandbox and capture its output
+    Exec {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        #[command(flatten)]
+        sandbox: SandboxIdArg,
+        /// Seconds before the command is killed
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+        /// Working directory for the command
+        #[arg(long)]
+        workdir: Option<String>,
+        /// Run this string via `bash -lc` instead of an argv (mutually
+        /// exclusive with trailing arguments)
+        #[arg(short = 'c', long, conflicts_with = "argv")]
+        command: Option<String>,
+        /// Command and arguments to run verbatim, e.g. `-- ls -la /workspace`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
+    /// Capture a PNG screenshot of the sandbox's screen
+    Screenshot {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        #[command(flatten)]
+        sandbox: SandboxIdArg,
+        /// Output path. Default: ./sandbox-screenshot-<id8>-<unixts>.png
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Click at a screen coordinate
+    Click {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        x: i64,
+        y: i64,
+        #[command(flatten)]
+        sandbox: SandboxIdArg,
+        /// Mouse button to click
+        #[arg(long, default_value = "left")]
+        button: String,
+    },
+    /// Double-click at a screen coordinate
+    DoubleClick {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        x: i64,
+        y: i64,
+        #[command(flatten)]
+        sandbox: SandboxIdArg,
+    },
+    /// Move the mouse to a screen coordinate
+    Move {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        x: i64,
+        y: i64,
+        #[command(flatten)]
+        sandbox: SandboxIdArg,
+    },
+    /// Type text at the current focus
+    Type {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        text: String,
+        #[command(flatten)]
+        sandbox: SandboxIdArg,
+    },
+    /// Send a key combo, e.g. `ctrl+t`
+    Key {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        combo: String,
+        #[command(flatten)]
+        sandbox: SandboxIdArg,
+    },
+    /// Scroll at a screen coordinate
+    Scroll {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        x: i64,
+        y: i64,
+        #[command(flatten)]
+        sandbox: SandboxIdArg,
+        /// Scroll direction
+        #[arg(long)]
+        direction: String,
+        /// Number of scroll steps
+        #[arg(long, default_value_t = 1)]
+        amount: u32,
+    },
+    /// Launch an app on the sandbox desktop
+    Open {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        #[command(flatten)]
+        sandbox: SandboxIdArg,
+        /// App to launch
+        #[arg(long)]
+        app: String,
+        /// URL to open (browser only)
+        #[arg(long)]
+        url: Option<String>,
     },
 }
 
@@ -2604,6 +2795,390 @@ mod tests {
             ])
             .is_err(),
             "--visibility chartreuse on update must be rejected at parse time"
+        );
+    }
+
+    // ── sandbox computer-use commands ──────────────────────────────────────
+
+    /// With no positional id, no BUZZ_SANDBOX_ID, and not running inside a
+    /// container, resolution must return a Usage error naming both the
+    /// positional arg and the env var — this is the only way an agent
+    /// without an id learns what to set.
+    #[test]
+    fn sandbox_id_missing_is_usage_error_naming_arg_and_env_var() {
+        let err = resolve_sandbox_id(None, false, || None)
+            .expect_err("no id, no env, not in a container must fail");
+        match err {
+            CliError::Usage(msg) => {
+                assert!(
+                    msg.contains("argument"),
+                    "usage error must mention the positional argument: {msg}"
+                );
+                assert!(
+                    msg.contains("BUZZ_SANDBOX_ID"),
+                    "usage error must name BUZZ_SANDBOX_ID: {msg}"
+                );
+                assert!(
+                    msg.contains("auto-detected"),
+                    "usage error must mention that a Buzz computer auto-detects its id: {msg}"
+                );
+            }
+            other => panic!("expected Usage error, got {other:?}"),
+        }
+    }
+
+    /// Inside a container but with no plausible container-id hostname
+    /// (covers both a non-hex hostname and a hostname read failure), the
+    /// error must still be a Usage error — self-detection never invents an
+    /// id when the guard doesn't clear.
+    #[test]
+    fn sandbox_id_in_container_with_bad_hostname_falls_through_to_usage_error() {
+        for hostname in [
+            Some("not-hex-at-all".to_string()),
+            Some("ab12".to_string()),
+            None,
+        ] {
+            let err = resolve_sandbox_id(None, true, || hostname.clone())
+                .expect_err("non-hex or too-short hostname must not resolve");
+            assert!(matches!(err, CliError::Usage(_)));
+        }
+    }
+
+    /// The explicit positional always wins, even inside a container with a
+    /// plausible hostname — precedence order 1 beats order 3.
+    #[test]
+    fn sandbox_id_explicit_beats_self_detection() {
+        let id = resolve_sandbox_id(Some("explicit-id"), true, || {
+            Some("abcdef012345".to_string())
+        })
+        .expect("explicit id must resolve");
+        assert_eq!(id, "explicit-id");
+    }
+
+    /// `BUZZ_SANDBOX_ID` is modeled as clap's `env` fallback landing in
+    /// `explicit` before `require()` ever runs (clap resolves positional-or-env
+    /// before the app sees the value) — so env-set beats self-detection too,
+    /// via the same `explicit` branch.
+    #[test]
+    fn sandbox_id_env_fallback_beats_self_detection() {
+        let id = resolve_sandbox_id(Some("from-env"), true, || Some("abcdef012345".to_string()))
+            .expect("env-sourced id must resolve");
+        assert_eq!(id, "from-env");
+    }
+
+    /// With no explicit id but inside a container with a hostname that looks
+    /// like a Docker short container id (12+ hex chars), self-detection
+    /// resolves it — this is the whole point of the fallback: the broker
+    /// can't inject BUZZ_SANDBOX_ID at container-create time.
+    #[test]
+    fn sandbox_id_self_detection_uses_hex_hostname_in_container() {
+        let id = resolve_sandbox_id(None, true, || Some("a1b2c3d4e5f6".to_string()))
+            .expect("12-hex-char hostname in a container must resolve");
+        assert_eq!(id, "a1b2c3d4e5f6");
+    }
+
+    /// A hostname that happens to satisfy the hex-shape guard but has mixed
+    /// case is normalized to lowercase — Docker ids are conventionally
+    /// lowercase and the broker should see a consistent form.
+    #[test]
+    fn sandbox_id_self_detection_normalizes_case() {
+        let id = resolve_sandbox_id(None, true, || Some("A1B2C3D4E5F6".to_string()))
+            .expect("uppercase-hex hostname must still resolve");
+        assert_eq!(id, "a1b2c3d4e5f6");
+    }
+
+    /// Outside a container (the common case: developer's own machine, or the
+    /// broker host itself), self-detection must never fire even if a fake
+    /// hostname source would satisfy the hex guard — `in_container` is the
+    /// gate, not just the hostname shape.
+    #[test]
+    fn sandbox_id_self_detection_skipped_outside_container() {
+        let err = resolve_sandbox_id(None, false, || Some("a1b2c3d4e5f6".to_string()))
+            .expect_err("hex-looking hostname outside a container must not resolve");
+        assert!(matches!(err, CliError::Usage(_)));
+    }
+
+    #[test]
+    fn container_id_from_hostname_accepts_twelve_hex_chars() {
+        assert_eq!(
+            container_id_from_hostname("a1b2c3d4e5f6"),
+            Some("a1b2c3d4e5f6".to_string())
+        );
+    }
+
+    #[test]
+    fn container_id_from_hostname_accepts_longer_hex_ids() {
+        assert_eq!(
+            container_id_from_hostname("a1b2c3d4e5f678901234"),
+            Some("a1b2c3d4e5f678901234".to_string())
+        );
+    }
+
+    #[test]
+    fn container_id_from_hostname_accepts_sixty_four_hex_chars() {
+        let id64 = "a".repeat(64);
+        assert_eq!(container_id_from_hostname(&id64), Some(id64));
+    }
+
+    #[test]
+    fn container_id_from_hostname_rejects_over_sixty_four_hex_chars() {
+        let id65 = "a".repeat(65);
+        assert_eq!(container_id_from_hostname(&id65), None);
+    }
+
+    #[test]
+    fn container_id_from_hostname_rejects_short_hex() {
+        assert_eq!(container_id_from_hostname("a1b2c3d4e5f"), None);
+    }
+
+    #[test]
+    fn container_id_from_hostname_rejects_non_hex() {
+        for bad in ["localhost", "my-laptop", "sandbox-01", ""] {
+            assert_eq!(container_id_from_hostname(bad), None, "input: {bad:?}");
+        }
+    }
+
+    /// An explicit positional id takes precedence and resolves cleanly.
+    #[test]
+    fn sandbox_id_explicit_positional_resolves() {
+        let Cmd::Sandbox(SandboxCmd::Click { sandbox, .. }) = Cli::try_parse_from([
+            "buzz",
+            "--relay",
+            "wss://x",
+            "sandbox",
+            "click",
+            "--broker",
+            "http://broker",
+            "1",
+            "2",
+            "explicit-id",
+        ])
+        .expect("parses with an explicit id")
+        .command
+        else {
+            panic!("expected Sandbox(Click)");
+        };
+        assert_eq!(sandbox.require().unwrap(), "explicit-id");
+    }
+
+    /// `exec` accepts trailing argv without `--command`.
+    #[test]
+    fn sandbox_exec_accepts_trailing_argv() {
+        let Cmd::Sandbox(SandboxCmd::Exec { command, argv, .. }) = Cli::try_parse_from([
+            "buzz",
+            "--relay",
+            "wss://x",
+            "sandbox",
+            "exec",
+            "--broker",
+            "http://broker",
+            "myid",
+            "--",
+            "ls",
+            "-la",
+            "/workspace",
+        ])
+        .expect("parses with trailing argv")
+        .command
+        else {
+            panic!("expected Sandbox(Exec)");
+        };
+        assert!(command.is_none());
+        assert_eq!(argv, vec!["ls", "-la", "/workspace"]);
+    }
+
+    /// `exec -c "<string>"` and trailing argv are mutually exclusive —
+    /// clap must reject the combination before dispatch ever sees it.
+    #[test]
+    fn sandbox_exec_command_and_argv_are_mutually_exclusive() {
+        assert!(
+            Cli::try_parse_from([
+                "buzz",
+                "--relay",
+                "wss://x",
+                "sandbox",
+                "exec",
+                "--broker",
+                "http://broker",
+                "myid",
+                "-c",
+                "echo hi",
+                "--",
+                "ls",
+            ])
+            .is_err(),
+            "-c and trailing argv together must be rejected at parse time"
+        );
+    }
+
+    /// `exec -c` alone parses to a `command` value with empty argv.
+    #[test]
+    fn sandbox_exec_command_flag_parses() {
+        let Cmd::Sandbox(SandboxCmd::Exec { command, argv, .. }) = Cli::try_parse_from([
+            "buzz",
+            "--relay",
+            "wss://x",
+            "sandbox",
+            "exec",
+            "--broker",
+            "http://broker",
+            "myid",
+            "-c",
+            "echo hi",
+        ])
+        .expect("parses with -c")
+        .command
+        else {
+            panic!("expected Sandbox(Exec)");
+        };
+        assert_eq!(command.as_deref(), Some("echo hi"));
+        assert!(argv.is_empty());
+    }
+
+    /// `exec` with neither `-c` nor trailing argv parses fine at the clap
+    /// layer (both are optional) but must be rejected by dispatch — model
+    /// that mapping directly against the same argv/command shape dispatch
+    /// sees, without needing a live broker.
+    #[test]
+    fn sandbox_exec_requires_command_or_argv_at_dispatch() {
+        let Cmd::Sandbox(SandboxCmd::Exec { command, argv, .. }) = Cli::try_parse_from([
+            "buzz",
+            "--relay",
+            "wss://x",
+            "sandbox",
+            "exec",
+            "--broker",
+            "http://broker",
+            "myid",
+        ])
+        .expect("parses with neither -c nor argv")
+        .command
+        else {
+            panic!("expected Sandbox(Exec)");
+        };
+        assert!(command.is_none());
+        assert!(argv.is_empty());
+        // Mirrors commands::sandbox::dispatch's argv resolution.
+        let resolved = match (command, argv.is_empty()) {
+            (Some(_), true) => unreachable!(),
+            (None, false) => unreachable!(),
+            (Some(_), false) => unreachable!(),
+            (None, true) => Err::<Vec<String>, _>(CliError::Usage(
+                "exec requires either --command <string> or trailing arguments after --"
+                    .to_string(),
+            )),
+        };
+        assert!(matches!(resolved, Err(CliError::Usage(_))));
+    }
+
+    /// Action-producing commands (click, key, scroll, ...) must map their
+    /// flags into the exact broker action shape the contract defines.
+    #[test]
+    fn sandbox_click_action_body_shape() {
+        let Cmd::Sandbox(SandboxCmd::Click {
+            x,
+            y,
+            button,
+            sandbox,
+            ..
+        }) = Cli::try_parse_from([
+            "buzz",
+            "--relay",
+            "wss://x",
+            "sandbox",
+            "click",
+            "--broker",
+            "http://broker",
+            "10",
+            "20",
+            "myid",
+            "--button",
+            "right",
+        ])
+        .expect("parses")
+        .command
+        else {
+            panic!("expected Sandbox(Click)");
+        };
+        assert_eq!(sandbox.require().unwrap(), "myid");
+        let action = serde_json::json!([{ "type": "click", "x": x, "y": y, "button": button }]);
+        assert_eq!(
+            action,
+            serde_json::json!([{ "type": "click", "x": 10, "y": 20, "button": "right" }])
+        );
+    }
+
+    #[test]
+    fn sandbox_scroll_action_body_shape() {
+        let Cmd::Sandbox(SandboxCmd::Scroll {
+            x,
+            y,
+            direction,
+            amount,
+            ..
+        }) = Cli::try_parse_from([
+            "buzz",
+            "--relay",
+            "wss://x",
+            "sandbox",
+            "scroll",
+            "--broker",
+            "http://broker",
+            "5",
+            "6",
+            "myid",
+            "--direction",
+            "down",
+            "--amount",
+            "3",
+        ])
+        .expect("parses")
+        .command
+        else {
+            panic!("expected Sandbox(Scroll)");
+        };
+        let action = serde_json::json!([{
+            "type": "scroll",
+            "x": x,
+            "y": y,
+            "direction": direction,
+            "amount": amount,
+        }]);
+        assert_eq!(
+            action,
+            serde_json::json!([{ "type": "scroll", "x": 5, "y": 6, "direction": "down", "amount": 3 }])
+        );
+    }
+
+    /// `open --app browser --url ...` maps into the launch request shape.
+    #[test]
+    fn sandbox_open_launch_body_shape() {
+        let Cmd::Sandbox(SandboxCmd::Open { app, url, .. }) = Cli::try_parse_from([
+            "buzz",
+            "--relay",
+            "wss://x",
+            "sandbox",
+            "open",
+            "--broker",
+            "http://broker",
+            "myid",
+            "--app",
+            "browser",
+            "--url",
+            "https://example.com",
+        ])
+        .expect("parses")
+        .command
+        else {
+            panic!("expected Sandbox(Open)");
+        };
+        let mut body = serde_json::json!({ "app": app });
+        if let Some(url) = url {
+            body["url"] = serde_json::json!(url);
+        }
+        assert_eq!(
+            body,
+            serde_json::json!({ "app": "browser", "url": "https://example.com" })
         );
     }
 }

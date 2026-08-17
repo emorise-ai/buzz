@@ -2592,6 +2592,120 @@ impl BuzzClient {
             .await?;
         Ok(())
     }
+
+    /// Run a command on the sandbox and capture its output.
+    pub async fn sandbox_exec(
+        &self,
+        broker_url: &str,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, CliError> {
+        let url = format!("{}/sandboxes/{id}/exec", broker_url.trim_end_matches('/'));
+        let (_, text) = self
+            .broker_call(
+                reqwest::Method::POST,
+                &url,
+                Some(body.to_string().into_bytes()),
+            )
+            .await?;
+        parse_broker_json(&text)
+    }
+
+    /// Capture a PNG screenshot of the sandbox's screen.
+    pub async fn sandbox_screenshot(
+        &self,
+        broker_url: &str,
+        id: &str,
+    ) -> Result<Vec<u8>, CliError> {
+        let url = format!(
+            "{}/sandboxes/{id}/screenshot",
+            broker_url.trim_end_matches('/')
+        );
+        self.broker_call_binary(reqwest::Method::GET, &url, None)
+            .await
+    }
+
+    /// Perform one or more input actions (mouse/keyboard) on the sandbox.
+    pub async fn sandbox_input(
+        &self,
+        broker_url: &str,
+        id: &str,
+        actions: serde_json::Value,
+    ) -> Result<serde_json::Value, CliError> {
+        let url = format!("{}/sandboxes/{id}/input", broker_url.trim_end_matches('/'));
+        let body = serde_json::json!({ "actions": actions });
+        let (_, text) = self
+            .broker_call(
+                reqwest::Method::POST,
+                &url,
+                Some(body.to_string().into_bytes()),
+            )
+            .await?;
+        parse_broker_json(&text)
+    }
+
+    /// Launch an app on the sandbox desktop.
+    pub async fn sandbox_launch(
+        &self,
+        broker_url: &str,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, CliError> {
+        let url = format!("{}/sandboxes/{id}/launch", broker_url.trim_end_matches('/'));
+        let (_, text) = self
+            .broker_call(
+                reqwest::Method::POST,
+                &url,
+                Some(body.to_string().into_bytes()),
+            )
+            .await?;
+        parse_broker_json(&text)
+    }
+
+    /// Same signing/status-mapping as `broker_call`, but returns the raw
+    /// response body instead of decoding it as text/JSON — used for the
+    /// screenshot endpoint, which answers with PNG bytes.
+    async fn broker_call_binary(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, CliError> {
+        let auth = sign_nip98(&self.keys, method.as_str(), url, body.as_deref())?;
+        let mut req = self
+            .http
+            .request(method, url)
+            .header(reqwest::header::AUTHORIZATION, auth);
+        if let Some(body) = body {
+            req = req
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body);
+        }
+        let resp = req.send().await?;
+        let status = resp.status().as_u16();
+        if !(200..=299).contains(&status) {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(match status {
+                401 | 403 => CliError::Auth(broker_detail(status, &text)),
+                404 => CliError::NotFound(broker_detail(status, &text)),
+                400 => CliError::Usage(broker_detail(status, &text)),
+                _ => CliError::Relay { status, body: text },
+            });
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        if !content_type.starts_with("image/png") {
+            return Err(CliError::Other(format!(
+                "expected image/png from screenshot endpoint, got '{content_type}'"
+            )));
+        }
+        let bytes = resp.bytes().await?;
+        Ok(bytes.to_vec())
+    }
 }
 
 /// The broker answers `{"error": "..."}`; surface that text rather than the
