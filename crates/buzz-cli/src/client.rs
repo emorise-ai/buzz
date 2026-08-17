@@ -2497,3 +2497,113 @@ mod tests {
         );
     }
 }
+
+/// Sandbox broker calls.
+///
+/// The broker is its own HTTP service, not a relay door: it lives where the
+/// sandboxes run and is reached through `BUZZ_SANDBOX_BROKER_URL` (injected
+/// into a managed agent's environment the same way the relay URL is). Requests
+/// are signed with the same NIP-98 scheme the relay uses, so the agent's one
+/// identity authenticates it everywhere.
+impl BuzzClient {
+    async fn broker_call(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<(u16, String), CliError> {
+        let auth = sign_nip98(&self.keys, method.as_str(), url, body.as_deref())?;
+        let mut req = self
+            .http
+            .request(method, url)
+            .header(reqwest::header::AUTHORIZATION, auth);
+        if let Some(body) = body {
+            req = req
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body);
+        }
+        let resp = req.send().await?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        match status {
+            200..=299 => Ok((status, text)),
+            401 | 403 => Err(CliError::Auth(broker_detail(status, &text))),
+            404 => Err(CliError::NotFound(broker_detail(status, &text))),
+            400 => Err(CliError::Usage(broker_detail(status, &text))),
+            _ => Err(CliError::Relay { status, body: text }),
+        }
+    }
+
+    /// Create a sandbox. `body` is the broker's create contract; the caller
+    /// decides image, owner, budget, and env.
+    pub async fn sandbox_create(
+        &self,
+        broker_url: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, CliError> {
+        let url = format!("{}/sandboxes", broker_url.trim_end_matches('/'));
+        let (_, text) = self
+            .broker_call(
+                reqwest::Method::POST,
+                &url,
+                Some(body.to_string().into_bytes()),
+            )
+            .await?;
+        parse_broker_json(&text)
+    }
+
+    pub async fn sandbox_list(&self, broker_url: &str) -> Result<serde_json::Value, CliError> {
+        let url = format!("{}/sandboxes", broker_url.trim_end_matches('/'));
+        let (_, text) = self.broker_call(reqwest::Method::GET, &url, None).await?;
+        parse_broker_json(&text)
+    }
+
+    pub async fn sandbox_status(
+        &self,
+        broker_url: &str,
+        id: &str,
+    ) -> Result<serde_json::Value, CliError> {
+        let url = format!("{}/sandboxes/{id}", broker_url.trim_end_matches('/'));
+        let (_, text) = self.broker_call(reqwest::Method::GET, &url, None).await?;
+        parse_broker_json(&text)
+    }
+
+    pub async fn sandbox_extend(
+        &self,
+        broker_url: &str,
+        id: &str,
+        ttl_seconds: u64,
+    ) -> Result<serde_json::Value, CliError> {
+        let url = format!("{}/sandboxes/{id}/extend", broker_url.trim_end_matches('/'));
+        let body = serde_json::json!({ "ttl_seconds": ttl_seconds });
+        let (_, text) = self
+            .broker_call(
+                reqwest::Method::POST,
+                &url,
+                Some(body.to_string().into_bytes()),
+            )
+            .await?;
+        parse_broker_json(&text)
+    }
+
+    pub async fn sandbox_destroy(&self, broker_url: &str, id: &str) -> Result<(), CliError> {
+        let url = format!("{}/sandboxes/{id}", broker_url.trim_end_matches('/'));
+        self.broker_call(reqwest::Method::DELETE, &url, None)
+            .await?;
+        Ok(())
+    }
+}
+
+/// The broker answers `{"error": "..."}`; surface that text rather than the
+/// JSON wrapper.
+fn broker_detail(status: u16, body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .unwrap_or_else(|| format!("broker returned {status}: {body}"))
+}
+
+fn parse_broker_json(text: &str) -> Result<serde_json::Value, CliError> {
+    serde_json::from_str(text)
+        .map_err(|e| CliError::Other(format!("broker returned unparseable JSON: {e}")))
+}

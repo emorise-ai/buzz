@@ -231,6 +231,9 @@ enum Cmd {
     /// Upload files to the relay's Blossom store
     #[command(subcommand)]
     Upload(UploadCmd),
+    /// Create, extend, and destroy this agent's remote computer (sandbox)
+    #[command(subcommand)]
+    Sandbox(SandboxCmd),
     /// Agent engram management — persistent memory per NIP-AE
     #[command(subcommand)]
     Mem(MemCmd),
@@ -1748,6 +1751,66 @@ pub enum UploadCmd {
     },
 }
 
+/// Where the sandbox broker lives. Shared by every `buzz sandbox` variant so
+/// the agent's injected environment answers it without a flag.
+#[derive(clap::Args, Clone)]
+pub struct SandboxBrokerArg {
+    /// Sandbox broker base URL. Overrides BUZZ_SANDBOX_BROKER_URL.
+    #[arg(long = "broker", env = "BUZZ_SANDBOX_BROKER_URL")]
+    pub broker: String,
+}
+
+#[derive(Subcommand)]
+pub enum SandboxCmd {
+    /// Create a sandbox — a remote desktop + browser owned by this key
+    Create {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        /// Image to run (must be on the broker's allowlist)
+        #[arg(long, env = "BUZZ_SANDBOX_IMAGE", default_value = "buzz-sprig-desktop")]
+        image: String,
+        /// Lifetime in seconds before the sandbox is reclaimed
+        #[arg(long, default_value_t = 1800)]
+        ttl: u64,
+        /// CPU budget (broker clamps to its ceiling)
+        #[arg(long)]
+        cpus: Option<f64>,
+        /// Memory budget in MB (broker clamps to its ceiling)
+        #[arg(long)]
+        memory_mb: Option<u64>,
+    },
+    /// List sandboxes the broker manages
+    List {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+    },
+    /// One sandbox's state, including its live expiry
+    Status {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        /// Sandbox id or name
+        id: String,
+    },
+    /// Buy a sandbox more time: lifetime becomes now + --ttl (owner only,
+    /// capped at 8h total from creation)
+    Extend {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        /// Sandbox id or name
+        id: String,
+        /// Seconds of lifetime wanted from now
+        #[arg(long)]
+        ttl: u64,
+    },
+    /// Destroy a sandbox now
+    Destroy {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        /// Sandbox id or name
+        id: String,
+    },
+}
+
 #[derive(Subcommand)]
 pub enum MediaCmd {
     /// Download relay media with Blossom get auth
@@ -2057,6 +2120,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Pr(sub) => commands::pr::dispatch(sub, &client).await,
         Cmd::Media(sub) => commands::upload::dispatch_media(sub, &client).await,
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
+        Cmd::Sandbox(sub) => commands::sandbox::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
         Cmd::Pack(_) => unreachable!("handled above"),
@@ -2164,6 +2228,7 @@ mod tests {
             "projects",
             "reactions",
             "repos",
+            "sandbox",
             "social",
             "upload",
             "users",

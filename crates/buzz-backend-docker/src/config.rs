@@ -21,6 +21,13 @@ pub struct ProviderConfig {
     pub cpus: f64,
     pub memory_mb: u64,
     pub inactivity_seconds: u64,
+    /// Broker base URL *as seen from inside a sandbox*, injected into the
+    /// agent's environment as `BUZZ_SANDBOX_BROKER_URL` so `buzz sandbox …`
+    /// can manage the agent's own computer. Distinct from `broker_url`, which
+    /// is where *this provider* reaches the broker (often a local tunnel a
+    /// container cannot see). Defaults to the broker container's DNS name on
+    /// the sandbox network.
+    pub agent_broker_url: String,
 }
 
 /// Parse and validate `provider_config`, rejecting anything the broker would
@@ -53,14 +60,34 @@ pub fn parse(cfg: &serde_json::Value) -> Result<ProviderConfig, String> {
         );
     }
 
+    let agent_broker_url = match cfg.get("agent_broker_url").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => {
+            let s = s.trim();
+            if !s.starts_with("http://") && !s.starts_with("https://") {
+                return Err(
+                    "provider_config.agent_broker_url must start with http:// or https://".into(),
+                );
+            }
+            s.trim_end_matches('/').to_string()
+        }
+        _ => DEFAULT_AGENT_BROKER_URL.to_string(),
+    };
+
     Ok(ProviderConfig {
         broker_url: broker_url.trim_end_matches('/').to_string(),
         image,
         cpus,
         memory_mb,
         inactivity_seconds,
+        agent_broker_url,
     })
 }
+
+/// Where a sandboxed agent finds the broker: the broker container's DNS name
+/// on the shared sandbox network. Docker's embedded DNS resolves container
+/// names on user-defined networks, so this works wherever the broker keeps its
+/// conventional name; an operator whose broker lives elsewhere overrides it.
+const DEFAULT_AGENT_BROKER_URL: &str = "http://buzz-sandbox-broker:9310";
 
 fn required_string(cfg: &serde_json::Value, key: &str) -> Result<String, String> {
     match cfg.get(key).and_then(|v| v.as_str()) {
@@ -145,6 +172,12 @@ pub fn schema() -> serde_json::Value {
                 "title": "Inactivity timeout (seconds)",
                 "description": "The agent self-exits after this long with no dispatched work, and the broker reaps the sandbox at the same bound.",
                 "default": DEFAULT_INACTIVITY_SECONDS
+            },
+            "agent_broker_url": {
+                "type": "string",
+                "title": "Broker URL inside a sandbox",
+                "description": "How a sandboxed agent reaches the broker to manage its own computer (injected as BUZZ_SANDBOX_BROKER_URL). Defaults to the broker container's DNS name on the sandbox network.",
+                "default": DEFAULT_AGENT_BROKER_URL
             }
         },
         "required": ["broker_url", "image"]

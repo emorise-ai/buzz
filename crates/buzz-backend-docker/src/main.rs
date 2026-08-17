@@ -119,7 +119,7 @@ async fn deploy_agent(request: &wire::DeployRequest) -> Result<String, String> {
     // sandbox's logs and the harness's frames share one identity.
     let generation = naming::new_generation();
 
-    let environment = env::build_env(
+    let mut environment = env::build_env(
         &request.agent,
         env::AuthoritativeInputs {
             generation: &generation,
@@ -127,6 +127,13 @@ async fn deploy_agent(request: &wire::DeployRequest) -> Result<String, String> {
         },
         DIAGNOSTICS,
     )?;
+    // Where `buzz sandbox …` finds the broker from inside the sandbox. The
+    // operator's substrate knowledge wins over anything a persona guessed, so
+    // this overwrites rather than defers.
+    environment.insert(
+        "BUZZ_SANDBOX_BROKER_URL".into(),
+        cfg.agent_broker_url.clone(),
+    );
 
     let sandbox_id = broker::create(
         &cfg.broker_url,
