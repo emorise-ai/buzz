@@ -2173,9 +2173,11 @@ async fn tokio_main() -> Result<()> {
         base_prompt: if config.no_base_prompt {
             None
         } else if let Some(content) = base_prompt_content {
-            Some(Box::leak(content.into_boxed_str()))
+            Some(Box::leak(
+                append_computer_prompt(content, has_sandbox_broker()).into_boxed_str(),
+            ))
         } else {
-            Some(include_str!("base_prompt.md"))
+            Some(effective_base_prompt(has_sandbox_broker()))
         },
         heartbeat_prompt: config.heartbeat_prompt.clone(),
         cwd: std::env::current_dir()
@@ -4465,6 +4467,50 @@ mod agent_draft_prompt_tests {
     }
 }
 
+#[cfg(test)]
+mod computer_prompt_tests {
+    use super::{append_computer_prompt, effective_base_prompt};
+
+    #[test]
+    fn computer_prompt_is_absent_without_a_sandbox_broker() {
+        let prompt = effective_base_prompt(false);
+        assert!(!prompt.contains("Your Computer"));
+        assert!(!prompt.contains("buzz sandbox exec"));
+    }
+
+    #[test]
+    fn computer_prompt_is_appended_with_a_sandbox_broker() {
+        let prompt = effective_base_prompt(true);
+        assert!(prompt.contains("Your Computer"));
+        // Commands target the running sandbox by default — BUZZ_SANDBOX_ID is
+        // an override, not a guaranteed env var, so the prompt must not
+        // promise it is always set.
+        assert!(prompt.contains("automatically target the computer you are running inside"));
+        assert!(prompt.contains("BUZZ_SANDBOX_ID"));
+        assert!(prompt.contains("overrides the default target"));
+        assert!(prompt.contains("buzz sandbox exec"));
+        assert!(prompt.contains("buzz sandbox screenshot"));
+        assert!(prompt.contains("take over the mouse and keyboard"));
+        // The base prompt's own content must still be present — this is an
+        // append, not a replacement.
+        assert!(prompt.contains("buzz agents draft-create"));
+    }
+
+    #[test]
+    fn append_computer_prompt_is_a_no_op_without_a_broker() {
+        let base = "some custom base prompt".to_string();
+        assert_eq!(append_computer_prompt(base.clone(), false), base);
+    }
+
+    #[test]
+    fn append_computer_prompt_appends_to_custom_content_with_a_broker() {
+        let base = "some custom base prompt".to_string();
+        let result = append_computer_prompt(base, true);
+        assert!(result.starts_with("some custom base prompt"));
+        assert!(result.contains("Your Computer"));
+    }
+}
+
 fn default_heartbeat_prompt() -> String {
     let now = chrono::Utc::now().to_rfc3339();
     format!(
@@ -5046,6 +5092,47 @@ fn check_remote_mcp_supported(
          them: it did not advertise mcpCapabilities.http. Use an agent that does \
          (claude-agent-acp), or drop --mcp-url to run tools locally."
     ))
+}
+
+/// Whether this harness process is wired to a sandbox broker.
+///
+/// `BUZZ_SANDBOX_BROKER_URL` is injected by the deploy path
+/// (`buzz-backend-docker`) into managed sandboxes only, so its presence in
+/// the harness's own process env — not any per-agent config — is what
+/// distinguishes a sandboxed agent from one running elsewhere.
+fn has_sandbox_broker() -> bool {
+    std::env::var("BUZZ_SANDBOX_BROKER_URL")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// The compiled-in base prompt, with the "Your Computer" briefing appended
+/// when this harness has a sandbox broker to talk to.
+fn effective_base_prompt(has_broker: bool) -> &'static str {
+    if has_broker {
+        // Leaked once per process (this path is only reached when building
+        // the shared PromptContext at startup), so the 'static lifetime the
+        // struct requires is honest, not a leak in the concerning sense.
+        Box::leak(
+            append_computer_prompt(include_str!("base_prompt.md").to_string(), true)
+                .into_boxed_str(),
+        )
+    } else {
+        include_str!("base_prompt.md")
+    }
+}
+
+/// Append the computer-use briefing to `base`, if `has_broker`; otherwise
+/// return `base` unchanged.
+fn append_computer_prompt(base: String, has_broker: bool) -> String {
+    if !has_broker {
+        return base;
+    }
+    format!(
+        "{}\n\n{}",
+        base.trim_end(),
+        include_str!("computer_prompt.md").trim_end()
+    )
 }
 
 fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
