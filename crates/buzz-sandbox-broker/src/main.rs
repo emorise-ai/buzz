@@ -276,6 +276,12 @@ fn build_router(state: AppState) -> Router {
         .route("/sandboxes/{id}/launch", post(launch_app))
         .route("/sandboxes/{id}/windows", get(windows_list))
         .route("/sandboxes/{id}/windows/action", post(window_action))
+        // Computer-use surface: run a command, see the screen, click/type.
+        // Same NIP-98 + owner-only pattern as `/extend` — these act on the
+        // sandbox as its own owner, not as an unprivileged viewer.
+        .route("/sandboxes/{id}/exec", post(sandbox_exec))
+        .route("/sandboxes/{id}/screenshot", get(sandbox_screenshot))
+        .route("/sandboxes/{id}/input", post(sandbox_input))
         .with_state(state)
 }
 
@@ -402,6 +408,11 @@ async fn create_sandbox(
         limits,
         env: &env,
         owner: req.owner.as_deref(),
+        // The verified NIP-98 caller, not `req.owner`: when the desktop app
+        // creates a box on an agent's behalf it signs as the human manager
+        // while `owner` names the agent, so these two are deliberately
+        // allowed to differ. See `LABEL_MANAGER`.
+        manager: Some(&caller),
         expires_at,
         cpuset: &cpuset,
         network: &state.network,
@@ -1098,6 +1109,11 @@ struct FsRenameRequest {
 #[derive(serde::Deserialize)]
 struct LaunchRequest {
     app: String,
+    /// Only valid alongside `app == "browser"` — validated by
+    /// `sandbox::validate_launch_url` and appended as its own argv element,
+    /// never shell-interpolated.
+    #[serde(default)]
+    url: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1489,7 +1505,7 @@ async fn launch_app(
     if !is_safe_id(&id) {
         return bad_request("malformed sandbox id");
     }
-    if let Err(response) = authorize(
+    let caller = match authorize(
         &state,
         &headers,
         "POST",
@@ -1498,8 +1514,9 @@ async fn launch_app(
     )
     .await
     {
-        return response;
-    }
+        Ok(pubkey) => pubkey,
+        Err(response) => return response,
+    };
     let req: LaunchRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return bad_request(format!("invalid request body: {e}")),
@@ -1508,20 +1525,386 @@ async fn launch_app(
         Ok(argv) => argv,
         Err(e) => return bad_request(e),
     };
+    if let Some(url) = req.url.as_deref() {
+        if let Err(e) = sandbox::validate_launch_url(&req.app, url) {
+            return bad_request(e);
+        }
+    }
+
+    // Owner-or-manager (see `require_owner_or_manager`): without this, any
+    // member could force-open an app in someone else's sandbox — and with
+    // the browser `url` field, force-navigate their screen to an
+    // attacker-chosen page. Plain owner-only would break the desktop dock,
+    // which signs launch calls with the *human manager's* key, not the
+    // sandbox owner's (see desktop/src-tauri/src/sandbox_viewer.rs).
+    // Checked after body/argv validation (cheap, local) but before anything
+    // reaches Docker.
+    if let Err(response) = require_owner_or_manager(&state, &id, &caller).await {
+        return response;
+    }
 
     // DISPLAY/HOME so the app finds the X server and its own config/profile
     // directories under the agent's home, same as everything else on this
     // desktop image (see Dockerfile.sprig-desktop).
     let env = ["DISPLAY=:1".to_string(), "HOME=/home/agent".to_string()];
+    let full_argv = sandbox::append_launch_url(argv, req.url.as_deref());
     if let Err(e) = state
         .docker
-        .exec_detached(&id, argv, FS_EXEC_USER, &env)
+        .exec_detached(&id, &full_argv, FS_EXEC_USER, &env)
         .await
     {
         return internal(e);
     }
 
     (StatusCode::NO_CONTENT, ()).into_response()
+}
+
+/// Inspect a sandbox by id, returning 404 (not the inspect error verbatim)
+/// when it doesn't exist or isn't one this broker manages.
+///
+/// Shared lookup for every owner/manager gate — mirroring the check
+/// `extend_sandbox` does inline (ownership lives on the container label, so
+/// this is local and works even when the relay is unreachable) — factored
+/// out so `require_owner_or_manager` differs from any future gate only in
+/// *whose* pubkey it accepts, not in how it looks the container up.
+async fn inspect_managed_sandbox(
+    state: &AppState,
+    id: &str,
+) -> Result<serde_json::Value, axum::response::Response> {
+    match state.docker.inspect_container(id).await {
+        Ok(v) if is_managed(&v) => Ok(v),
+        Ok(_) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no such sandbox"})),
+        )
+            .into_response()),
+        Err(e) if e.contains("404") || e.to_lowercase().contains("no such container") => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no such sandbox"})),
+        )
+            .into_response()),
+        Err(e) => Err(internal(e)),
+    }
+}
+
+/// Look up a managed sandbox and confirm `caller` is either its owner or its
+/// manager.
+///
+/// The two are the same pubkey only when an agent self-creates its own box
+/// (e.g. via the CLI); when the desktop app creates a sandbox on an agent's
+/// behalf, it signs as the *human* manager while the agent's own key is
+/// recorded as owner (see `LABEL_MANAGER`). Both may drive the sandbox's
+/// computer-use surface — the manager because they are the human watching
+/// (or taking over) the screen the dock's buttons act on, the owner because
+/// it is their box. If the manager label is absent (a sandbox created before
+/// this gate existed), this falls back to owner-only rather than admitting
+/// anyone — never fail open on a missing label.
+async fn require_owner_or_manager(
+    state: &AppState,
+    id: &str,
+    caller: &str,
+) -> Result<serde_json::Value, axum::response::Response> {
+    let inspect = inspect_managed_sandbox(state, id).await?;
+
+    let owner = inspect_label(&inspect, sandbox::LABEL_OWNER);
+    let manager = inspect_label(&inspect, sandbox::LABEL_MANAGER);
+    if !sandbox::is_owner_or_manager(caller, owner.as_deref(), manager.as_deref()) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "only the sandbox's owner or its manager may act on it"
+            })),
+        )
+            .into_response());
+    }
+    Ok(inspect)
+}
+
+/// `POST /sandboxes/{id}/exec` — run a command inside the sandbox and return
+/// its output. Owner-or-manager computer-use primitive (see
+/// `require_owner_or_manager`): the caller supplies argv (never a shell
+/// string), the broker prepends a `timeout` wrapper so a
+/// runaway command cannot hang the sandbox forever, and a
+/// `tokio::time::timeout` above that is a belt-and-braces bound in case the
+/// in-container `timeout` binary itself is missing or misbehaves.
+async fn sandbox_exec(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if !is_safe_id(&id) {
+        return bad_request("malformed sandbox id");
+    }
+    let caller = match authorize(
+        &state,
+        &headers,
+        "POST",
+        &format!("/sandboxes/{id}/exec"),
+        &body,
+    )
+    .await
+    {
+        Ok(pubkey) => pubkey,
+        Err(response) => return response,
+    };
+    let req: sandbox::ExecRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return bad_request(format!("invalid request body: {e}")),
+    };
+    let resolved = match sandbox::resolve_exec(req) {
+        Ok(r) => r,
+        Err(e) => return bad_request(e),
+    };
+
+    if let Err(response) = require_owner_or_manager(&state, &id, &caller).await {
+        return response;
+    }
+
+    // Prepend the timeout wrapper — a fixed argv0 and the resolved numeric
+    // timeout, not caller-controlled text — so the in-container command dies
+    // on schedule even if it ignores signals sent any other way.
+    let timeout_str = resolved.timeout_secs.to_string();
+    let argv: Vec<&str> = std::iter::once("timeout")
+        .chain(std::iter::once(timeout_str.as_str()))
+        .chain(resolved.argv.iter().map(|s| s.as_str()))
+        .collect();
+
+    let env = [format!("BUZZ_EXEC_WORKDIR={}", resolved.workdir)];
+    // The workdir travels via env and a `cd` prefix executed by `sh -c` would
+    // reopen the shell-injection door this module otherwise avoids, so
+    // instead the exec's argv is wrapped one level: `sh -c 'cd "$BUZZ_EXEC_WORKDIR" && exec "$@"' -- <argv...>`
+    // keeps every caller-controlled value in its own argv/env slot.
+    let mut wrapped: Vec<&str> = vec!["sh", "-c", "cd \"$BUZZ_EXEC_WORKDIR\" && exec \"$@\"", "--"];
+    wrapped.extend(argv.iter());
+
+    let belt_and_braces = std::time::Duration::from_secs(resolved.timeout_secs + 5);
+    let result = tokio::time::timeout(
+        belt_and_braces,
+        state
+            .docker
+            .exec_with_env(&id, &wrapped, FS_EXEC_USER, &env),
+    )
+    .await;
+
+    let (exit_code, output, timed_out) = match result {
+        Ok(Ok((code, output))) => (code, output, code == 124),
+        Ok(Err(e)) => return internal(e),
+        Err(_) => (124i64, Vec::new(), true),
+    };
+
+    let truncate = |bytes: &[u8]| -> String {
+        let mut s = String::from_utf8_lossy(bytes).into_owned();
+        if s.len() > sandbox::EXEC_MAX_OUTPUT_BYTES {
+            s.truncate(sandbox::EXEC_MAX_OUTPUT_BYTES);
+            s.push_str("\n[truncated]");
+        }
+        s
+    };
+    // `Docker::exec_with_env` concatenates stdout+stderr in stream order
+    // rather than demuxing them (see its own doc comment) — reporting the
+    // combined text under `stdout` and leaving `stderr` empty is honest about
+    // that, rather than fabricating a stream split the transport does not
+    // give us.
+    let stdout = truncate(&output);
+    let stderr = String::new();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "timed_out": timed_out,
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /sandboxes/{id}/screenshot` — capture the sandbox's desktop and
+/// return it as a raw PNG. Owner-or-manager: the screen can show anything
+/// the agent (or the human manager watching it) is doing, so both — and no
+/// one else — may see it.
+async fn sandbox_screenshot(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if !is_safe_id(&id) {
+        return bad_request("malformed sandbox id");
+    }
+    // NIP-98 on a GET signs an empty body, matching fs_list.
+    let caller = match authorize(
+        &state,
+        &headers,
+        "GET",
+        &format!("/sandboxes/{id}/screenshot"),
+        b"",
+    )
+    .await
+    {
+        Ok(pubkey) => pubkey,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_owner_or_manager(&state, &id, &caller).await {
+        return response;
+    }
+
+    const SCREENSHOT_PATH: &str = "/tmp/buzz-screenshot.png";
+    let env = ["DISPLAY=:1".to_string()];
+    let (exit_code, output) = match state
+        .docker
+        .exec_with_env(
+            &id,
+            &["scrot", "-o", "-z", SCREENSHOT_PATH],
+            FS_EXEC_USER,
+            &env,
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    if exit_code != 0 {
+        warn!(
+            sandbox = %id,
+            exit_code,
+            detail = %String::from_utf8_lossy(&output).trim(),
+            "screenshot capture failed"
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "screenshot tool unavailable in this computer — restart it to pick up the new image"
+            })),
+        )
+            .into_response();
+    }
+
+    let tar_bytes = match state.docker.get_archive(&id, SCREENSHOT_PATH).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(sandbox = %id, error = %e, "screenshot file missing after capture");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "screenshot tool unavailable in this computer — restart it to pick up the new image"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+    let entries = match archive.entries() {
+        Ok(e) => e,
+        Err(e) => return internal(format!("could not read archive: {e}")),
+    };
+    for entry in entries {
+        let mut entry = match entry {
+            Ok(e) => e,
+            Err(e) => return internal(format!("could not read archive entry: {e}")),
+        };
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        if let Err(e) = std::io::Read::read_to_end(&mut entry, &mut bytes) {
+            return internal(format!("could not read screenshot contents: {e}"));
+        }
+        return (
+            [(axum::http::header::CONTENT_TYPE, "image/png".to_string())],
+            bytes,
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({
+            "error": "screenshot tool unavailable in this computer — restart it to pick up the new image"
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /sandboxes/{id}/input` — perform a sequence of mouse/keyboard
+/// actions on the sandbox's desktop via `xdotool`. Owner-or-manager, same as
+/// exec and screenshot: this drives the same screen the owner or the human
+/// manager watching it is looking at.
+async fn sandbox_input(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if !is_safe_id(&id) {
+        return bad_request("malformed sandbox id");
+    }
+    let caller = match authorize(
+        &state,
+        &headers,
+        "POST",
+        &format!("/sandboxes/{id}/input"),
+        &body,
+    )
+    .await
+    {
+        Ok(pubkey) => pubkey,
+        Err(response) => return response,
+    };
+    let req: sandbox::InputRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return bad_request(format!("invalid request body: {e}")),
+    };
+    if let Err(e) = sandbox::validate_input_request(&req) {
+        return bad_request(e);
+    }
+    // Build and validate every action's argv up front, before any exec runs —
+    // a request that is partly invalid should fail atomically rather than
+    // performing some actions and rejecting others.
+    let mut argvs: Vec<Vec<String>> = Vec::with_capacity(req.actions.len());
+    for (i, action) in req.actions.iter().enumerate() {
+        match sandbox::input_action_argv(action) {
+            Ok(argv) => argvs.push(argv),
+            Err(e) => return bad_request(format!("action {i}: {e}")),
+        }
+    }
+
+    if let Err(response) = require_owner_or_manager(&state, &id, &caller).await {
+        return response;
+    }
+
+    let env = ["DISPLAY=:1".to_string()];
+    for (i, argv) in argvs.iter().enumerate() {
+        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        let (exit_code, output) = match state
+            .docker
+            .exec_with_env(&id, &argv_refs, FS_EXEC_USER, &env)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return internal(e),
+        };
+        if exit_code != 0 {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "action {i} failed: {}",
+                        String::from_utf8_lossy(&output).trim()
+                    )
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "performed": argvs.len() })),
+    )
+        .into_response()
 }
 
 /// List the open windows on the sandbox's desktop, for the dock's taskbar
@@ -2229,5 +2612,46 @@ mod router_tests {
             "an unsigned request must reach launch_app and be refused there \
              (401), not 404 at the router layer"
         );
+    }
+
+    /// Same routing-not-404 proof as `launch_reaches_the_handler_and_fails_auth_without_a_signature`,
+    /// applied to the three new computer-use routes: an unsigned request must
+    /// reach the handler and be refused there, not fail earlier at the axum
+    /// route table.
+    #[tokio::test]
+    async fn exec_reaches_the_handler_and_fails_auth_without_a_signature() {
+        let app = build_router(test_state());
+        let body = serde_json::json!({ "argv": ["ls"] }).to_string();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/sandboxes/abc123def456/exec")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn screenshot_reaches_the_handler_and_fails_auth_without_a_signature() {
+        let app = build_router(test_state());
+        let uri = "/sandboxes/abc123def456/screenshot";
+        let resp = app.oneshot(forwarded_request("GET", uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn input_reaches_the_handler_and_fails_auth_without_a_signature() {
+        let app = build_router(test_state());
+        let body =
+            serde_json::json!({ "actions": [{ "type": "move", "x": 1, "y": 1 }] }).to_string();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/sandboxes/abc123def456/input")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

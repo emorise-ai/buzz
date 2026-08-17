@@ -44,6 +44,10 @@ http-body-util = "0.1"
 # format those two endpoints require.
 tar = "0.4"
 
+# Validates the optional launch URL (scheme, well-formedness) before it is
+# appended as a single argv element to the browser's launch command.
+url = { workspace = true }
+
 [dev-dependencies]
 # `ServiceExt::oneshot` drives the real `Router` end to end in router-level
 # tests (e.g. pinning a route that must not 404 before it ever reaches a

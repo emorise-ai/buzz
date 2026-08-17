@@ -11,7 +11,7 @@
 //! (see `container_spec` in `sandbox.rs`).
 
 use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
+use hyper::body::{Buf, Bytes};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use std::path::PathBuf;
@@ -20,6 +20,15 @@ use std::path::PathBuf;
 /// changing response shapes under us; 1.43 is available on Docker 24+ and the
 /// host runs 29.x.
 const API_VERSION: &str = "v1.43";
+
+/// Cap on bytes read from a synchronous exec's output stream, applied while
+/// reading rather than after.
+///
+/// A margin over `sandbox::EXEC_MAX_OUTPUT_BYTES` (which trims the *response*
+/// text) so the raw, still-demuxed stream — 8 bytes of Docker framing per
+/// chunk, and both stdout+stderr interleaved — isn't clipped mid-frame before
+/// the caller-facing truncation gets a chance to run on the demuxed result.
+const EXEC_STREAM_CAP_BYTES: usize = 512 * 1024;
 
 #[derive(Clone)]
 /// A client for the Docker Engine API over its unix socket.
@@ -236,10 +245,19 @@ impl Docker {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "docker did not return an exec id".to_string())?;
 
+        // Bounded, not `exec_start_raw`'s `.collect()`: a caller-controlled
+        // command (this is the primitive behind `POST .../exec`) can emit
+        // output far faster than any per-request timeout bounds bytes, and
+        // buffering it all before truncating would let one exec drive the
+        // broker's own memory up before the caller-facing 256 KiB cap ever
+        // applies. `EXEC_STREAM_CAP_BYTES` stops accumulating (with a small
+        // margin over the response-level cap) rather than reading to
+        // completion first.
         let output = self
-            .exec_start_raw(
+            .exec_start_bounded(
                 exec_id,
                 &serde_json::json!({ "Detach": false, "Tty": false }),
+                EXEC_STREAM_CAP_BYTES,
             )
             .await?;
 
@@ -343,6 +361,57 @@ impl Docker {
         Ok(bytes.to_vec())
     }
 
+    /// Like [`Docker::exec_start_raw`], but reads the response body frame by
+    /// frame and stops accumulating once `cap_bytes` is reached instead of
+    /// collecting the whole stream first.
+    ///
+    /// The exec still runs to completion on the daemon side either way —
+    /// dropping the response body early does not cancel it — this only
+    /// bounds how much of its output the broker holds in memory, which is
+    /// the property that matters for a process this service cannot itself
+    /// throttle beyond the `timeout` wrapper and outer request timeout.
+    async fn exec_start_bounded(
+        &self,
+        exec_id: &str,
+        body: &serde_json::Value,
+        cap_bytes: usize,
+    ) -> Result<Vec<u8>, String> {
+        let uri = hyperlocal_uri(
+            &self.socket,
+            &format!("/{API_VERSION}/exec/{exec_id}/start"),
+        )
+        .ok_or_else(|| "could not build a docker request URI for exec/start".to_string())?;
+        let req = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(uri)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(body.to_string())))
+            .map_err(|e| format!("could not build the docker request: {e}"))?;
+
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .map_err(|e| format!("could not reach the docker daemon: {e}"))?;
+        let status = resp.status();
+        let out = read_body_bounded(resp.into_body(), cap_bytes)
+            .await
+            .map_err(|e| format!("could not read the docker response: {e}"))?;
+
+        if !status.is_success() {
+            let detail = serde_json::from_slice::<serde_json::Value>(&out)
+                .ok()
+                .and_then(|v| {
+                    v.get("message")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| String::from_utf8_lossy(&out).trim().to_string());
+            return Err(format!("docker returned {status}: {detail}"));
+        }
+        Ok(out)
+    }
+
     /// Fetch a tar stream of the single path `path` inside `id`.
     ///
     /// Docker's archive endpoint always returns a tar even for one file — the
@@ -425,6 +494,33 @@ impl Docker {
         }
         Ok(())
     }
+}
+
+/// Read a hyper body frame by frame, accumulating at most `cap_bytes`.
+///
+/// Once the cap is reached the accumulated buffer is truncated to exactly
+/// `cap_bytes` and reading stops — later frames are never polled, so nothing
+/// past the cap is held in memory even momentarily. Isolated from
+/// [`Docker::exec_start_bounded`] so the accumulate-and-stop logic can be
+/// exercised directly against a synthetic body in tests, without a live
+/// Docker daemon to drive real HTTP framing.
+async fn read_body_bounded<B>(mut body: B, cap_bytes: usize) -> Result<Vec<u8>, B::Error>
+where
+    B: hyper::body::Body + Unpin,
+    B::Data: hyper::body::Buf,
+{
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Some(data) = frame.data_ref() {
+            out.extend_from_slice(data.chunk());
+            if out.len() >= cap_bytes {
+                out.truncate(cap_bytes);
+                break;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Demultiplex Docker's exec/attach stream framing: each chunk is an 8-byte
@@ -534,5 +630,52 @@ mod tests {
         let decoded = String::from_utf8(hex::decode(host).expect("host is hex")).expect("utf8");
         assert_eq!(decoded, "/var/run/docker.sock");
         assert_eq!(uri.path(), "/v1.43/_ping");
+    }
+
+    /// A body that yields a fixed queue of data frames, one per `frame()`
+    /// poll — enough to drive [`read_body_bounded`] without a live Docker
+    /// daemon or connection.
+    struct FixedFrames(std::collections::VecDeque<Bytes>);
+
+    impl hyper::body::Body for FixedFrames {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Ready(self.0.pop_front().map(|b| Ok(hyper::body::Frame::data(b))))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_body_bounded_returns_everything_under_the_cap() {
+        let body =
+            FixedFrames(vec![Bytes::from_static(b"hello "), Bytes::from_static(b"world")].into());
+        let out = read_body_bounded(body, 1024).await.unwrap();
+        assert_eq!(out, b"hello world");
+    }
+
+    /// The load-bearing case: a body that produces far more than the cap must
+    /// never accumulate past it, regardless of how many frames remain
+    /// unread — this is what stops a runaway exec (`yes | head -c 5G`, say)
+    /// from driving the broker's own memory up before the caller-facing
+    /// truncation in `main.rs` ever runs.
+    #[tokio::test]
+    async fn read_body_bounded_stops_accumulating_at_the_cap() {
+        let frames: std::collections::VecDeque<Bytes> = (0..10_000)
+            .map(|_| Bytes::from_static(b"0123456789"))
+            .collect();
+        let body = FixedFrames(frames);
+        let out = read_body_bounded(body, 55).await.unwrap();
+        assert_eq!(out.len(), 55, "output must be truncated to exactly the cap");
+    }
+
+    #[tokio::test]
+    async fn read_body_bounded_handles_an_empty_body() {
+        let body = FixedFrames(std::collections::VecDeque::new());
+        let out = read_body_bounded(body, 1024).await.unwrap();
+        assert!(out.is_empty());
     }
 }

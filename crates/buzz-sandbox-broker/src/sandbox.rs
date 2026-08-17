@@ -13,6 +13,15 @@ use serde::{Deserialize, Serialize};
 pub const MANAGED_LABEL: &str = "com.buzz.sandbox=1";
 pub const LABEL_KEY: &str = "com.buzz.sandbox";
 pub const LABEL_OWNER: &str = "com.buzz.sandbox.owner";
+/// The caller who created the sandbox, as verified by NIP-98 at creation
+/// time — distinct from `LABEL_OWNER` because the two are the same key only
+/// when an agent self-creates its own box via the CLI. When the desktop app
+/// creates a box on an agent's behalf, it signs the create call with the
+/// *human* manager's key while the agent's own key is recorded as the owner
+/// (see `create_sandbox`, main.rs). The manager is who the desktop's dock
+/// authenticates as for the lifetime of that sandbox, so computer-use actions
+/// need to admit this identity too, not just the owner.
+pub const LABEL_MANAGER: &str = "com.buzz.sandbox.manager";
 pub const LABEL_EXPIRES: &str = "com.buzz.sandbox.expires-at";
 
 /// Ceilings the broker will not exceed regardless of what is asked for.
@@ -118,6 +127,10 @@ pub struct SpecInputs<'a> {
     pub limits: Limits,
     pub env: &'a std::collections::BTreeMap<String, String>,
     pub owner: Option<&'a str>,
+    /// The NIP-98-verified caller who made the create call — see
+    /// [`LABEL_MANAGER`]. `None` only in tests; `create_sandbox` always
+    /// passes the caller.
+    pub manager: Option<&'a str>,
     pub expires_at: i64,
     pub cpuset: &'a str,
     pub network: &'a str,
@@ -147,6 +160,7 @@ pub fn container_spec(inputs: SpecInputs<'_>) -> serde_json::Value {
         limits,
         env,
         owner,
+        manager,
         expires_at,
         cpuset,
         network,
@@ -162,6 +176,9 @@ pub fn container_spec(inputs: SpecInputs<'_>) -> serde_json::Value {
     );
     if let Some(owner) = owner {
         labels.insert(LABEL_OWNER.to_string(), serde_json::json!(owner));
+    }
+    if let Some(manager) = manager {
+        labels.insert(LABEL_MANAGER.to_string(), serde_json::json!(manager));
     }
 
     let mut spec = serde_json::json!({
@@ -250,6 +267,276 @@ pub fn validate_fs_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Ceiling on `argv` for `POST /sandboxes/{id}/exec` — generous for a real
+/// shell invocation, small enough that a request cannot be used to smuggle an
+/// unbounded amount of data into the exec's `Cmd` array.
+pub const EXEC_MAX_ARGV: usize = 64;
+/// Ceiling on the summed byte length of all `argv` elements for an exec
+/// request.
+pub const EXEC_MAX_ARGV_BYTES: usize = 8 * 1024;
+/// Default and clamp range for `timeout_secs` on an exec request. The broker
+/// prepends `["timeout", "<secs>"]` to the caller's argv so a runaway command
+/// is killed at the container level, and wraps the whole call in a
+/// `tokio::time::timeout` five seconds past that as a belt-and-braces bound.
+pub const EXEC_DEFAULT_TIMEOUT_SECS: u64 = 30;
+pub const EXEC_MIN_TIMEOUT_SECS: u64 = 1;
+pub const EXEC_MAX_TIMEOUT_SECS: u64 = 120;
+/// Cap on stdout/stderr each, in an exec response. Large enough for normal
+/// command output, small enough that a caller cannot use exec to pull
+/// unbounded data out of a sandbox in one response.
+pub const EXEC_MAX_OUTPUT_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Deserialize)]
+pub struct ExecRequest {
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub workdir: Option<String>,
+}
+
+/// Validated, clamped form of an [`ExecRequest`].
+pub struct ResolvedExec {
+    pub argv: Vec<String>,
+    pub timeout_secs: u64,
+    pub workdir: String,
+}
+
+/// Validate and clamp an exec request. Content of `argv` elements is not
+/// inspected beyond size — the caller is the sandbox's own owner acting on
+/// their own box — but the shape is: non-empty, bounded element count and
+/// total size, and (if given) an absolute `workdir`.
+pub fn resolve_exec(req: ExecRequest) -> Result<ResolvedExec, String> {
+    if req.argv.is_empty() {
+        return Err("argv must not be empty".to_string());
+    }
+    if req.argv.len() > EXEC_MAX_ARGV {
+        return Err(format!("argv must have at most {EXEC_MAX_ARGV} elements"));
+    }
+    let total_bytes: usize = req.argv.iter().map(|a| a.len()).sum();
+    if total_bytes > EXEC_MAX_ARGV_BYTES {
+        return Err(format!(
+            "argv totals {total_bytes} bytes, exceeding the {EXEC_MAX_ARGV_BYTES}-byte limit"
+        ));
+    }
+    let timeout_secs = req
+        .timeout_secs
+        .unwrap_or(EXEC_DEFAULT_TIMEOUT_SECS)
+        .clamp(EXEC_MIN_TIMEOUT_SECS, EXEC_MAX_TIMEOUT_SECS);
+    let workdir = match req.workdir {
+        Some(w) if !w.is_empty() => {
+            if !w.starts_with('/') {
+                return Err("workdir must be an absolute path".to_string());
+            }
+            w
+        }
+        _ => "/workspace".to_string(),
+    };
+    Ok(ResolvedExec {
+        argv: req.argv,
+        timeout_secs,
+        workdir,
+    })
+}
+
+/// One input action from `POST /sandboxes/{id}/input`, tagged by `type` in the
+/// wire format. Coordinates and text are bounded here so nothing caller-shaped
+/// reaches an xdotool argv unchecked, even though every field still travels as
+/// its own argv element rather than through a shell.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InputAction {
+    Move {
+        x: i64,
+        y: i64,
+    },
+    Click {
+        x: i64,
+        y: i64,
+        #[serde(default)]
+        button: Option<String>,
+    },
+    DoubleClick {
+        x: i64,
+        y: i64,
+    },
+    Type {
+        text: String,
+    },
+    Key {
+        combo: String,
+    },
+    Scroll {
+        x: i64,
+        y: i64,
+        direction: String,
+        #[serde(default)]
+        amount: Option<u32>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InputRequest {
+    pub actions: Vec<InputAction>,
+}
+
+pub const INPUT_MIN_ACTIONS: usize = 1;
+pub const INPUT_MAX_ACTIONS: usize = 20;
+pub const INPUT_MAX_TEXT_BYTES: usize = 4 * 1024;
+pub const INPUT_COORD_MIN: i64 = 0;
+pub const INPUT_COORD_MAX: i64 = 16384;
+pub const INPUT_MIN_SCROLL_AMOUNT: u32 = 1;
+pub const INPUT_MAX_SCROLL_AMOUNT: u32 = 10;
+
+fn validate_coord(x: i64, y: i64) -> Result<(), String> {
+    if !(INPUT_COORD_MIN..=INPUT_COORD_MAX).contains(&x)
+        || !(INPUT_COORD_MIN..=INPUT_COORD_MAX).contains(&y)
+    {
+        return Err(format!(
+            "coordinates must be within {INPUT_COORD_MIN}..={INPUT_COORD_MAX}"
+        ));
+    }
+    Ok(())
+}
+
+/// `ctrl+t`-style key combos: letters, digits, underscore, and `+` as the
+/// modifier separator, matching xdotool's own key-name grammar closely enough
+/// that anything accepted here is inert as a shell argument regardless.
+fn validate_key_combo(combo: &str) -> Result<(), String> {
+    let len_ok = !combo.is_empty() && combo.len() <= 40;
+    let chars_ok = combo
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'+');
+    if !len_ok || !chars_ok {
+        return Err(
+            "key combo must be 1-40 characters of letters, digits, underscore, or +".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn click_button_code(button: Option<&str>) -> Result<&'static str, String> {
+    match button.unwrap_or("left") {
+        "left" => Ok("1"),
+        "middle" => Ok("2"),
+        "right" => Ok("3"),
+        other => Err(format!(
+            "unknown button {other:?}; allowed: left, middle, right"
+        )),
+    }
+}
+
+fn scroll_direction_code(direction: &str) -> Result<&'static str, String> {
+    match direction {
+        "up" => Ok("4"),
+        "down" => Ok("5"),
+        other => Err(format!("unknown direction {other:?}; allowed: up, down")),
+    }
+}
+
+/// Validate one input action and build its xdotool argv.
+///
+/// Every dynamic value (coordinates, text, combo) becomes its own argv
+/// element — never concatenated into a shell string — mirroring the rest of
+/// this module's exec calls.
+pub fn input_action_argv(action: &InputAction) -> Result<Vec<String>, String> {
+    match action {
+        InputAction::Move { x, y } => {
+            validate_coord(*x, *y)?;
+            Ok(vec![
+                "xdotool".to_string(),
+                "mousemove".to_string(),
+                x.to_string(),
+                y.to_string(),
+            ])
+        }
+        InputAction::Click { x, y, button } => {
+            validate_coord(*x, *y)?;
+            let code = click_button_code(button.as_deref())?;
+            Ok(vec![
+                "xdotool".to_string(),
+                "mousemove".to_string(),
+                x.to_string(),
+                y.to_string(),
+                "click".to_string(),
+                code.to_string(),
+            ])
+        }
+        InputAction::DoubleClick { x, y } => {
+            validate_coord(*x, *y)?;
+            Ok(vec![
+                "xdotool".to_string(),
+                "mousemove".to_string(),
+                x.to_string(),
+                y.to_string(),
+                "click".to_string(),
+                "--repeat".to_string(),
+                "2".to_string(),
+                "--delay".to_string(),
+                "150".to_string(),
+                "1".to_string(),
+            ])
+        }
+        InputAction::Type { text } => {
+            if text.len() > INPUT_MAX_TEXT_BYTES {
+                return Err(format!(
+                    "text exceeds the {INPUT_MAX_TEXT_BYTES}-byte limit"
+                ));
+            }
+            Ok(vec![
+                "xdotool".to_string(),
+                "type".to_string(),
+                "--delay".to_string(),
+                "12".to_string(),
+                "--".to_string(),
+                text.clone(),
+            ])
+        }
+        InputAction::Key { combo } => {
+            validate_key_combo(combo)?;
+            Ok(vec![
+                "xdotool".to_string(),
+                "key".to_string(),
+                "--".to_string(),
+                combo.clone(),
+            ])
+        }
+        InputAction::Scroll {
+            x,
+            y,
+            direction,
+            amount,
+        } => {
+            validate_coord(*x, *y)?;
+            let code = scroll_direction_code(direction)?;
+            let amount = amount
+                .unwrap_or(INPUT_MIN_SCROLL_AMOUNT)
+                .clamp(INPUT_MIN_SCROLL_AMOUNT, INPUT_MAX_SCROLL_AMOUNT);
+            Ok(vec![
+                "xdotool".to_string(),
+                "mousemove".to_string(),
+                x.to_string(),
+                y.to_string(),
+                "click".to_string(),
+                "--repeat".to_string(),
+                amount.to_string(),
+                code.to_string(),
+            ])
+        }
+    }
+}
+
+/// Validate an input request's shape (action count) before any per-action
+/// validation runs.
+pub fn validate_input_request(req: &InputRequest) -> Result<(), String> {
+    if req.actions.len() < INPUT_MIN_ACTIONS || req.actions.len() > INPUT_MAX_ACTIONS {
+        return Err(format!(
+            "actions must contain {INPUT_MIN_ACTIONS}..={INPUT_MAX_ACTIONS} entries"
+        ));
+    }
+    Ok(())
+}
+
 /// The desktop apps a sandbox's launch endpoint may open, each a fixed argv
 /// vector — never assembled from caller input. A dock icon on the desktop
 /// opens a real window for one of these under the window manager, rather than
@@ -290,6 +577,54 @@ pub fn launch_argv(app: &str) -> Result<&'static [&'static str], String> {
             let allowed: Vec<&str> = LAUNCH_APPS.iter().map(|(name, _)| *name).collect();
             format!("unknown app {app:?}; allowed: {}", allowed.join(", "))
         })
+}
+
+/// Cap on the `url` field of a launch request.
+pub const LAUNCH_URL_MAX_BYTES: usize = 2 * 1024;
+
+/// Validate an optional launch URL against the app it targets.
+///
+/// Only `app == "browser"` may carry a `url` — any other app rejects it
+/// outright, matching the contract's "400 otherwise". Valid only means: it
+/// parses as an absolute URL and its scheme is `http` or `https`. The
+/// returned string is the URL exactly as the caller sent it (not
+/// re-serialized), appended as its own argv element — never interpolated
+/// into a shell string.
+pub fn validate_launch_url(app: &str, url: &str) -> Result<(), String> {
+    if app != "browser" {
+        return Err(format!(
+            "url is only valid with app \"browser\", not {app:?}"
+        ));
+    }
+    if url.len() > LAUNCH_URL_MAX_BYTES {
+        return Err(format!("url exceeds the {LAUNCH_URL_MAX_BYTES}-byte limit"));
+    }
+    let parsed = url::Url::parse(url).map_err(|e| format!("url is not a valid URL: {e}"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(format!(
+            "url scheme must be http or https, got {:?}",
+            parsed.scheme()
+        ));
+    }
+    Ok(())
+}
+
+/// Append a validated launch URL to an app's fixed argv, guarded by a literal
+/// `--` immediately before it.
+///
+/// `url::Url::parse` plus the http/https scheme check in
+/// [`validate_launch_url`] already reject anything that looks like a
+/// `--flag`, but the `--` is defense in depth: it means the appended element
+/// can never be read as a switch by the launched program even if that
+/// validation is ever loosened, since everything after `--` is positional by
+/// convention (Chromium included).
+pub fn append_launch_url<'a>(argv: &[&'a str], url: Option<&'a str>) -> Vec<&'a str> {
+    let mut full: Vec<&str> = argv.to_vec();
+    if let Some(url) = url {
+        full.push("--");
+        full.push(url);
+    }
+    full
 }
 
 /// The actions the window endpoint may perform on a desktop window, each a
@@ -344,6 +679,19 @@ pub fn validate_window_id(window: &str) -> Result<(), String> {
         return Err("malformed window id".to_string());
     }
     Ok(())
+}
+
+/// May `caller` act on a sandbox as its owner or manager?
+///
+/// Pure decision, factored out of `require_owner_or_manager` (main.rs) so it
+/// can be exercised directly without a Docker inspect: `caller` matches the
+/// owner label, or matches a *present* manager label. A manager label that is
+/// simply absent (an older sandbox created before `LABEL_MANAGER` existed)
+/// must never be treated as "anyone may act" — the `manager.is_some()` guard
+/// is what keeps that case falling back to owner-only instead of failing
+/// open.
+pub fn is_owner_or_manager(caller: &str, owner: Option<&str>, manager: Option<&str>) -> bool {
+    owner == Some(caller) || (manager.is_some() && manager == Some(caller))
 }
 
 /// Is this image allowed to hold an agent's private key?
@@ -470,6 +818,7 @@ mod tests {
             limits: Limits::resolve(&req(None, None, None)),
             env: &Default::default(),
             owner: None,
+            manager: None,
             expires_at: 0,
             cpuset: "0-1",
             network: "sandbox",
@@ -488,6 +837,7 @@ mod tests {
             limits: Limits::resolve(&req(Some(2.0), Some(1024), None)),
             env: &Default::default(),
             owner: Some("owner"),
+            manager: Some("manager"),
             expires_at: 123,
             cpuset: "0-1",
             network: "sandbox",
@@ -504,6 +854,7 @@ mod tests {
         assert_eq!(hc["CpusetCpus"], "0-1");
         assert_eq!(spec["Labels"][LABEL_KEY], "1");
         assert_eq!(spec["Labels"][LABEL_OWNER], "owner");
+        assert_eq!(spec["Labels"][LABEL_MANAGER], "manager");
     }
 
     #[test]
@@ -514,6 +865,7 @@ mod tests {
             limits,
             env: &EMPTY_ENV,
             owner: None,
+            manager: None,
             expires_at: 0,
             cpuset: "0-1",
             network: "sandbox",
@@ -540,6 +892,7 @@ mod tests {
             limits,
             env: &EMPTY_ENV,
             owner: None,
+            manager: None,
             expires_at: 0,
             cpuset: "0-1",
             network: "sandbox",
@@ -562,6 +915,7 @@ mod tests {
             limits: Limits::resolve(&req(None, None, None)),
             env: &env,
             owner: None,
+            manager: None,
             expires_at: 0,
             cpuset: "0-0",
             network: "sandbox",
@@ -586,6 +940,7 @@ mod tests {
             limits: Limits::resolve(&req(None, None, None)),
             env: &EMPTY_ENV,
             owner: None,
+            manager: None,
             expires_at: 1_786_824_039,
             cpuset: "0-0",
             network: "sandbox",
@@ -604,12 +959,32 @@ mod tests {
             limits: Limits::resolve(&req(None, None, None)),
             env: &EMPTY_ENV,
             owner: None,
+            manager: None,
             expires_at: 0,
             cpuset: "0-0",
             network: "buzz-sandboxes",
             disk_limit: None,
         });
         assert_eq!(spec["HostConfig"]["NetworkMode"], "buzz-sandboxes");
+    }
+
+    /// `manager: None` must omit the label entirely, not write an empty
+    /// value — `require_owner_or_manager`'s fallback-to-owner-only behavior
+    /// for older sandboxes depends on the label being *absent*, not blank.
+    #[test]
+    fn manager_label_is_omitted_when_absent() {
+        let spec = container_spec(SpecInputs {
+            image: "img",
+            limits: Limits::resolve(&req(None, None, None)),
+            env: &EMPTY_ENV,
+            owner: Some("owner"),
+            manager: None,
+            expires_at: 0,
+            cpuset: "0-0",
+            network: "sandbox",
+            disk_limit: None,
+        });
+        assert!(spec["Labels"].get(LABEL_MANAGER).is_none());
     }
 
     #[test]
@@ -748,5 +1123,326 @@ mod tests {
         ] {
             assert!(validate_window_id(bad).is_err(), "{bad:?} should fail");
         }
+    }
+
+    fn exec_req(argv: &[&str], timeout_secs: Option<u64>, workdir: Option<&str>) -> ExecRequest {
+        ExecRequest {
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            timeout_secs,
+            workdir: workdir.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn resolve_exec_rejects_empty_argv() {
+        assert!(resolve_exec(exec_req(&[], None, None)).is_err());
+    }
+
+    #[test]
+    fn resolve_exec_rejects_too_many_elements() {
+        let many: Vec<String> = (0..EXEC_MAX_ARGV + 1).map(|i| i.to_string()).collect();
+        let req = ExecRequest {
+            argv: many,
+            timeout_secs: None,
+            workdir: None,
+        };
+        assert!(resolve_exec(req).is_err());
+    }
+
+    #[test]
+    fn resolve_exec_rejects_oversized_argv_bytes() {
+        let req = ExecRequest {
+            argv: vec!["x".repeat(EXEC_MAX_ARGV_BYTES + 1)],
+            timeout_secs: None,
+            workdir: None,
+        };
+        assert!(resolve_exec(req).is_err());
+    }
+
+    #[test]
+    fn resolve_exec_defaults_workdir_and_timeout() {
+        let resolved = resolve_exec(exec_req(&["ls"], None, None)).unwrap();
+        assert_eq!(resolved.workdir, "/workspace");
+        assert_eq!(resolved.timeout_secs, EXEC_DEFAULT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn resolve_exec_clamps_timeout_to_the_allowed_range() {
+        let low = resolve_exec(exec_req(&["ls"], Some(0), None)).unwrap();
+        assert_eq!(low.timeout_secs, EXEC_MIN_TIMEOUT_SECS);
+        let high = resolve_exec(exec_req(&["ls"], Some(9999), None)).unwrap();
+        assert_eq!(high.timeout_secs, EXEC_MAX_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn resolve_exec_requires_an_absolute_workdir() {
+        assert!(resolve_exec(exec_req(&["ls"], None, Some("relative/path"))).is_err());
+        assert!(resolve_exec(exec_req(&["ls"], None, Some("/workspace/sub"))).is_ok());
+    }
+
+    #[test]
+    fn move_action_builds_xdotool_mousemove() {
+        let argv = input_action_argv(&InputAction::Move { x: 10, y: 20 }).unwrap();
+        assert_eq!(argv, vec!["xdotool", "mousemove", "10", "20"]);
+    }
+
+    #[test]
+    fn click_action_maps_button_names_to_xdotool_codes() {
+        for (button, code) in [
+            (None, "1"),
+            (Some("left"), "1"),
+            (Some("middle"), "2"),
+            (Some("right"), "3"),
+        ] {
+            let argv = input_action_argv(&InputAction::Click {
+                x: 5,
+                y: 6,
+                button: button.map(str::to_string),
+            })
+            .unwrap();
+            assert_eq!(argv, vec!["xdotool", "mousemove", "5", "6", "click", code]);
+        }
+    }
+
+    #[test]
+    fn click_action_rejects_unknown_button() {
+        let err = input_action_argv(&InputAction::Click {
+            x: 0,
+            y: 0,
+            button: Some("banana".to_string()),
+        })
+        .unwrap_err();
+        assert!(err.contains("banana"));
+    }
+
+    #[test]
+    fn double_click_action_builds_xdotool_repeat_click() {
+        let argv = input_action_argv(&InputAction::DoubleClick { x: 1, y: 2 }).unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "xdotool",
+                "mousemove",
+                "1",
+                "2",
+                "click",
+                "--repeat",
+                "2",
+                "--delay",
+                "150",
+                "1"
+            ]
+        );
+    }
+
+    #[test]
+    fn type_action_guards_text_with_a_double_dash() {
+        let argv = input_action_argv(&InputAction::Type {
+            text: "hello --world".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec!["xdotool", "type", "--delay", "12", "--", "hello --world"]
+        );
+    }
+
+    #[test]
+    fn type_action_rejects_oversized_text() {
+        let err = input_action_argv(&InputAction::Type {
+            text: "x".repeat(INPUT_MAX_TEXT_BYTES + 1),
+        })
+        .unwrap_err();
+        assert!(err.contains("4096") || err.contains("byte"));
+    }
+
+    #[test]
+    fn key_action_validates_and_guards_the_combo() {
+        let argv = input_action_argv(&InputAction::Key {
+            combo: "ctrl+t".to_string(),
+        })
+        .unwrap();
+        assert_eq!(argv, vec!["xdotool", "key", "--", "ctrl+t"]);
+    }
+
+    #[test]
+    fn key_action_rejects_shell_meaningful_combos() {
+        for bad in ["", "ctrl; rm -rf /", "$(reboot)", "a b", &"a".repeat(41)] {
+            assert!(
+                input_action_argv(&InputAction::Key {
+                    combo: bad.to_string()
+                })
+                .is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_action_maps_direction_and_clamps_amount() {
+        let up = input_action_argv(&InputAction::Scroll {
+            x: 1,
+            y: 2,
+            direction: "up".to_string(),
+            amount: Some(999),
+        })
+        .unwrap();
+        assert_eq!(
+            up,
+            vec![
+                "xdotool",
+                "mousemove",
+                "1",
+                "2",
+                "click",
+                "--repeat",
+                "10",
+                "4"
+            ]
+        );
+        let down = input_action_argv(&InputAction::Scroll {
+            x: 1,
+            y: 2,
+            direction: "down".to_string(),
+            amount: None,
+        })
+        .unwrap();
+        assert_eq!(
+            down,
+            vec![
+                "xdotool",
+                "mousemove",
+                "1",
+                "2",
+                "click",
+                "--repeat",
+                "1",
+                "5"
+            ]
+        );
+    }
+
+    #[test]
+    fn scroll_action_rejects_unknown_direction() {
+        let err = input_action_argv(&InputAction::Scroll {
+            x: 0,
+            y: 0,
+            direction: "sideways".to_string(),
+            amount: None,
+        })
+        .unwrap_err();
+        assert!(err.contains("sideways"));
+    }
+
+    #[test]
+    fn coordinates_out_of_range_are_rejected() {
+        assert!(input_action_argv(&InputAction::Move { x: -1, y: 0 }).is_err());
+        assert!(input_action_argv(&InputAction::Move { x: 0, y: 16385 }).is_err());
+        assert!(input_action_argv(&InputAction::Move { x: 16384, y: 16384 }).is_ok());
+    }
+
+    #[test]
+    fn validate_input_request_enforces_action_count_bounds() {
+        let none = InputRequest { actions: vec![] };
+        assert!(validate_input_request(&none).is_err());
+
+        let too_many = InputRequest {
+            actions: (0..INPUT_MAX_ACTIONS + 1)
+                .map(|_| InputAction::Move { x: 0, y: 0 })
+                .collect(),
+        };
+        assert!(validate_input_request(&too_many).is_err());
+
+        let ok = InputRequest {
+            actions: vec![InputAction::Move { x: 0, y: 0 }],
+        };
+        assert!(validate_input_request(&ok).is_ok());
+    }
+
+    #[test]
+    fn launch_url_is_only_valid_for_the_browser_app() {
+        assert!(validate_launch_url("browser", "https://example.com").is_ok());
+        assert!(validate_launch_url("browser", "http://example.com").is_ok());
+        assert!(validate_launch_url("files", "https://example.com").is_err());
+        assert!(validate_launch_url("terminal", "https://example.com").is_err());
+    }
+
+    #[test]
+    fn launch_url_rejects_non_http_schemes_and_malformed_urls() {
+        assert!(validate_launch_url("browser", "not a url").is_err());
+        assert!(validate_launch_url("browser", "javascript:alert(1)").is_err());
+        assert!(validate_launch_url("browser", "file:///etc/passwd").is_err());
+        assert!(validate_launch_url("browser", "ftp://example.com").is_err());
+    }
+
+    #[test]
+    fn launch_url_rejects_oversized_urls() {
+        let huge = format!("https://example.com/{}", "a".repeat(LAUNCH_URL_MAX_BYTES));
+        assert!(validate_launch_url("browser", &huge).is_err());
+    }
+
+    #[test]
+    fn append_launch_url_guards_the_url_with_a_literal_double_dash() {
+        let argv = launch_argv("browser").unwrap();
+        let full = append_launch_url(argv, Some("https://example.com"));
+        // The `--` must sit immediately before the URL, regardless of how
+        // many fixed flags precede it, so the launched program can never
+        // read the URL as a switch of its own.
+        let dash_pos = full.iter().position(|a| *a == "--").expect("has a --");
+        assert_eq!(full[dash_pos + 1], "https://example.com");
+        assert_eq!(dash_pos + 2, full.len(), "url must be the final element");
+    }
+
+    #[test]
+    fn append_launch_url_leaves_argv_untouched_without_a_url() {
+        let argv = launch_argv("terminal").unwrap();
+        let full = append_launch_url(argv, None);
+        assert_eq!(full, argv);
+        assert!(!full.contains(&"--"));
+    }
+
+    #[test]
+    fn owner_may_act() {
+        assert!(is_owner_or_manager("owner-pk", Some("owner-pk"), None));
+        assert!(is_owner_or_manager(
+            "owner-pk",
+            Some("owner-pk"),
+            Some("manager-pk")
+        ));
+    }
+
+    #[test]
+    fn manager_may_act_even_when_distinct_from_owner() {
+        // The desktop's dock signs as the human manager, not the agent
+        // owner — this is the case that motivated the whole gate.
+        assert!(is_owner_or_manager(
+            "manager-pk",
+            Some("owner-pk"),
+            Some("manager-pk")
+        ));
+    }
+
+    #[test]
+    fn an_unrelated_caller_is_refused() {
+        assert!(!is_owner_or_manager(
+            "someone-else-pk",
+            Some("owner-pk"),
+            Some("manager-pk")
+        ));
+        assert!(!is_owner_or_manager(
+            "someone-else-pk",
+            Some("owner-pk"),
+            None
+        ));
+        assert!(!is_owner_or_manager("someone-else-pk", None, None));
+    }
+
+    /// A sandbox created before `LABEL_MANAGER` existed has no manager label
+    /// at all — that must fall back to owner-only, never admit any caller
+    /// just because the label happens to be missing.
+    #[test]
+    fn an_absent_manager_label_falls_back_to_owner_only() {
+        assert!(is_owner_or_manager("owner-pk", Some("owner-pk"), None));
+        assert!(!is_owner_or_manager("random-pk", Some("owner-pk"), None));
     }
 }
