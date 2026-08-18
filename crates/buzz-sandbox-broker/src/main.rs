@@ -2163,6 +2163,11 @@ async fn sandbox_recording_start(
     {
         return internal(e);
     }
+    info!(
+        sandbox_id = %id,
+        max_duration_secs = sandbox::RECORDING_MAX_DURATION_SECS,
+        "recording started; ffmpeg self-terminates at the -t cap even if no stop call ever arrives"
+    );
 
     (StatusCode::OK, Json(serde_json::json!({"recording": true}))).into_response()
 }

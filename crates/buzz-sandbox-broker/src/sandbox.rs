@@ -644,6 +644,23 @@ pub fn append_launch_url<'a>(argv: &[&'a str], url: Option<&'a str>) -> Vec<&'a 
 /// recording per sandbox, so there is nothing for a caller to name.
 pub const RECORDING_PATH: &str = "/tmp/buzz-teach-recording.mp4";
 
+/// Hard ceiling on how long a single screen recording may run, in seconds.
+///
+/// This is an orphaned-recording safety net, not a product limit: the "Teach
+/// a task" pop-out window normally stops the recording itself (on hook
+/// unmount, cancel, or done), and the Tauri-side native `CloseRequested`
+/// handler on the pop-out window is a second layer that best-effort stops it
+/// when the window closes. But a window can also vanish without either
+/// running — a force-quit, an OS crash, a lost network connection between
+/// the desktop and the broker — leaving ffmpeg alive inside the sandbox with
+/// no UI left that can ever ask it to stop. The reaper eventually reclaims an
+/// *idle* sandbox, but a recording keeps the sandbox looking active, so it
+/// does not bound a live-but-abandoned capture. Passing `-t` to ffmpeg makes
+/// the recording self-terminate no matter what happens outside the
+/// container. 600s (10 minutes) comfortably covers a "teach a task" demo
+/// while guaranteeing no recording — legitimate or orphaned — runs forever.
+pub const RECORDING_MAX_DURATION_SECS: u32 = 600;
+
 /// Build the argv that starts screen recording inside a sandbox, backgrounded
 /// so the exec that launches it returns immediately.
 ///
@@ -653,12 +670,18 @@ pub const RECORDING_PATH: &str = "/tmp/buzz-teach-recording.mp4";
 /// `setsid` detaches the ffmpeg process from the exec's own session so it
 /// keeps running (and stays reachable by name for `recording_is_running_argv`
 /// and `recording_stop_argv`) after this exec's stdout/stderr stream closes.
+/// `-t RECORDING_MAX_DURATION_SECS` is placed as an output option (right
+/// before the output path, ffmpeg's conventional position) so it bounds the
+/// muxed output's duration — and therefore the whole capture — rather than
+/// only the x11grab input; ffmpeg stops and finalizes the mp4 on its own once
+/// the cap is hit, the same clean-exit path `recording_stop_argv`'s SIGINT
+/// takes.
 pub fn recording_start_argv() -> Vec<&'static str> {
     vec![
         "sh",
         "-c",
         "setsid ffmpeg -y -f x11grab -framerate 10 -i :1 -codec:v libx264 \
-         -preset ultrafast -pix_fmt yuv420p \
+         -preset ultrafast -pix_fmt yuv420p -t 600 \
          /tmp/buzz-teach-recording.mp4 > /tmp/buzz-teach-recording.log 2>&1 < /dev/null &",
     ]
 }
@@ -1607,6 +1630,25 @@ mod tests {
         // survives after the starting exec's stream closes.
         assert!(script.trim_end().ends_with('&'));
         assert!(script.contains("setsid"));
+    }
+
+    /// Orphaned-recording safety net: even if both the pop-out window's
+    /// native close handler and the React cleanup fail to stop a recording
+    /// (force-quit, crash, dropped connection), ffmpeg must self-terminate.
+    /// The `-t` flag must carry the exact duration named by
+    /// `RECORDING_MAX_DURATION_SECS` and sit before the output path, the
+    /// output-option position that bounds the whole capture.
+    #[test]
+    fn recording_start_argv_caps_duration_with_a_hard_ceiling() {
+        let script = recording_start_argv()[2];
+        let flag = format!("-t {RECORDING_MAX_DURATION_SECS}");
+        assert!(
+            script.contains(&flag),
+            "expected {flag:?} in script: {script}"
+        );
+        let t_pos = script.find(&flag).expect("has -t flag");
+        let output_pos = script.find(RECORDING_PATH).expect("has output path");
+        assert!(t_pos < output_pos, "-t must appear before the output path");
     }
 
     #[test]

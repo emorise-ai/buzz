@@ -42,25 +42,58 @@ export function useTeachTask({
   const [finishing, setFinishing] = React.useState(false);
   const [listening, setListening] = React.useState(false);
   const micRef = React.useRef<TeachTaskMicHandle | null>(null);
+  // True whenever a sandbox recording is running (ffmpeg live inside the
+  // sandbox). A ref, not state, so the unmount cleanup below reads the latest
+  // value without re-subscribing. Without this, closing the computer window
+  // mid-recording unmounts the hook and orphans ffmpeg — it keeps recording in
+  // the sandbox forever with no UI left to stop it.
+  const recordingActiveRef = React.useRef(false);
   const identityQuery = useIdentityQuery();
   const sendMessageMutation = useSendMessageMutation(null, identityQuery.data);
   const openDmMutation = useOpenDmMutation();
+
+  // On unmount (window/dialog closed) while a recording is still running, stop
+  // it in the sandbox so no orphaned ffmpeg keeps capturing. Best-effort and
+  // fire-and-forget — the surface is already going away, so there's nothing to
+  // send and no error to surface; we just must not leak the recording.
+  React.useEffect(() => {
+    return () => {
+      micRef.current?.stop();
+      micRef.current = null;
+      if (recordingActiveRef.current) {
+        recordingActiveRef.current = false;
+        void stopSandboxRecording(sandboxId).catch((err) => {
+          console.warn("[useTeachTask] stop on unmount failed:", err);
+        });
+      }
+    };
+  }, [sandboxId]);
 
   /** Reset all teaching state — call alongside a host surface's own
    *  session-reset (e.g. a freshly reopened dialog's `open` effect). */
   const resetTeaching = React.useCallback(() => {
     micRef.current?.stop();
     micRef.current = null;
+    // If a reset lands mid-recording (e.g. the dialog reopened onto a new
+    // session while one was live), stop the sandbox ffmpeg too — same leak the
+    // unmount guard closes.
+    if (recordingActiveRef.current) {
+      recordingActiveRef.current = false;
+      void stopSandboxRecording(sandboxId).catch((err) => {
+        console.warn("[useTeachTask] stop on reset failed:", err);
+      });
+    }
     setTeaching(false);
     setFinishing(false);
     setListening(false);
-  }, []);
+  }, [sandboxId]);
 
   async function startTeaching() {
     setUserInControl(true);
     setTeaching(true);
     try {
       await startSandboxRecording(sandboxId);
+      recordingActiveRef.current = true;
     } catch (err) {
       console.error("[useTeachTask] recording start failed:", err);
       toast.error(
@@ -91,6 +124,7 @@ export function useTeachTask({
     setListening(false);
     micRef.current?.stop();
     micRef.current = null;
+    recordingActiveRef.current = false;
     try {
       await stopSandboxRecording(sandboxId);
     } catch (err) {
@@ -130,6 +164,7 @@ export function useTeachTask({
         // dropping the whole teaching handoff over an STT hiccup.
       }
 
+      recordingActiveRef.current = false;
       const recording = await stopSandboxRecording(
         sandboxId,
         wavBytes ? { bytes: wavBytes, ext: "wav" } : undefined,

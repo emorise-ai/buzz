@@ -346,6 +346,41 @@ pub async fn sandbox_recording_stop(
     Ok(bytes.to_vec())
 }
 
+/// Best-effort, fire-and-forget recording stop for a sandbox whose viewer
+/// window is going away right now (native window close, see `lib.rs`'s
+/// `CloseRequested` handling for `computer-*` labels).
+///
+/// This is the same bare-stop request `sandbox_recording_stop` makes when
+/// called with no audio (empty body, no `audio_ext` query param) — it exists
+/// so the native window-close path can reuse that exact signing/request shape
+/// without going through the Tauri command (which returns the recording
+/// bytes; the window is closing, so there is nowhere to put them). Errors are
+/// swallowed by the caller: if there was no recording in progress the broker
+/// answers 409, and either way the window must not be blocked from closing
+/// while this runs.
+pub(crate) async fn stop_recording_best_effort(
+    sandbox_id: &str,
+    state: &AppState,
+) -> CmdResult<()> {
+    let id = validate_sandbox_id(sandbox_id)?;
+    let url = format!("{}/sandboxes/{id}/recording/stop", broker_base(state));
+    let auth = build_nip98_auth_header(&Method::POST, &url, &[], state)?;
+    let response = state
+        .http_client
+        .post(&url)
+        .header("Authorization", auth)
+        .body(Vec::new())
+        .send()
+        .await
+        .map_err(|e| format!("could not reach the sandbox broker: {e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(broker_error(status.as_u16(), &text));
+    }
+    Ok(())
+}
+
 /// Probe whether a sandbox is still alive on the broker (`GET
 /// /sandboxes/{id}`, unauthenticated-by-ownership — any NIP-98-valid caller
 /// may read status). Used at agent-start to decide whether a record's stored
@@ -778,8 +813,13 @@ pub async fn sandbox_launch_app(
 // dedup by label so re-clicking pop-out while the window is already open
 // just brings it forward instead of building a duplicate.
 
+/// Prefix on every computer pop-out window's label, shared with `lib.rs`'s
+/// `RunEvent::WindowEvent { CloseRequested, .. }` handling so it can recognize
+/// the window and recover the sandbox id from `label.strip_prefix(..)`.
+pub(crate) const COMPUTER_WINDOW_LABEL_PREFIX: &str = "computer-";
+
 fn computer_window_label(sandbox_id: &str) -> String {
-    format!("computer-{sandbox_id}")
+    format!("{COMPUTER_WINDOW_LABEL_PREFIX}{sandbox_id}")
 }
 
 /// Build the `#/computer/<id>?...` hash route for the pop-out window,
@@ -878,91 +918,5 @@ pub async fn open_computer_window(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        computer_window_hash_route, computer_window_label, to_base64url, validate_sandbox_id,
-        ComputerWindowParams,
-    };
-    use base64::Engine;
-
-    #[test]
-    fn reencodes_standard_base64_as_url_safe() {
-        // A payload whose standard base64 contains + and / must come back with
-        // only URL-safe characters (- _), and decode to the same bytes.
-        let raw = b"\xfb\xff\xbf hello world >>";
-        let std = base64::engine::general_purpose::STANDARD.encode(raw);
-        let url = to_base64url(&std).unwrap();
-        assert!(!url.contains('+') && !url.contains('/') && !url.contains('='));
-        let back = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(&url)
-            .unwrap();
-        assert_eq!(back, raw);
-    }
-
-    #[test]
-    fn computer_window_label_is_stable_and_unique_per_sandbox() {
-        // `open_computer_window` dedups via `app.get_webview_window(&label)`,
-        // so two calls for the same sandbox id must produce the exact same
-        // label (or a second click would build a duplicate window instead of
-        // focusing the existing one), while two different sandboxes must not
-        // collide.
-        let id = validate_sandbox_id("buzz-sandbox-fq5ijxh7lt").unwrap();
-        assert_eq!(
-            computer_window_label(id),
-            computer_window_label(id),
-            "label must be deterministic for the same sandbox id"
-        );
-        assert_eq!(
-            computer_window_label(id),
-            "computer-buzz-sandbox-fq5ijxh7lt"
-        );
-        assert_ne!(
-            computer_window_label(id),
-            computer_window_label("other-sandbox-id")
-        );
-    }
-
-    #[test]
-    fn hash_route_with_no_params_has_no_query_string() {
-        let route = computer_window_hash_route("sbx-1", &ComputerWindowParams::default());
-        assert_eq!(route, "index.html#/computer/sbx-1");
-    }
-
-    #[test]
-    fn hash_route_round_trips_every_param() {
-        let params = ComputerWindowParams {
-            viewer_url: Some("https://relay.example.com/sandbox-viewer/sbx-1".to_string()),
-            sandbox_name: Some("buzz-sandbox-fq5ijxh7lt".to_string()),
-            owner_pubkey: Some("deadbeef".repeat(8)),
-            agent_display_name: Some("Fern the Agent".to_string()),
-            expires_at: Some(1_700_000_000),
-        };
-        let route = computer_window_hash_route("sbx-1", &params);
-
-        assert!(route.starts_with("index.html#/computer/sbx-1?"));
-        assert!(
-            route.contains("viewerUrl=https%3A%2F%2Frelay.example.com%2Fsandbox-viewer%2Fsbx-1")
-        );
-        assert!(route.contains("sandboxName=buzz-sandbox-fq5ijxh7lt"));
-        assert!(route.contains(&format!("ownerPubkey={}", "deadbeef".repeat(8))));
-        assert!(route.contains("agentDisplayName=Fern%20the%20Agent"));
-        assert!(route.contains("expiresAt=1700000000"));
-    }
-
-    #[test]
-    fn hash_route_omits_blank_and_absent_params() {
-        // Empty strings from the frontend (e.g. an agent with no resolved
-        // display name) must not produce an empty `foo=` param — omitted
-        // entirely is what lets the frontend's "fall back to the store"
-        // check (`param === null`) work correctly.
-        let params = ComputerWindowParams {
-            viewer_url: Some(String::new()),
-            sandbox_name: None,
-            owner_pubkey: Some("  ".to_string()).filter(|s| !s.trim().is_empty()),
-            agent_display_name: None,
-            expires_at: None,
-        };
-        let route = computer_window_hash_route("sbx-1", &params);
-        assert_eq!(route, "index.html#/computer/sbx-1");
-    }
-}
+#[path = "sandbox_viewer_tests.rs"]
+mod tests;
