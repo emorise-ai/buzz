@@ -1,7 +1,8 @@
 import * as React from "react";
-import { Monitor } from "lucide-react";
+import { GraduationCap, Monitor } from "lucide-react";
 import { toast } from "sonner";
 
+import { Button } from "@/shared/ui/button";
 import { useUserProfileQuery } from "@/features/profile/hooks";
 import { resolveProfileDisplayName } from "@/features/profile/ui/UserProfilePanelUtils";
 import { useNow } from "@/shared/lib/useNow";
@@ -10,6 +11,9 @@ import { formatSandboxRemaining, isSandboxExpired } from "./sandboxCountdown";
 import { mintViewerUrl } from "./mintViewerUrl";
 import { readComputerWindowHandoff } from "./computerWindow";
 import { SandboxStage } from "./SandboxStage";
+import { SandboxControlToggle } from "./SandboxControlToggle";
+import { TeachTaskBanner } from "./TeachTaskBanner";
+import { useTeachTask } from "./useTeachTask";
 
 /** How long to wait for either the handoff params or the shared sandbox
  *  store before giving up on "Connecting…" and showing an actionable error.
@@ -59,6 +63,18 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
   const viewerUrl = handoff.viewerUrl ?? found?.sandbox.viewerUrl ?? null;
   const sandboxName = handoff.sandboxName ?? found?.sandbox.name ?? null;
   const expiresAt = handoff.expiresAt ?? found?.sandbox.expiresAt ?? null;
+
+  // "Teach a task" — same flow as the fullscreen dialog (see `useTeachTask`),
+  // shared rather than forked so the pop-out doesn't drift from the dialog.
+  const {
+    teaching,
+    finishing,
+    narration,
+    setNarration,
+    startTeaching,
+    cancelTeaching,
+    doneTeaching,
+  } = useTeachTask({ sandboxId, ownerPubkey, setUserInControl });
 
   React.useEffect(() => {
     setMintedUrl(null);
@@ -129,18 +145,75 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
     );
   }
 
+  const title = agentDisplayName
+    ? `${agentDisplayName}'s computer`
+    : "Agent's computer";
+
   return (
     <div className="flex h-screen w-screen flex-col bg-background">
-      <SandboxStage
-        viewerUrl={mintedUrl}
-        sandboxId={sandboxId}
-        sandboxName={sandboxName}
-        agentDisplayName={agentDisplayName}
-        remaining={remaining}
-        expired={expired}
-        userInControl={userInControl}
-        onUserInControlChange={setUserInControl}
-      />
+      {/* A real top bar (mirrors the in-app dialog header) rather than a
+          floating button — keeps the control toggle + "Teach a task" out of
+          the streamed browser's own window chrome, where a floating button
+          overlapped the sandbox Chromium's min/close buttons. */}
+      <div className="flex shrink-0 items-center justify-between gap-4 border-b border-border px-4 py-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <Monitor className="h-4 w-4 shrink-0 text-muted-foreground" />
+          <span className="truncate text-sm font-medium text-foreground">
+            {title}
+          </span>
+          {remaining && !expired ? (
+            <span className="shrink-0 text-2xs text-muted-foreground">
+              {remaining}
+            </span>
+          ) : null}
+        </div>
+
+        <div className="flex shrink-0 items-center gap-3">
+          {!expired ? (
+            <SandboxControlToggle
+              userInControl={userInControl}
+              onToggle={() => setUserInControl((v) => !v)}
+            />
+          ) : null}
+
+          {!expired && ownerPubkey ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={teaching}
+              data-testid="sandbox-teach-task"
+              onClick={() => void startTeaching()}
+              className="gap-1.5 text-2xs"
+            >
+              <GraduationCap className="h-3.5 w-3.5" />
+              Teach a task
+            </Button>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="relative flex min-h-0 flex-1 flex-col">
+        <SandboxStage
+          viewerUrl={mintedUrl}
+          sandboxId={sandboxId}
+          sandboxName={sandboxName}
+          agentDisplayName={agentDisplayName}
+          remaining={remaining}
+          expired={expired}
+          userInControl={userInControl}
+          onUserInControlChange={setUserInControl}
+        />
+        {teaching ? (
+          <TeachTaskBanner
+            narration={narration}
+            onNarrationChange={setNarration}
+            onDone={() => void doneTeaching()}
+            onCancel={() => void cancelTeaching()}
+            busy={finishing}
+          />
+        ) : null}
+      </div>
     </div>
   );
 }

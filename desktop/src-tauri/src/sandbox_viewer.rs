@@ -261,6 +261,64 @@ pub async fn sandbox_heartbeat(sandbox_id: String, state: State<'_, AppState>) -
     Ok(())
 }
 
+/// Start capturing a sandbox's screen — the "Teach a task" entry point.
+/// Owner-or-manager gated on the broker side, same as every other
+/// computer-use call here. A 409 (a recording is already in progress)
+/// surfaces as an ordinary error string for the caller to show.
+#[tauri::command]
+pub async fn sandbox_recording_start(
+    sandbox_id: String,
+    state: State<'_, AppState>,
+) -> CmdResult<()> {
+    let id = validate_sandbox_id(&sandbox_id)?;
+    let url = format!("{}/sandboxes/{id}/recording/start", broker_base(&state));
+    let auth = build_nip98_auth_header(&Method::POST, &url, &[], &state)?;
+    let response = state
+        .http_client
+        .post(&url)
+        .header("Authorization", auth)
+        .send()
+        .await
+        .map_err(|e| format!("could not reach the sandbox broker: {e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(broker_error(status.as_u16(), &text));
+    }
+    Ok(())
+}
+
+/// Stop an in-progress recording and return the finished mp4's raw bytes.
+/// The frontend hands these straight to `uploadMediaBytes` (the same path
+/// used for pasted/dragged media) to turn them into a fetchable URL — this
+/// command only fetches the bytes, it does not host them anywhere itself.
+#[tauri::command]
+pub async fn sandbox_recording_stop(
+    sandbox_id: String,
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<u8>> {
+    let id = validate_sandbox_id(&sandbox_id)?;
+    let url = format!("{}/sandboxes/{id}/recording/stop", broker_base(&state));
+    let auth = build_nip98_auth_header(&Method::POST, &url, &[], &state)?;
+    let response = state
+        .http_client
+        .post(&url)
+        .header("Authorization", auth)
+        .send()
+        .await
+        .map_err(|e| format!("could not reach the sandbox broker: {e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(broker_error(status.as_u16(), &text));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("could not read the recording: {e}"))?;
+    Ok(bytes.to_vec())
+}
+
 /// Probe whether a sandbox is still alive on the broker (`GET
 /// /sandboxes/{id}`, unauthenticated-by-ownership — any NIP-98-valid caller
 /// may read status). Used at agent-start to decide whether a record's stored

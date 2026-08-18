@@ -18,7 +18,9 @@ import { Button } from "@/shared/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { SandboxControlToggle } from "./SandboxControlToggle";
 import { SandboxStage, type SandboxStageHandle } from "./SandboxStage";
+import { TeachTaskBanner } from "./TeachTaskBanner";
 import { openComputerWindow } from "./openComputerWindow";
+import { useTeachTask } from "./useTeachTask";
 
 /**
  * The agent's workspace: one live screen, the real-desktop metaphor all the
@@ -71,13 +73,29 @@ export function SandboxViewerDialog({
   const [userInControl, setUserInControl] = React.useState(false);
   const stageRef = React.useRef<SandboxStageHandle>(null);
 
+  // "Teach a task" — see `useTeachTask` for the full flow (record → upload →
+  // message the agent's DM). Shared with the pop-out computer window so the
+  // two surfaces don't drift.
+  const {
+    teaching,
+    finishing,
+    narration,
+    setNarration,
+    startTeaching,
+    cancelTeaching,
+    doneTeaching,
+    resetTeaching,
+  } = useTeachTask({ sandboxId, ownerPubkey, setUserInControl });
+
   // A freshly reopened dialog should always start with the agent in
-  // control — this state is local to one workspace session.
+  // control and out of teaching mode — this state is local to one
+  // workspace session.
   React.useEffect(() => {
     if (open) {
       setUserInControl(false);
+      resetTeaching();
     }
-  }, [open]);
+  }, [open, resetTeaching]);
 
   const title = agentDisplayName
     ? `${agentDisplayName}'s computer`
@@ -139,24 +157,20 @@ export function SandboxViewerDialog({
               </Button>
             ) : null}
 
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    disabled
-                    data-testid="sandbox-teach-task"
-                    className="gap-1.5 text-2xs"
-                  >
-                    <GraduationCap className="h-3.5 w-3.5" />
-                    Teach a task
-                  </Button>
-                </span>
-              </TooltipTrigger>
-              <TooltipContent>Coming soon</TooltipContent>
-            </Tooltip>
+            {!expired ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={teaching}
+                data-testid="sandbox-teach-task"
+                onClick={() => void startTeaching()}
+                className="gap-1.5 text-2xs"
+              >
+                <GraduationCap className="h-3.5 w-3.5" />
+                Teach a task
+              </Button>
+            ) : null}
 
             <Tooltip>
               <TooltipTrigger asChild>
@@ -176,18 +190,29 @@ export function SandboxViewerDialog({
           </div>
         </DialogHeader>
 
-        <SandboxStage
-          ref={stageRef}
-          viewerUrl={viewerUrl}
-          sandboxId={sandboxId}
-          sandboxName={sandboxName}
-          agentDisplayName={agentDisplayName}
-          remaining={remaining}
-          expired={expired}
-          active={open}
-          userInControl={userInControl}
-          onUserInControlChange={setUserInControl}
-        />
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          <SandboxStage
+            ref={stageRef}
+            viewerUrl={viewerUrl}
+            sandboxId={sandboxId}
+            sandboxName={sandboxName}
+            agentDisplayName={agentDisplayName}
+            remaining={remaining}
+            expired={expired}
+            active={open}
+            userInControl={userInControl}
+            onUserInControlChange={setUserInControl}
+          />
+          {teaching ? (
+            <TeachTaskBanner
+              narration={narration}
+              onNarrationChange={setNarration}
+              onDone={() => void doneTeaching()}
+              onCancel={() => void cancelTeaching()}
+              busy={finishing}
+            />
+          ) : null}
+        </div>
       </DialogContent>
     </Dialog>
   );
