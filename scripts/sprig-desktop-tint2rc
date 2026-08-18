@@ -25,33 +25,99 @@
 # make room, so nothing else on screen has to move.
 #
 # Visual goal: read as a real OS dock (macOS/GNOME-style) — a small rounded,
-# softly translucent pill centered at the bottom, icons at a fraction of the
-# panel height with generous padding — themed with the same neutral dark
-# greys as openbox's BuzzDark titlebar (see
-# ../scripts/sprig-desktop-theme/openbox-3/themerc) so it reads as part of
-# the same desktop, not a second, differently-themed dock bolted on.
+# softly translucent pill centered at the bottom, shrunk to its own content
+# (launcher icons + taskbar, no dead space) rather than stretched across a
+# fixed-width bar — themed with the same neutral dark greys as openbox's
+# BuzzDark titlebar (see ../scripts/sprig-desktop-theme/openbox-3/themerc)
+# so it reads as part of the same desktop, not a second, differently-themed
+# dock bolted on.
 #
-# tint2's config format: top-level `key = value` pairs, plus a handful of
-# `background_id = N` / `gradient_id = N` blocks that each open with their
-# own header line and are filled in by the `background_color` /
-# `border_color` / `rounded` keys that immediately follow, up to the next
-# background_id (or end of file). Items reference a background by number
-# via *_background_id keys (e.g. `task_background_id = 2`).
+# SYNTAX NOTE — verified against the real Debian bookworm tint2 17.0.1
+# package (there is no `background_id = N` declarator key; it errors as
+# "invalid option" if used). Background definitions are POSITIONAL: each
+# `# Background N: ...` comment below starts a new block purely by
+# appearing after the previous block's last key, and *_background_id keys
+# elsewhere (e.g. `panel_background_id = 1`) reference blocks by their
+# 1-based position in this file, top to bottom. Confirmed by running the
+# actual binary with `-c` against this file and checking for "invalid
+# option" / "Could not open file" lines — zero parse errors.
 
-# === Panel ====================================================================
+#-------------------------------------
+# Backgrounds
+# Background 1: Panel — rounded, softly translucent pill in the same
+# neutral greys as BuzzDark's menu chrome (#232323 fill, #3a3a3a border —
+# see openbox-3/themerc) so the dock doesn't clash with the rest of the
+# desktop's window chrome.
+rounded = 16
+border_width = 1
+border_sides = TBLR
+background_color = #232323 82
+border_color = #3a3a3a 90
+background_color_hover = #232323 82
+border_color_hover = #3a3a3a 90
+background_color_pressed = #232323 82
+border_color_pressed = #3a3a3a 90
+
+# Background 2: Default task, iconified task — near-invisible until
+# hovered. A taskbar entry isn't a button-like tile the way a launcher is,
+# it's a live window indicator, so it stays flush with the panel except on
+# interaction.
+rounded = 10
+border_width = 0
+border_sides = TBLR
+background_color = #ffffff 0
+border_color = #ffffff 0
+background_color_hover = #ffffff 14
+border_color_hover = #ffffff 0
+background_color_pressed = #ffffff 22
+border_color_pressed = #ffffff 0
+
+# Background 3: Active task, urgent task — a soft highlight pill, the same
+# visual language macOS/GNOME use for "this window is focused."
+rounded = 10
+border_width = 0
+border_sides = TBLR
+background_color = #ffffff 20
+border_color = #ffffff 0
+background_color_hover = #ffffff 26
+border_color_hover = #ffffff 0
+background_color_pressed = #ffffff 32
+border_color_pressed = #ffffff 0
+
+# Background 4: Tooltip
+rounded = 8
+border_width = 1
+border_sides = TBLR
+background_color = #1a1a1a 92
+border_color = #3a3a3a 90
+background_color_hover = #1a1a1a 92
+border_color_hover = #3a3a3a 90
+background_color_pressed = #1a1a1a 92
+border_color_pressed = #3a3a3a 90
+
+#-------------------------------------
+# Panel
 panel_items = LT
 panel_size = 62% 60
 panel_margin = 0 6
 panel_padding = 10 6 10
+panel_background_id = 1
 panel_position = bottom center horizontal
 # tint2's stacking-order layer — always drawn above normal windows so the
 # dock is never hidden behind Chromium. This is NOT a strut/space
 # reservation; strut_policy (below) is what controls that, and it is off.
 panel_layer = top
 panel_dock = 0
-panel_pivot_struts = 0
 panel_monitor = all
-panel_shrink = 0
+# THE fix for a dock that reads as a full-width bar with dead space between
+# clusters: panel_size above is a MAXIMUM/available width (like max-width in
+# CSS), not the panel's actual width — panel_shrink is what makes tint2
+# size the panel down to its actual content (launcher + taskbar, no wasted
+# space) instead of stretching to fill panel_size. Every stock tint2 theme
+# ships panel_shrink = 1 for exactly this reason; this file originally had
+# it backwards (0), which is what produced the launcher-icons-left,
+# taskbar-stranded-in-the-middle layout.
+panel_shrink = 1
 autohide = 0
 strut_policy = none
 font_shadow = 0
@@ -60,18 +126,8 @@ disable_transparency = 0
 mouse_hover_icon_asb = 100 0 10
 mouse_pressed_icon_asb = 100 0 -10
 
-# Panel background (id 1): rounded, softly translucent pill in the same
-# neutral greys as BuzzDark's menu chrome (#232323 fill, #3a3a3a border —
-# see openbox-3/themerc) so the dock doesn't clash with the rest of the
-# desktop's window chrome.
-background_id = 1
-rounded = 16
-border_width = 1
-border_color = #3a3a3a 90
-background_color = #232323 82
-panel_background_id = 1
-
-# === Taskbar ===================================================================
+#-------------------------------------
+# Taskbar
 # Window switching, fed straight from the X server's own EWMH state — this
 # is what used to require polling the broker's /windows endpoint from React.
 # Single desktop (openbox-rc.xml sets <number>1</number>), so no pager/
@@ -82,17 +138,29 @@ taskbar_background_id = 0
 taskbar_active_background_id = 0
 taskbar_name = 0
 taskbar_hide_if_empty = 1
+taskbar_distribute_size = 0
 taskbar_sort_order = lru
+task_align = center
 
+#-------------------------------------
+# Task
 task_icon = 1
-task_text = 0
+# Icon + window title, like a real OS taskbar entry — not icon-only.
+# task_maximum_size's width is widened to fit a title (tint2 truncates with
+# an ellipsis past this, so a long title never breaks layout); height stays
+# tall enough for icon + single-line text without stretching the panel
+# beyond the 60px it's sized for.
+task_text = 1
 task_thumbnail = 0
-task_font_tooltip = 0
-task_maximum_size = 40 40
+# Fixed, non-expanding tile size — with taskbar_distribute_size off this is
+# also what keeps a single open window from being stretched to fill the
+# panel (the earlier bug: one taskbar item alone in a wide bar). The
+# taskbar's total width is however many of these fit its tasks, not a
+# fraction of panel_size.
+task_maximum_size = 220 34
 task_padding = 4 4 4
 task_tooltip = 1
 task_centered = 1
-task_align = center
 task_background_id = 2
 task_active_background_id = 3
 task_urgent_background_id = 3
@@ -100,33 +168,14 @@ task_iconified_background_id = 2
 task_font = Inter 9
 task_font_color = #e8e8e8 100
 task_active_font_color = #ffffff 100
+mouse_left = toggle_iconify
+mouse_middle = none
+mouse_right = close
+mouse_scroll_up = none
+mouse_scroll_down = none
 
-# Task chip background (id 2): near-invisible until hovered — a taskbar
-# entry isn't a button-like tile the way a launcher is, it's a live window
-# indicator, so it stays flush with the panel except on interaction.
-background_id = 2
-rounded = 10
-border_width = 0
-background_color = #ffffff 0
-background_color_hover = #ffffff 14
-background_color_pressed = #ffffff 22
-
-# Active-task background (id 3): a soft highlight pill, the same visual
-# language macOS/GNOME use for "this window is focused."
-background_id = 3
-rounded = 10
-border_width = 0
-background_color = #ffffff 20
-background_color_hover = #ffffff 26
-background_color_pressed = #ffffff 32
-
-# === Separator =================================================================
-separator_style = dots
-separator_color = #ffffff 30
-separator_size = 1
-separator_background_id = 0
-
-# === Launcher ===================================================================
+#-------------------------------------
+# Launcher
 # Points at the real .desktop files already shipped in this image (Debian's
 # chromium/thunar/xfce4-terminal packages install these to
 # /usr/share/applications/ — nothing here needs a new icon package; the Yaru
@@ -137,29 +186,48 @@ separator_background_id = 0
 # too.
 launcher_padding = 6 4 8
 launcher_background_id = 0
-launcher_icon_theme = Yaru
+launcher_icon_background_id = 0
 launcher_icon_size = 40
 launcher_icon_asb = 100 0 0
+launcher_icon_theme = Yaru
 launcher_icon_theme_override = 0
+startup_notifications = 1
+launcher_tooltip = 1
 launcher_item_app = /usr/share/applications/chromium.desktop
-launcher_item_app = /usr/share/applications/thunar.desktop
+# Files uses a local override (see sprig-desktop-thunar.desktop), not the
+# system thunar.desktop directly — thunar.desktop's own Icon= says
+# "org.xfce.thunar", which Yaru does not ship (it only exists under
+# hicolor, Thunar's own upstream fallback icon), so a Yaru-themed lookup
+# renders it inconsistently with Chromium/Terminal's Yaru-styled tiles.
+# The override points Icon= at "system-file-manager" instead — the
+# freedesktop-standard generic name, which Yaru DOES ship real themed
+# artwork for. See that file's header comment for the full investigation.
+launcher_item_app = /home/agent/.local/share/applications/sprig-thunar.desktop
 launcher_item_app = /usr/share/applications/xfce4-terminal.desktop
 
-# === Clock (skipped) ===========================================================
+#-------------------------------------
+# Separator — a thin divider between the launcher cluster and the taskbar
+# cluster (macOS-style), not the large dead-space gap the un-shrunk panel
+# produced. `separator = new` is required syntax (tint2 warns and ignores
+# the block without it) — confirmed against the real binary.
+separator = new
+separator_background_id = 0
+separator_color = #ffffff 30
+separator_style = dots
+separator_size = 1
+separator_padding = 4 0
+
+#-------------------------------------
+# Clock (skipped)
 # No clock — this is an agent's computer, not a human's daily-driver
 # desktop, and the taskbar/launcher already fill the panel's intended role.
 time1_format =
 
-# === Tooltip ====================================================================
+#-------------------------------------
+# Tooltip
 tooltip_show_timeout = 0.4
 tooltip_hide_timeout = 0.1
 tooltip_padding = 6 4
 tooltip_font = Inter 9
 tooltip_font_color = #e8e8e8 100
 tooltip_background_id = 4
-
-background_id = 4
-rounded = 8
-border_width = 1
-border_color = #3a3a3a 90
-background_color = #1a1a1a 92

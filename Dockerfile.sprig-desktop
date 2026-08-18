@@ -176,6 +176,7 @@ COPY --chown=agent:agent scripts/sprig-desktop-fontconfig.conf /home/agent/.conf
 COPY --chown=agent:agent scripts/sprig-desktop-picom.conf /home/agent/.config/picom.conf
 COPY --chown=agent:agent scripts/sprig-desktop-terminalrc /home/agent/.config/xfce4/terminal/terminalrc
 COPY --chown=agent:agent scripts/sprig-desktop-tint2rc /home/agent/.config/tint2/tint2rc
+COPY --chown=agent:agent scripts/sprig-desktop-thunar.desktop /home/agent/.local/share/applications/sprig-thunar.desktop
 
 USER agent
 WORKDIR /home/agent

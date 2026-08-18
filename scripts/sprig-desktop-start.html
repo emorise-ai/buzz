@@ -6,21 +6,31 @@
   a white flash is the first thing a human sees on takeover — exactly the
   "generic Linux box" impression the rest of this image works to avoid. This
   is a local file so it needs no network and loads instantly.
+
+  Content-wise this used to be one grey line ("This computer is ready.").
+  It's now a proper branded landing page: the Buzz mark, a short "what is
+  this" explainer aimed at a human who just took over mid-session, and
+  three hint chips pointing at the dock below (browser/files/terminal) so
+  the page teaches its own next step instead of leaving a first-time viewer
+  to guess what the dock icons are for.
 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <title>Ready</title>
 <style>
+  :root {
+    color-scheme: dark;
+  }
   html, body {
     margin: 0;
     height: 100%;
   }
   body {
-    /* Echoes sprig-desktop-wallpaper.png's navy-to-teal glow toward the
-       upper-right, kept subtle (single soft radial, no vignette) so this
-       page and the desktop behind it read as one system rather than two
-       different backgrounds swapping in and out. */
+    /* Same navy-to-teal glow as sprig-desktop-wallpaper.png (radial at 86%
+       12%, rgba(34,122,138,0.35) -> transparent), so this page and the
+       desktop behind it read as one system rather than two different
+       backgrounds swapping in and out. */
     background:
       radial-gradient(ellipse at 86% 12%, rgba(34, 122, 138, 0.35), transparent 55%),
       #0b1421;
@@ -28,13 +38,119 @@
     align-items: center;
     justify-content: center;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #d8dee9;
+  }
+
+  .card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    max-width: 30rem;
+    padding: 0 2rem;
+    text-align: center;
+  }
+
+  .mark {
+    width: 4.5rem;
+    height: auto;
+    color: #f0b849;
+    margin-bottom: 1.5rem;
+    /* A soft glow instead of a hard drop-shadow — echoes the wallpaper's
+       glow rather than fighting it with a separate light source. */
+    filter: drop-shadow(0 0 24px rgba(240, 184, 73, 0.25));
+  }
+
+  /* Type scale with deliberate contrast between steps (~1.3+ ratio), so the
+     page reads top-down as title -> explainer -> labels -> hint rather than
+     one flat block. Display heading anchors it; everything below steps down. */
+  h1 {
+    margin: 0 0 1rem;
+    font-size: 2rem;
+    font-weight: 650;
+    letter-spacing: -0.02em;
+    line-height: 1.1;
+    color: #f2f4f7;
+  }
+
+  p.intro {
+    margin: 0;
+    font-size: 1rem;
+    line-height: 1.6;
+    color: #9aa4b2;
+  }
+
+  .chips {
+    display: flex;
+    gap: 0.625rem;
+    margin-top: 2rem;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .chip {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.4rem 0.75rem;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    font-size: 0.8125rem;
+    color: #b8c0cc;
+    letter-spacing: 0.01em;
+  }
+
+  .chip .glyph {
+    font-size: 0.9375rem;
+    line-height: 1;
+  }
+
+  .hint {
+    margin-top: 1.25rem;
+    font-size: 0.6875rem;
+    text-transform: uppercase;
     color: #5b6470;
-    font-size: 14px;
-    letter-spacing: 0.02em;
+    letter-spacing: 0.08em;
   }
 </style>
 </head>
 <body>
-  This computer is ready.
+  <div class="card">
+    <!-- Buzz mark: identical geometry to desktop/src/shared/ui/buzz-logo/BuzzMark.tsx
+         (viewBox 466x309 — two circles for the "ears", a rounded-rect body,
+         eye/mouth cutouts via mask), inlined so this page needs no network
+         and no asset file alongside it. currentColor picks up .mark's color
+         above. -->
+    <svg class="mark" viewBox="0 0 466 309" fill="currentColor" role="img" aria-label="Buzz">
+      <defs>
+        <mask id="m">
+          <rect x="-80" y="-80" width="626" height="469" fill="#fff"/>
+          <ellipse cx="193.3" cy="84.4" rx="27" ry="27" fill="#000"/>
+          <ellipse cx="276" cy="84.4" rx="27" ry="27" fill="#000"/>
+          <rect x="166.3" y="157.2" width="136.9" height="38.3" rx="5" fill="#000"/>
+          <rect x="166.9" y="235.1" width="136.2" height="37.6" rx="5" fill="#000"/>
+        </mask>
+      </defs>
+      <g mask="url(#m)">
+        <circle cx="91.7" cy="154.5" r="91.7"/>
+        <circle cx="374.3" cy="154.5" r="91.7"/>
+        <rect x="128" y="0" width="210" height="309" rx="34"/>
+      </g>
+    </svg>
+
+    <h1>This is your Buzz computer</h1>
+    <p class="intro">
+      A real Linux desktop your agent controls — and you can watch or take
+      over anytime. Ask your agent to browse, run commands, or use apps
+      here, or click into the screen to drive it yourself.
+    </p>
+
+    <div class="chips">
+      <span class="chip"><span class="glyph">🌐</span>Browser</span>
+      <span class="chip"><span class="glyph">📁</span>Files</span>
+      <span class="chip"><span class="glyph">⌨️</span>Terminal</span>
+    </div>
+    <p class="hint">Open any of these from the dock below.</p>
+  </div>
 </body>
 </html>

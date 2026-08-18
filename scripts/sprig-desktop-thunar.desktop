@@ -1,0 +1,25 @@
+[Desktop Entry]
+# Local override of Debian's /usr/share/applications/thunar.desktop, used
+# only by the tint2 dock's launcher (sprig-desktop-tint2rc). Everything
+# here is copied verbatim from the system file EXCEPT Icon=.
+#
+# ROOT CAUSE: thunar.desktop's own Icon= line says "org.xfce.thunar", which
+# only exists under hicolor (Thunar's own upstream-shipped icon) — it is
+# NOT one of Yaru's icon names, so a Yaru-themed lookup falls through to
+# hicolor and renders Thunar in a visually different (non-Yaru-styled)
+# style than Chromium/Terminal, or a generic glyph depending on cache
+# state. Yaru does not ship a Thunar-specific icon at all; the correct name
+# for "the file manager" in Yaru (and the freedesktop icon-naming spec) is
+# the generic "system-file-manager" — confirmed present as real Yaru
+# artwork under /usr/share/icons/Yaru/48x48/apps/system-file-manager.png
+# (and every other Yaru size bucket), not a hicolor/Adwaita fallback. Using
+# that name instead of Thunar's own gets a properly Yaru-styled tile that
+# matches Chromium/Terminal's look, not just *a* resolvable icon.
+Name=Files
+Exec=thunar %U
+Icon=system-file-manager
+Terminal=false
+StartupNotify=true
+Type=Application
+Categories=System;Core;GTK;FileTools;FileManager;
+MimeType=inode/directory;
