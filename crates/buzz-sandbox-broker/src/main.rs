@@ -2167,6 +2167,15 @@ async fn sandbox_recording_start(
     (StatusCode::OK, Json(serde_json::json!({"recording": true}))).into_response()
 }
 
+/// Query hint on `POST /sandboxes/{id}/recording/stop` naming the format of
+/// an optional audio body — see [`sandbox::AUDIO_EXT_ALLOWLIST`]. Absent
+/// entirely when the call carries no audio.
+#[derive(serde::Deserialize, Default)]
+struct RecordingStopQuery {
+    #[serde(default)]
+    audio_ext: Option<String>,
+}
+
 /// `POST /sandboxes/{id}/recording/stop` — gracefully stop an in-progress
 /// recording and return the finished mp4's raw bytes. Owner-or-manager, same
 /// as `start`.
@@ -2177,20 +2186,53 @@ async fn sandbox_recording_start(
 /// still-running (or force-killed) ffmpeg would return an unplayable file.
 /// Reuses the exact `get_archive` + tar-extraction path `sandbox_screenshot`
 /// uses for its PNG.
+///
+/// Optionally takes a human's narration track in the same call: pass
+/// `?audio_ext=<wav|webm|ogg|m4a|mp3|aac>` and put the raw audio bytes in the
+/// request body (in place of the empty body a video-only stop sends). When
+/// present, the audio is pushed into the sandbox and muxed against the just
+/// -recorded screen capture with `ffmpeg -c:v copy -c:a aac -shortest`, and
+/// the *merged* mp4 is what comes back — never both files separately. This
+/// is intentionally one call rather than a second "mux" endpoint: the video
+/// file only exists on the sandbox's disk for the instant between stopping
+/// ffmpeg and reading it back, and giving a second endpoint a window to find
+/// that file would mean tracking its lifetime across two round trips instead
+/// of one. Omitting `audio_ext` (or sending an empty body) reproduces
+/// exactly today's video-only behavior — callers that haven't wired up audio
+/// capture yet are unaffected.
 async fn sandbox_recording_stop(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+    Query(q): Query<RecordingStopQuery>,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     if !is_safe_id(&id) {
         return bad_request("malformed sandbox id");
     }
+    if body.len() > sandbox::RECORDING_AUDIO_MAX_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "audio upload exceeds the {}-byte limit",
+                    sandbox::RECORDING_AUDIO_MAX_BYTES
+                )
+            })),
+        )
+            .into_response();
+    }
+    // The audio extension hint is part of what the caller must sign over:
+    // folding it into the request line (rather than trusting the query
+    // separately from NIP-98) means a caller cannot replay a stop call
+    // signed for one extension against a different one.
+    let query_suffix = raw.map(|r| format!("?{r}")).unwrap_or_default();
     let caller = match authorize(
         &state,
         &headers,
         "POST",
-        &format!("/sandboxes/{id}/recording/stop"),
+        &format!("/sandboxes/{id}/recording/stop{query_suffix}"),
         &body,
     )
     .await
@@ -2201,6 +2243,16 @@ async fn sandbox_recording_stop(
     if let Err(response) = require_owner_or_manager(&state, &id, &caller).await {
         return response;
     }
+
+    // An audio track is present only when the caller named its format *and*
+    // sent bytes — either alone (a hint with an empty body, or a body with no
+    // hint) is treated as "no audio", matching how `fs_upload` treats an
+    // absent body: there is nothing to validate an extension against, or
+    // nothing to write.
+    let audio: Option<(&str, &[u8])> = match (q.audio_ext.as_deref(), body.as_ref()) {
+        (Some(ext), bytes) if !bytes.is_empty() => Some((ext, bytes)),
+        _ => None,
+    };
 
     let is_running_argv = sandbox::recording_is_running_argv();
     match state.docker.exec(&id, &is_running_argv, FS_EXEC_USER).await {
@@ -2238,7 +2290,105 @@ async fn sandbox_recording_stop(
         }
     }
 
-    let tar_bytes = match state.docker.get_archive(&id, sandbox::RECORDING_PATH).await {
+    let Some((ext, audio_bytes)) = audio else {
+        return recording_video_response(&state, &id).await;
+    };
+
+    let audio_path = match sandbox::audio_upload_path(ext) {
+        Ok(p) => p,
+        Err(e) => return bad_request(e),
+    };
+    let audio_filename = std::path::Path::new(&audio_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("buzz-teach-audio");
+    let audio_tar = match build_single_file_tar(audio_filename, audio_bytes) {
+        Ok(t) => t,
+        Err(e) => return internal(format!("could not build audio upload archive: {e}")),
+    };
+    if let Err(e) = state.docker.put_archive(&id, "/tmp", audio_tar).await {
+        return internal(format!("could not upload audio track: {e}"));
+    }
+
+    let mux_argv = sandbox::recording_mux_argv(sandbox::RECORDING_PATH, &audio_path);
+    let mux_result = state.docker.exec(&id, &mux_argv, FS_EXEC_USER).await;
+    // Best-effort cleanup of the audio upload regardless of mux outcome — it
+    // has already served its purpose either way, and leaving it behind would
+    // accumulate across repeated takes the same way a stray recording would.
+    let _ = state
+        .docker
+        .exec(&id, &["rm", "-f", "--", &audio_path], FS_EXEC_USER)
+        .await;
+    match mux_result {
+        Ok((0, _)) => {}
+        Ok((_, output)) => {
+            warn!(
+                sandbox = %id,
+                output = %String::from_utf8_lossy(&output),
+                "ffmpeg mux failed"
+            );
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "could not mux the audio track into the recording"
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => return internal(e),
+    }
+
+    let tar_bytes = match state
+        .docker
+        .get_archive(&id, sandbox::RECORDING_MERGED_PATH)
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(sandbox = %id, error = %e, "merged recording missing after mux");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "merged recording was not found after muxing"
+                })),
+            )
+                .into_response();
+        }
+    };
+    // Best-effort cleanup of the merged file — same spirit as the audio
+    // cleanup above, so repeated "Teach a task" takes on one long-lived
+    // sandbox don't accumulate stale mp4s under /tmp.
+    let _ = state
+        .docker
+        .exec(
+            &id,
+            &["rm", "-f", "--", sandbox::RECORDING_MERGED_PATH],
+            FS_EXEC_USER,
+        )
+        .await;
+
+    match single_file_from_tar_bytes(tar_bytes) {
+        Ok(Some(bytes)) => (
+            [(axum::http::header::CONTENT_TYPE, "video/mp4".to_string())],
+            bytes,
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "merged recording was not found after muxing"
+            })),
+        )
+            .into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+/// Fetch and return the plain (audio-free) recording — the path
+/// `sandbox_recording_stop` takes when no audio track was uploaded, factored
+/// out so that path reads exactly as it did before muxing existed.
+async fn recording_video_response(state: &AppState, id: &str) -> axum::response::Response {
+    let tar_bytes = match state.docker.get_archive(id, sandbox::RECORDING_PATH).await {
         Ok(b) => b,
         Err(e) => {
             warn!(sandbox = %id, error = %e, "recording file missing after stop");
@@ -2252,37 +2402,42 @@ async fn sandbox_recording_stop(
         }
     };
 
+    match single_file_from_tar_bytes(tar_bytes) {
+        Ok(Some(bytes)) => (
+            [(axum::http::header::CONTENT_TYPE, "video/mp4".to_string())],
+            bytes,
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "recording file was not found after stopping"
+            })),
+        )
+            .into_response(),
+        Err(e) => internal(format!("could not read recording archive: {e}")),
+    }
+}
+
+/// Extract the first regular file's contents from a single-entry tar, as
+/// returned by Docker's container-archive `GET`. `Ok(None)` means the tar
+/// had no file entry — distinct from an I/O error reading one that exists.
+fn single_file_from_tar_bytes(tar_bytes: Vec<u8>) -> Result<Option<Vec<u8>>, String> {
     let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
-    let entries = match archive.entries() {
-        Ok(e) => e,
-        Err(e) => return internal(format!("could not read archive: {e}")),
-    };
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("could not read archive: {e}"))?;
     for entry in entries {
-        let mut entry = match entry {
-            Ok(e) => e,
-            Err(e) => return internal(format!("could not read archive entry: {e}")),
-        };
+        let mut entry = entry.map_err(|e| format!("could not read archive entry: {e}"))?;
         if !entry.header().entry_type().is_file() {
             continue;
         }
         let mut bytes = Vec::new();
-        if let Err(e) = std::io::Read::read_to_end(&mut entry, &mut bytes) {
-            return internal(format!("could not read recording contents: {e}"));
-        }
-        return (
-            [(axum::http::header::CONTENT_TYPE, "video/mp4".to_string())],
-            bytes,
-        )
-            .into_response();
+        std::io::Read::read_to_end(&mut entry, &mut bytes)
+            .map_err(|e| format!("could not read file contents: {e}"))?;
+        return Ok(Some(bytes));
     }
-
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(serde_json::json!({
-            "error": "recording file was not found after stopping"
-        })),
-    )
-        .into_response()
+    Ok(None)
 }
 
 /// `POST /sandboxes/{id}/heartbeat` — a pure activity signal, owner-or-manager

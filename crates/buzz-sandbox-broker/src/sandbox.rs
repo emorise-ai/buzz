@@ -686,6 +686,79 @@ pub fn recording_stop_argv() -> Vec<&'static str> {
     vec!["pkill", "-INT", "-f", "ffmpeg.*buzz-teach-recording.mp4"]
 }
 
+/// Path inside the container that an uploaded narration track is written to
+/// before muxing, and the merged result read back from. Both fixed, like
+/// [`RECORDING_PATH`] — a stop call carries at most one audio upload and
+/// produces at most one merged file, so there is nothing for a caller to name.
+/// The audio path's extension varies with [`AUDIO_EXT_ALLOWLIST`] and is
+/// substituted by [`audio_upload_path`]; the merged output is always `.mp4`
+/// since muxing always re-packages into the same container format the screen
+/// recording already uses.
+pub const RECORDING_AUDIO_PATH_BASE: &str = "/tmp/buzz-teach-audio";
+pub const RECORDING_MERGED_PATH: &str = "/tmp/buzz-teach-merged.mp4";
+
+/// Extensions ffmpeg is expected to demux without extra flags, covering the
+/// formats a browser's `MediaRecorder`/WebAudio capture or a plain WAV
+/// encoder plausibly hands the broker. Checked against the caller-supplied
+/// hint so nothing reaches a filename or exec argv that didn't come from this
+/// fixed list.
+pub const AUDIO_EXT_ALLOWLIST: &[&str] = &["wav", "webm", "ogg", "m4a", "mp3", "aac"];
+
+/// Cap on an uploaded narration track. It is a short screen-recording
+/// voiceover, not a general file upload — large enough for a long take at a
+/// modest bitrate, small enough that a caller cannot use this path to push an
+/// unbounded amount of data into a sandbox.
+pub const RECORDING_AUDIO_MAX_BYTES: usize = 50 * 1024 * 1024;
+
+/// Validate a caller-supplied audio extension hint against
+/// [`AUDIO_EXT_ALLOWLIST`] and, if valid, return the fixed in-container path
+/// the upload should be written to.
+///
+/// The hint travels as a query parameter (`?audio_ext=wav`), never as a path
+/// or filename built from caller input — this function is the only place
+/// that turns it into one, and it only ever appends one of the fixed
+/// allowlisted suffixes to [`RECORDING_AUDIO_PATH_BASE`].
+pub fn audio_upload_path(ext: &str) -> Result<String, String> {
+    let normalized = ext.to_ascii_lowercase();
+    if !AUDIO_EXT_ALLOWLIST.contains(&normalized.as_str()) {
+        return Err(format!(
+            "unsupported audio_ext {ext:?}; allowed: {}",
+            AUDIO_EXT_ALLOWLIST.join(", ")
+        ));
+    }
+    Ok(format!("{RECORDING_AUDIO_PATH_BASE}.{normalized}"))
+}
+
+/// Build the argv that muxes a just-recorded screen capture with an uploaded
+/// narration track into one mp4.
+///
+/// `-c:v copy` re-packages the video stream without touching it — re-encoding
+/// a screen capture a second time would cost CPU and quality for no reason,
+/// since the capture is already a finished mp4. Only audio is encoded, to a
+/// codec (`aac`) mp4 can actually contain, since the incoming track may be
+/// wav/ogg/webm/etc. `-shortest` stops at whichever stream ends first: the
+/// desktop's mic capture and the sandbox's screen capture start and stop as
+/// two independent processes on two machines, so their durations are never
+/// guaranteed to match exactly, and padding one to fit the other is not worth
+/// the complexity for a v1 voiceover feature. `-y` overwrites any stale
+/// merged file from a previous stop on the same sandbox.
+pub fn recording_mux_argv<'a>(video_path: &'a str, audio_path: &'a str) -> Vec<&'a str> {
+    vec![
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path,
+        "-i",
+        audio_path,
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-shortest",
+        RECORDING_MERGED_PATH,
+    ]
+}
+
 /// May `caller` act on a sandbox as its owner or manager?
 ///
 /// Pure decision, factored out of `require_owner_or_manager` (main.rs) so it
@@ -1564,5 +1637,72 @@ mod tests {
         assert!(start.contains(RECORDING_PATH));
         assert!(is_running.contains("buzz-teach-recording.mp4"));
         assert!(stop.contains("buzz-teach-recording.mp4"));
+    }
+
+    #[test]
+    fn audio_upload_path_accepts_every_allowlisted_extension() {
+        for ext in AUDIO_EXT_ALLOWLIST {
+            let path = audio_upload_path(ext).unwrap();
+            assert_eq!(path, format!("{RECORDING_AUDIO_PATH_BASE}.{ext}"));
+        }
+    }
+
+    #[test]
+    fn audio_upload_path_is_case_insensitive() {
+        assert_eq!(
+            audio_upload_path("WAV").unwrap(),
+            format!("{RECORDING_AUDIO_PATH_BASE}.wav")
+        );
+    }
+
+    #[test]
+    fn audio_upload_path_rejects_unlisted_extensions() {
+        // Includes an attempt to smuggle a path traversal or shell-meaningful
+        // string through the extension hint itself — it must be refused the
+        // same as any other unrecognized value, never appended to the path.
+        for bad in ["exe", "sh", "../../etc/passwd", "wav; rm -rf /", ""] {
+            let err = audio_upload_path(bad).unwrap_err();
+            assert!(
+                err.contains("wav"),
+                "error should list allowed extensions: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn recording_mux_argv_copies_video_and_encodes_audio_only() {
+        let argv = recording_mux_argv(RECORDING_PATH, "/tmp/buzz-teach-audio.wav");
+        assert_eq!(argv[0], "ffmpeg");
+        assert!(argv.contains(&"-i"));
+        assert!(argv.contains(&RECORDING_PATH));
+        assert!(argv.contains(&"/tmp/buzz-teach-audio.wav"));
+        // Video is copied, never re-encoded.
+        let cv_pos = argv.iter().position(|a| *a == "-c:v").expect("has -c:v");
+        assert_eq!(argv[cv_pos + 1], "copy");
+        // Audio is encoded to a codec mp4 can contain, regardless of source format.
+        let ca_pos = argv.iter().position(|a| *a == "-c:a").expect("has -c:a");
+        assert_eq!(argv[ca_pos + 1], "aac");
+        assert!(argv.contains(&"-shortest"));
+        assert!(argv.contains(&RECORDING_MERGED_PATH));
+    }
+
+    #[test]
+    fn recording_mux_argv_places_video_input_before_audio_input() {
+        // `-shortest` and stream mapping both assume input order; getting it
+        // backwards wouldn't error, it would silently swap which track drives
+        // the "-c:v copy" vs "-c:a aac" treatment... except ffmpeg doesn't
+        // care about semantic order, it maps by stream type. This test pins
+        // the argv shape so a future edit can't accidentally drop or
+        // duplicate an -i flag.
+        let argv = recording_mux_argv("/video.mp4", "/audio.wav");
+        let positions: Vec<usize> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| **a == "-i")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(positions.len(), 2, "exactly two -i flags");
+        assert_eq!(argv[positions[0] + 1], "/video.mp4");
+        assert_eq!(argv[positions[1] + 1], "/audio.wav");
     }
 }
