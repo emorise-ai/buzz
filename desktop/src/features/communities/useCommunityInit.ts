@@ -31,6 +31,7 @@ import {
 import { resetAgentWorkingSignal } from "@/features/agents/agentWorkingSignal";
 import { resetAgentObserverStore } from "@/features/agents/observerRelayStore";
 import { resetAgentSandboxStore } from "@/features/agents/sandbox/agentSandboxStore";
+import { closeComputerPanel } from "@/features/agents/sandbox/computerPanelStore";
 import { resetAvatarPresentations } from "@/features/profile/avatarPresentationStore";
 import { resetAvatarProfileSync } from "@/features/profile/avatarProfileSync";
 import { resetSidebarRelayConnectionCardState } from "@/features/sidebar/ui/useSidebarRelayConnectionCard";
@@ -61,6 +62,7 @@ async function resetCommunityState({
   clearAllDrafts();
   resetAgentObserverStore();
   resetAgentSandboxStore();
+  closeComputerPanel();
   resetActiveAgentTurnsStore();
   resetAgentWorkingSignal();
   if (isTauri() && isMacPlatform()) {

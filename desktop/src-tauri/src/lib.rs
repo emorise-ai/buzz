@@ -585,6 +585,7 @@ pub fn run() {
             sandbox_viewer::sandbox_launch_app,
             sandbox_viewer::sandbox_list_windows,
             sandbox_viewer::sandbox_window_action,
+            sandbox_viewer::open_computer_window,
             take_pending_community_deep_link,
             acknowledge_pending_community_deep_link,
             take_pending_navigation_deep_link,

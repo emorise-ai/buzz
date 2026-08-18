@@ -26,6 +26,12 @@ import { buildVideoReviewPresentationByMessageId } from "@/features/messages/lib
 import { useComposerHeightPadding } from "@/features/messages/ui/useComposerHeightPadding";
 import { UserProfilePanel } from "@/features/profile/ui/UserProfilePanel";
 import { AgentSessionThreadPanel } from "@/features/channels/ui/AgentSessionThreadPanel";
+import { ComputerPreviewPanel } from "@/features/agents/sandbox/ComputerPreviewPanel";
+import {
+  closeComputerPanel,
+  useComputerPanel,
+} from "@/features/agents/sandbox/computerPanelStore";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 import { ChannelManagementAuxiliaryPanel } from "@/features/channels/ui/ChannelManagementAuxiliaryPanel";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
 import { ThreadViewModeToggle } from "@/features/channels/ui/ThreadViewModeToggle";
@@ -478,13 +484,38 @@ export const ChannelPane = React.memo(function ChannelPane({
       }),
     [agentSessionAgents, openAgentSessionPubkey, profilePanelPubkey, profiles],
   );
+  // The Computer button in the channel header opens this DM's counterpart
+  // in the sidebar preview panel — but only while that counterpart is still
+  // the active DM (switching channels while the panel is open should not
+  // leave a stale agent's computer showing, so this only reads the store's
+  // owner when it matches the current 1:1 DM's other participant).
+  const computerPanel = useComputerPanel();
+  const activeDmCounterpartPubkey = React.useMemo(() => {
+    if (activeChannel?.channelType !== "dm") return null;
+    const normalizedCurrentPubkey = currentPubkey
+      ? normalizePubkey(currentPubkey)
+      : null;
+    const others = activeChannel.participantPubkeys.filter(
+      (pubkey) => normalizePubkey(pubkey) !== normalizedCurrentPubkey,
+    );
+    return others.length === 1 ? others[0] : null;
+  }, [activeChannel, currentPubkey]);
+  const computerPanelOwnerPubkey =
+    computerPanel.open &&
+    computerPanel.ownerPubkey &&
+    activeDmCounterpartPubkey &&
+    normalizePubkey(computerPanel.ownerPubkey) ===
+      normalizePubkey(activeDmCounterpartPubkey)
+      ? computerPanel.ownerPubkey
+      : null;
   const hasSplitAuxiliaryPane =
     useSplitAuxiliaryPane &&
     (channelManagementOpen ||
       Boolean(threadHeadMessage) ||
       shouldShowThreadSkeleton ||
       Boolean(activeChannel && selectedAgent) ||
-      Boolean(profilePanelPubkey));
+      Boolean(profilePanelPubkey) ||
+      Boolean(computerPanelOwnerPubkey));
   const wrapAux = (
     panel: React.ReactNode,
     testId: string,
@@ -931,6 +962,22 @@ export const ChannelPane = React.memo(function ChannelPane({
               />
             );
             return wrapAux(panel, "user-profile-panel");
+          })()
+        ) : computerPanelOwnerPubkey ? (
+          (() => {
+            const panel = (
+              <ComputerPreviewPanel
+                isSinglePanelView={
+                  useSplitAuxiliaryPane ? false : isSinglePanelView
+                }
+                layout={useSplitAuxiliaryPane ? "split" : "standalone"}
+                onClose={closeComputerPanel}
+                ownerPubkey={computerPanelOwnerPubkey}
+                transparentChrome={useSplitAuxiliaryPane}
+                widthPx={threadPanelWidthPx}
+              />
+            );
+            return wrapAux(panel, "computer-preview-panel");
           })()
         ) : null}
       </AnimatePresence>

@@ -107,6 +107,22 @@ export function getSandboxForOwner(
   return sandboxByOwner.get(agentPubkey.toLowerCase()) ?? EMPTY;
 }
 
+/**
+ * Find a live sandbox by its own id, plus its owner's pubkey. Used by the
+ * pop-out window route, which is opened with only a sandbox id (the window
+ * label) and needs the owner's display name/profile too. A linear scan is
+ * fine: an agent has at most one sandbox today, so this map is tiny.
+ */
+export function getSandboxById(
+  sandboxId: string | null,
+): { sandbox: AgentSandbox; ownerPubkey: string } | null {
+  if (!sandboxId) return null;
+  for (const [ownerPubkey, sandbox] of sandboxByOwner) {
+    if (sandbox.id === sandboxId) return { sandbox, ownerPubkey };
+  }
+  return null;
+}
+
 /** Tear down on community switch. Wired into `resetCommunityState()`. */
 export function resetAgentSandboxStore() {
   generation += 1;

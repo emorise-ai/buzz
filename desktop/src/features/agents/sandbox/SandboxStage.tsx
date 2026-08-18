@@ -1,0 +1,211 @@
+import * as React from "react";
+import { Monitor, X } from "lucide-react";
+import { toast } from "sonner";
+
+import { SandboxDock } from "./SandboxDock";
+import { SandboxFilesView } from "./SandboxFilesView";
+import { type LaunchableApp, launchSandboxApp } from "./sandboxLaunch";
+import { actOnSandboxWindow, type SandboxWindow } from "./sandboxWindows";
+import { useSandboxWindows } from "./useSandboxWindows";
+import { useContainedAspectBox } from "./useContainedAspectBox";
+
+/** The sandbox screen is a fixed 1920x1080 remote desktop. */
+const SCREEN_ASPECT_RATIO = 16 / 9;
+
+export type SandboxStageHandle = {
+  /** Open the "Transfer files" overlay — driven by a host surface's own
+   *  header button, since the header lives outside the stage. */
+  openTransfer: () => void;
+};
+
+/**
+ * The live view of an agent's computer: one screen (iframe), the dock
+ * (Browser/Files/Terminal launchers + open-window taskbar), the
+ * control-toggle overlay, and the "Transfer files" overlay, aspect-fit to
+ * whatever container it's placed in.
+ *
+ * Extracted verbatim from `SandboxViewerDialog` (no behavior change) so the
+ * fullscreen dialog, the sidebar preview panel, and the pop-out native
+ * window all render the exact same live view rather than three copies
+ * drifting apart. Control state (`userInControl`) and the transfer overlay
+ * are local to the stage, same as before extraction — each mounted stage
+ * (dialog, sidebar, pop-out) gets its own independent control state, which
+ * is correct: taking over control in the sidebar preview shouldn't also
+ * flip the pop-out window's overlay.
+ */
+export const SandboxStage = React.forwardRef<
+  SandboxStageHandle,
+  {
+    viewerUrl: string;
+    sandboxId: string;
+    sandboxName: string | null;
+    agentDisplayName: string | null;
+    remaining: string | null;
+    expired: boolean;
+    /** Whether this surface is currently visible/mounted-live — gates the
+     *  open-windows poll. Defaults true. */
+    active?: boolean;
+    userInControl: boolean;
+    onUserInControlChange: (userInControl: boolean) => void;
+  }
+>(function SandboxStage(
+  {
+    viewerUrl,
+    sandboxId,
+    agentDisplayName,
+    expired,
+    active = true,
+    userInControl,
+    onUserInControlChange,
+  },
+  ref,
+) {
+  const [launching, setLaunching] = React.useState<LaunchableApp | null>(null);
+  const [transferOpen, setTransferOpen] = React.useState(false);
+  // State-backed callback ref: the stage element mounts only when the host
+  // surface appears, so the measuring hook must re-run when it appears.
+  const [stageContainer, setStageContainer] =
+    React.useState<HTMLDivElement | null>(null);
+  const stageBox = useContainedAspectBox(stageContainer, SCREEN_ASPECT_RATIO);
+
+  React.useImperativeHandle(
+    ref,
+    () => ({
+      openTransfer: () => setTransferOpen(true),
+    }),
+    [],
+  );
+
+  const { windows, refresh: refreshWindows } = useSandboxWindows(
+    sandboxId,
+    active && !expired,
+  );
+
+  async function handleWindowClick(w: SandboxWindow) {
+    // Using the taskbar is using the computer, same as launching an app.
+    onUserInControlChange(true);
+    try {
+      await actOnSandboxWindow(
+        sandboxId,
+        w.id,
+        w.active ? "minimize" : "activate",
+      );
+    } catch {
+      // The window may have closed between poll and click — the refresh
+      // below drops it from the taskbar; nothing to tell the user.
+    }
+    refreshWindows();
+  }
+
+  async function handleLaunch(app: LaunchableApp) {
+    if (launching) return;
+    setLaunching(app);
+    try {
+      await launchSandboxApp(sandboxId, app);
+      // A launch is a request to use the window right away.
+      onUserInControlChange(true);
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : `Could not open ${app}.`,
+      );
+    } finally {
+      setLaunching(null);
+    }
+  }
+
+  const title = agentDisplayName
+    ? `${agentDisplayName}'s computer`
+    : "Agent's computer";
+
+  return (
+    <div
+      ref={setStageContainer}
+      className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-background p-3"
+    >
+      {expired ? (
+        <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
+          <Monitor className="h-8 w-8 text-muted-foreground" />
+          <p className="text-sm font-medium text-foreground">
+            This computer has been shut down
+          </p>
+          <p className="max-w-sm text-2xs text-muted-foreground">
+            The sandbox reached its expiry and was destroyed. Its screen is no
+            longer available.
+          </p>
+        </div>
+      ) : (
+        // The stage is a strict 16:9 box — the remote screen is 1920x1080 —
+        // measured to fit the available area so the iframe maps edge-to-edge
+        // with no visible dead space inside it. Any leftover margin outside
+        // the box is the app's surface background, not black. One screen,
+        // always visible: launching an app opens a window right there in the
+        // stream, not a separate flat panel.
+        <div
+          className="relative overflow-hidden rounded-lg bg-black shadow-sm"
+          style={
+            stageBox
+              ? { width: stageBox.width, height: stageBox.height }
+              : { width: "100%", height: "100%", visibility: "hidden" }
+          }
+        >
+          <iframe
+            key={viewerUrl}
+            src={viewerUrl}
+            title={title}
+            className="h-full w-full border-0"
+            sandbox="allow-scripts allow-same-origin allow-forms"
+            allow="clipboard-read; clipboard-write"
+          />
+          {!userInControl ? (
+            <button
+              type="button"
+              data-testid="sandbox-control-overlay"
+              onClick={() => onUserInControlChange(true)}
+              aria-label="Take over control"
+              className="absolute inset-0 cursor-pointer bg-transparent"
+            />
+          ) : null}
+
+          {/* The dock overlays the bottom edge of the screen itself, so it
+              reads as the computer's own dock sitting on the desktop — not a
+              strip of external controls floating under a VNC window. It
+              renders after the take-over overlay, so it stays clickable in
+              both control states. */}
+          <div className="pointer-events-none absolute inset-x-0 bottom-2 z-10 flex justify-center [&>*]:pointer-events-auto">
+            <SandboxDock
+              launching={launching}
+              onLaunch={handleLaunch}
+              windows={windows}
+              onWindowClick={handleWindowClick}
+            />
+          </div>
+
+          {/* "Transfer files" overlay: moving files between this Mac and the
+              sandbox is the one thing the in-desktop file manager can't do,
+              so it lives here instead of on the dock. */}
+          {transferOpen ? (
+            <div className="absolute inset-0 flex flex-col bg-background">
+              <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
+                <span className="text-sm font-medium text-foreground">
+                  Transfer files
+                </span>
+                <button
+                  type="button"
+                  data-testid="sandbox-transfer-files-close"
+                  aria-label="Close transfer files"
+                  onClick={() => setTransferOpen(false)}
+                  className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <div className="min-h-0 flex-1">
+                <SandboxFilesView sandboxId={sandboxId} />
+              </div>
+            </div>
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+});

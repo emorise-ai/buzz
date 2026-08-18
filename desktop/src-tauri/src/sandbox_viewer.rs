@@ -13,7 +13,7 @@
 
 use base64::Engine;
 use reqwest::Method;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::app_state::AppState;
 use crate::relay::build_nip98_auth_header;
@@ -709,9 +709,60 @@ pub async fn sandbox_window_action(
     Ok(())
 }
 
+// ── Pop-out native window ───────────────────────────────────────────────────
+//
+// Watching a sandbox's live screen from the sidebar or the agent-profile
+// dialog is fine while chatting in the same window, but a second monitor
+// needs a real OS window to drag over there. Mirrors `open_huddle_window`:
+// dedup by label so re-clicking pop-out while the window is already open
+// just brings it forward instead of building a duplicate.
+
+fn computer_window_label(sandbox_id: &str) -> String {
+    format!("computer-{sandbox_id}")
+}
+
+/// Open (or focus, if already open) a native window showing `sandbox_id`'s
+/// live desktop. The window loads the ordinary app bundle and lands on the
+/// `#/computer/<sandboxId>` route, which resolves the sandbox from the
+/// shared frontend store and mints its own viewer token — this command only
+/// owns window lifecycle, not the sandbox lookup or the viewer URL.
+#[tauri::command]
+pub async fn open_computer_window(
+    sandbox_id: String,
+    title: String,
+    app: AppHandle,
+) -> CmdResult<()> {
+    let id = validate_sandbox_id(&sandbox_id)?;
+    let label = computer_window_label(id);
+
+    if let Some(window) = app.get_webview_window(&label) {
+        window.show().map_err(|error| error.to_string())?;
+        window.set_focus().map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    let window_title = if title.trim().is_empty() {
+        "Agent's computer".to_string()
+    } else {
+        title
+    };
+
+    WebviewWindowBuilder::new(
+        &app,
+        label,
+        WebviewUrl::App(format!("index.html#/computer/{id}").into()),
+    )
+    .title(window_title)
+    .inner_size(1280.0, 820.0)
+    .min_inner_size(800.0, 560.0)
+    .build()
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::to_base64url;
+    use super::{computer_window_label, to_base64url, validate_sandbox_id};
     use base64::Engine;
 
     #[test]
@@ -726,5 +777,28 @@ mod tests {
             .decode(&url)
             .unwrap();
         assert_eq!(back, raw);
+    }
+
+    #[test]
+    fn computer_window_label_is_stable_and_unique_per_sandbox() {
+        // `open_computer_window` dedups via `app.get_webview_window(&label)`,
+        // so two calls for the same sandbox id must produce the exact same
+        // label (or a second click would build a duplicate window instead of
+        // focusing the existing one), while two different sandboxes must not
+        // collide.
+        let id = validate_sandbox_id("buzz-sandbox-fq5ijxh7lt").unwrap();
+        assert_eq!(
+            computer_window_label(id),
+            computer_window_label(id),
+            "label must be deterministic for the same sandbox id"
+        );
+        assert_eq!(
+            computer_window_label(id),
+            "computer-buzz-sandbox-fq5ijxh7lt"
+        );
+        assert_ne!(
+            computer_window_label(id),
+            computer_window_label("other-sandbox-id")
+        );
     }
 }
