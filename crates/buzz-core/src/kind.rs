@@ -604,6 +604,12 @@ pub const KIND_HUDDLE_GUIDELINES: u32 = 48106;
 pub const KIND_SANDBOX_CREATED: u32 = 48200;
 /// A sandbox was destroyed, whether by request or by its lifetime expiring.
 pub const KIND_SANDBOX_DESTROYED: u32 = 48201;
+/// A skill/routine an owner taught an agent by demonstrating on the sandbox
+/// computer ("Teach a Task"). Tags carry `["d", skill_id]`, `["name",
+/// human_name]`, `["p", owner]`, `["agent", agent_pubkey]`, and `["recording",
+/// media_url]` pointing at the demo video. Content is the JSON skill body
+/// (name, summary, ordered steps, inputs).
+pub const KIND_AGENT_SKILL: u32 = 48202;
 
 // Media (49000–49999)
 /// Internal kind for media upload audit entries. Not a relay event kind.
@@ -756,6 +762,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_AUDIT_ENTRY,
     KIND_SANDBOX_CREATED,
     KIND_SANDBOX_DESTROYED,
+    KIND_AGENT_SKILL,
     KIND_HUDDLE_STARTED,
     KIND_HUDDLE_PARTICIPANT_JOINED,
     KIND_HUDDLE_PARTICIPANT_LEFT,
@@ -889,6 +896,7 @@ const _: () = assert!(
 const _: () = assert!(KIND_AUTH <= u16::MAX as u32);
 const _: () = assert!(KIND_CANVAS <= u16::MAX as u32);
 const _: () = assert!(KIND_HUDDLE_GUIDELINES <= u16::MAX as u32);
+const _: () = assert!(KIND_AGENT_SKILL <= u16::MAX as u32);
 const _: () = assert!(EPHEMERAL_KIND_MIN < EPHEMERAL_KIND_MAX);
 // Compile-time: KIND_AGENT_TURN_METRIC is a regular stored kind (not ephemeral, not replaceable).
 const _: () = assert!(!is_ephemeral(KIND_AGENT_TURN_METRIC));
