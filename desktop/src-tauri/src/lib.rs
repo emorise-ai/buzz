@@ -577,6 +577,7 @@ pub fn run() {
             sandbox_viewer::mint_sandbox_viewer_url,
             sandbox_viewer::create_agent_sandbox,
             sandbox_viewer::destroy_agent_sandbox,
+            sandbox_viewer::sandbox_heartbeat,
             sandbox_viewer::sandbox_fs_list,
             sandbox_viewer::sandbox_fs_download,
             sandbox_viewer::sandbox_fs_upload,

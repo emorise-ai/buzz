@@ -76,6 +76,13 @@ struct AppState {
     /// the relay — the only record that survives a broker restart after an
     /// extend). See `seed_expiries`.
     expiry: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    /// Expiry last announced to the relay as a kind:48200, per container id —
+    /// the keepalive middleware's republish throttle. Separate from `expiry`
+    /// (the reaper's live truth) because the two update on different
+    /// schedules: `expiry` moves on every authenticated call, this only when
+    /// that movement crosses `KEEPALIVE_REPUBLISH_THRESHOLD_SECONDS` since
+    /// the last announcement. See `bump_keepalive`.
+    last_published_expiry: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
 }
 
 impl AppState {
@@ -89,10 +96,23 @@ impl AppState {
         if let Ok(mut map) = self.expiry.lock() {
             map.remove(id);
         }
+        if let Ok(mut map) = self.last_published_expiry.lock() {
+            map.remove(id);
+        }
     }
 
     fn expiry_of(&self, id: &str) -> Option<i64> {
         self.expiry.lock().ok()?.get(id).copied()
+    }
+
+    fn last_published_expiry_of(&self, id: &str) -> Option<i64> {
+        self.last_published_expiry.lock().ok()?.get(id).copied()
+    }
+
+    fn set_last_published_expiry(&self, id: &str, expires_at: i64) {
+        if let Ok(mut map) = self.last_published_expiry.lock() {
+            map.insert(id.to_string(), expires_at);
+        }
     }
 }
 
@@ -207,6 +227,7 @@ async fn main() {
         host_cpus,
         slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         expiry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        last_published_expiry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     seed_expiries(&state).await;
@@ -235,9 +256,13 @@ async fn main() {
 /// regressions (a route that 404s before ever reaching its handler) are
 /// invisible to a handler-level unit test.
 fn build_router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/sandboxes", get(list_sandboxes).post(create_sandbox))
+    // Every route scoped to one sandbox (`/sandboxes/{id}/...`) sits behind
+    // the keepalive middleware: any authenticated 2xx against one of these
+    // is real use of that sandbox, and bumps its expiry. `/sandboxes` itself
+    // (bare list/create, no `{id}`) and `/health` are not nested here —
+    // there is no sandbox yet to bump on a create, and list/health are not
+    // "using" any particular one.
+    let sandbox_scoped = Router::new()
         .route("/sandboxes/{id}", get(get_sandbox).delete(delete_sandbox))
         .route("/sandboxes/{id}/stop", post(delete_sandbox))
         .route("/sandboxes/{id}/extend", post(extend_sandbox))
@@ -282,6 +307,20 @@ fn build_router(state: AppState) -> Router {
         .route("/sandboxes/{id}/exec", post(sandbox_exec))
         .route("/sandboxes/{id}/screenshot", get(sandbox_screenshot))
         .route("/sandboxes/{id}/input", post(sandbox_input))
+        // Activity signal only — the desktop viewer pings this while a
+        // sandbox's screen is mounted so passive watching (no exec/input of
+        // its own) still counts as use. The handler itself does nothing;
+        // the middleware below is what bumps expiry on its 2xx.
+        .route("/sandboxes/{id}/heartbeat", post(heartbeat))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            keepalive_middleware,
+        ));
+
+    Router::new()
+        .route("/health", get(health))
+        .route("/sandboxes", get(list_sandboxes).post(create_sandbox))
+        .merge(sandbox_scoped)
         .with_state(state)
 }
 
@@ -356,7 +395,9 @@ async fn create_sandbox(
 
     // Concurrency cap: the host runs production workloads alongside sandboxes,
     // so the broker refuses rather than letting the box be oversubscribed.
-    match state.docker.list_managed(sandbox::MANAGED_LABEL).await {
+    // Fetched once and reused below for the per-owner dedupe check — both
+    // need the same "what's currently running" list.
+    let existing = match state.docker.list_managed(sandbox::MANAGED_LABEL).await {
         Ok(existing) => {
             let running = existing
                 .iter()
@@ -374,8 +415,31 @@ async fn create_sandbox(
                 )
                     .into_response();
             }
+            existing
         }
         Err(e) => return internal(e),
+    };
+
+    // Per-owner dedupe: an owner that already has a live sandbox gets that
+    // one back instead of a second box, making "create" idempotent per
+    // owner and giving a restarting agent a stable id to reconnect to. The
+    // decision itself is pure (`existing_sandbox_for_owner`); only the
+    // Docker list-entry -> decision-input projection happens here.
+    let projections: Vec<sandbox::ExistingSandbox> = existing
+        .iter()
+        .map(|c| sandbox::ExistingSandbox {
+            owner: c
+                .get("Labels")
+                .and_then(|l| l.get(sandbox::LABEL_OWNER))
+                .and_then(|v| v.as_str()),
+            running: c.get("State").and_then(|s| s.as_str()) == Some("running"),
+        })
+        .collect();
+    if let Some(idx) = sandbox::existing_sandbox_for_owner(req.owner.as_deref(), &projections) {
+        return match sandbox_summary_response(&state, &existing[idx]).await {
+            Ok(response) => response,
+            Err(e) => internal(e),
+        };
     }
 
     let limits = Limits::resolve(&req);
@@ -506,6 +570,88 @@ async fn create_sandbox(
         })),
     )
         .into_response()
+}
+
+/// Build a create-shaped response (`200`, not `201` — nothing was created)
+/// for a sandbox the per-owner dedupe matched, from a fresh inspect of the
+/// list entry `create_sandbox` already found.
+///
+/// Mirrors the fields `create_sandbox` returns, read the same way
+/// `extend_sandbox` reads them back from an inspect (cpus/memory from
+/// `HostConfig`, not the list entry, which carries neither) — with one
+/// deliberate gap: `tools_token` is the create-time bearer secret, minted
+/// once and never stored, so a reused sandbox has none to return. A caller
+/// that needs the tools port on a reused sandbox has no way to get a fresh
+/// token short of stopping and recreating it; that is a real limitation of
+/// reuse, not an oversight.
+async fn sandbox_summary_response(
+    state: &AppState,
+    list_entry: &serde_json::Value,
+) -> Result<axum::response::Response, String> {
+    let id = list_entry
+        .get("Id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "matched sandbox has no id".to_string())?;
+    let inspect = state.docker.inspect_container(id).await?;
+    let full_id = inspect
+        .get("Id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(id)
+        .to_string();
+    let name = inspect
+        .get("Name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim_start_matches('/')
+        .to_string();
+    let image = inspect
+        .pointer("/Config/Image")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let cpus = inspect
+        .pointer("/HostConfig/NanoCpus")
+        .and_then(|v| v.as_i64())
+        .map(|n| n as f64 / 1e9)
+        .unwrap_or(0.0);
+    let memory_mb = inspect
+        .pointer("/HostConfig/Memory")
+        .and_then(|v| v.as_i64())
+        .map(|b| (b / (1024 * 1024)) as u64)
+        .unwrap_or(0);
+    let cpuset = inspect
+        .pointer("/HostConfig/CpusetCpus")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let expires_at = state.expiry_of(&full_id).or_else(|| {
+        inspect_label(&inspect, sandbox::LABEL_EXPIRES).and_then(|s| s.parse::<i64>().ok())
+    });
+    let tools_url =
+        sandbox_ip(&inspect, &state.network).map(|ip| format!("http://{ip}:{TOOLS_PORT}/mcp"));
+
+    info!(sandbox = %full_id, "create request matched an existing sandbox for its owner");
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": full_id,
+            "name": name,
+            "image": image,
+            "cpus": cpus,
+            "memory_mb": memory_mb,
+            "cpuset": cpuset,
+            "expires_at": expires_at,
+            "tools_url": tools_url,
+            // No secret to hand back — see this function's doc comment.
+            "tools_token": serde_json::Value::Null,
+            // Signals the caller got back an existing sandbox rather than a
+            // freshly created one, so it does not treat the missing
+            // `tools_token`/`ttl_seconds` as broker error.
+            "reused": true,
+        })),
+    )
+        .into_response())
 }
 
 /// Reconstruct the broker's public origin from a reverse proxy's forwarded
@@ -996,12 +1142,7 @@ async fn extend_sandbox(
     // The lifetime ceiling is measured from the container's creation, which
     // Docker records authoritatively — not from the label, which a future
     // change might alter.
-    let created_at = inspect
-        .get("Created")
-        .and_then(|v| v.as_str())
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|t| t.timestamp());
-    let Some(created_at) = created_at else {
+    let Some(created_at) = created_at_of(&inspect) else {
         return internal("container has no readable creation time");
     };
 
@@ -1016,54 +1157,14 @@ async fn extend_sandbox(
         .to_string();
     state.set_expiry(&full_id, expires_at);
 
-    // Re-announce with the new expiry. The desktop reconstructs from the
-    // latest 48200, so a fresh announcement moves its countdown; it also
-    // becomes the crash-recovery record `seed_expiries` reads after a broker
-    // restart.
-    if let Some(publisher) = state.publisher.as_ref() {
-        let name = inspect
-            .get("Name")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .trim_start_matches('/')
-            .to_string();
-        let image = inspect
-            .pointer("/Config/Image")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let cpus = inspect
-            .pointer("/HostConfig/NanoCpus")
-            .and_then(|v| v.as_i64())
-            .map(|n| n as f64 / 1e9)
-            .unwrap_or(0.0);
-        let memory_mb = inspect
-            .pointer("/HostConfig/Memory")
-            .and_then(|v| v.as_i64())
-            .map(|b| (b / (1024 * 1024)) as u64)
-            .unwrap_or(0);
-        let viewer = state.viewer_base.as_ref().map(|base| {
-            format!(
-                "{base}/sandboxes/{}/desktop",
-                &full_id[..12.min(full_id.len())]
-            )
-        });
-        publisher
-            .sandbox_created(events::SandboxFacts {
-                // The full id, so the re-announcement lands on the same `d`
-                // tag as the original and replaces it in the desktop's view
-                // rather than appearing as a second sandbox.
-                sandbox_id: &full_id,
-                name: &name,
-                image: &image,
-                owner: owner.as_deref(),
-                cpus,
-                memory_mb,
-                expires_at,
-                viewer_url: viewer.as_deref(),
-            })
-            .await;
-    }
+    // Re-announce with the new expiry, unconditionally — an explicit extend
+    // is a deliberate call, not high-frequency traffic, so it always
+    // publishes (unlike the keepalive middleware's throttled bump). The
+    // desktop reconstructs from the latest 48200, so a fresh announcement
+    // moves its countdown; it also becomes the crash-recovery record
+    // `seed_expiries` reads after a broker restart.
+    republish_expiry(&state, &inspect, &full_id, owner.as_deref(), expires_at).await;
+    state.set_last_published_expiry(&full_id, expires_at);
 
     info!(sandbox = %id, expires_at, "sandbox extended");
     (
@@ -1071,6 +1172,69 @@ async fn extend_sandbox(
         Json(serde_json::json!({ "id": id, "expires_at": expires_at })),
     )
         .into_response()
+}
+
+/// Re-announce a sandbox's facts to the relay with a new `expires_at`, as a
+/// fresh kind:48200 landing on the same `d` tag (the container's full id) so
+/// it replaces the previous announcement in the desktop's view instead of
+/// appearing as a second sandbox.
+///
+/// Shared by `extend_sandbox` (always calls this) and the keepalive
+/// middleware (calls it only past the republish throttle) — both need the
+/// same inspect -> `SandboxFacts` projection, and factoring it out is what
+/// keeps that projection from drifting between the two call sites the way
+/// the id-resolve logic would if duplicated. Best-effort: a sandbox that
+/// runs unannounced is a display gap, not a failure, so this never returns
+/// an error for the caller to handle.
+async fn republish_expiry(
+    state: &AppState,
+    inspect: &serde_json::Value,
+    full_id: &str,
+    owner: Option<&str>,
+    expires_at: i64,
+) {
+    let Some(publisher) = state.publisher.as_ref() else {
+        return;
+    };
+    let name = inspect
+        .get("Name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim_start_matches('/')
+        .to_string();
+    let image = inspect
+        .pointer("/Config/Image")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let cpus = inspect
+        .pointer("/HostConfig/NanoCpus")
+        .and_then(|v| v.as_i64())
+        .map(|n| n as f64 / 1e9)
+        .unwrap_or(0.0);
+    let memory_mb = inspect
+        .pointer("/HostConfig/Memory")
+        .and_then(|v| v.as_i64())
+        .map(|b| (b / (1024 * 1024)) as u64)
+        .unwrap_or(0);
+    let viewer = state.viewer_base.as_ref().map(|base| {
+        format!(
+            "{base}/sandboxes/{}/desktop",
+            &full_id[..12.min(full_id.len())]
+        )
+    });
+    publisher
+        .sandbox_created(events::SandboxFacts {
+            sandbox_id: full_id,
+            name: &name,
+            image: &image,
+            owner,
+            cpus,
+            memory_mb,
+            expires_at,
+            viewer_url: viewer.as_deref(),
+        })
+        .await;
 }
 
 /// The Unix identity every file-API exec runs as: the unprivileged agent
@@ -1907,6 +2071,39 @@ async fn sandbox_input(
         .into_response()
 }
 
+/// `POST /sandboxes/{id}/heartbeat` — a pure activity signal, owner-or-manager
+/// gated like every other computer-use route. Does nothing itself; its only
+/// purpose is to give the desktop viewer a 2xx to send while a sandbox's
+/// screen is on-screen but otherwise idle (no exec/input of its own), so the
+/// keepalive middleware has something to bump expiry on for passive
+/// watching.
+async fn heartbeat(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if !is_safe_id(&id) {
+        return bad_request("malformed sandbox id");
+    }
+    let caller = match authorize(
+        &state,
+        &headers,
+        "POST",
+        &format!("/sandboxes/{id}/heartbeat"),
+        &body,
+    )
+    .await
+    {
+        Ok(pubkey) => pubkey,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_owner_or_manager(&state, &id, &caller).await {
+        return response;
+    }
+    (StatusCode::OK, ()).into_response()
+}
+
 /// List the open windows on the sandbox's desktop, for the dock's taskbar
 /// segment: the window manager's own EWMH client list (`_NET_CLIENT_LIST`,
 /// exactly what an in-desktop taskbar would show), each with its title and
@@ -2105,6 +2302,328 @@ fn inspect_label(inspect: &serde_json::Value, key: &str) -> Option<String> {
         .get(key)?
         .as_str()
         .map(str::to_string)
+}
+
+/// A container's creation time from an *inspect* payload, as Docker records
+/// it authoritatively — not from the expiry label, which a future change
+/// might alter. This is the reference point every lifetime ceiling
+/// (`extended_expiry`, `MAX_TTL_SECONDS`) measures from, so both the extend
+/// handler and the keepalive middleware read it the same way.
+fn created_at_of(inspect: &serde_json::Value) -> Option<i64> {
+    inspect
+        .get("Created")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.timestamp())
+}
+
+/// A resolved keepalive target: everything a bump needs about the sandbox a
+/// `{id}` path segment named, read from one inspect call.
+struct KeepaliveTarget {
+    full_id: String,
+    created_at: i64,
+    owner: Option<String>,
+    inspect: serde_json::Value,
+}
+
+/// Resolve a sandbox-scoped URL's `{id}` path segment — which may be a short
+/// prefix, same as every other sandbox route accepts — to the full container
+/// id, its creation time, and its owner: the facts a keepalive bump needs.
+///
+/// Shared by the keepalive middleware and available to any handler that
+/// needs the same resolve, so the prefix -> full-id mapping exists in
+/// exactly one place rather than risking drift between them (the same
+/// reasoning as `inspect_managed_sandbox`, which this mirrors but does not
+/// call directly — that helper builds an HTTP error response on failure,
+/// which the middleware has no use for; it just skips the bump). Returns
+/// `None` for anything that isn't a live, managed sandbox with a readable
+/// creation time — an id that fails to resolve is simply not bumped, the
+/// same as any other lookup miss.
+async fn resolve_keepalive_target(state: &AppState, id: &str) -> Option<KeepaliveTarget> {
+    if !is_safe_id(id) {
+        return None;
+    }
+    let inspect = state.docker.inspect_container(id).await.ok()?;
+    if !is_managed(&inspect) {
+        return None;
+    }
+    let full_id = inspect.get("Id").and_then(|v| v.as_str())?.to_string();
+    let created_at = created_at_of(&inspect)?;
+    let owner = inspect_label(&inspect, sandbox::LABEL_OWNER);
+    Some(KeepaliveTarget {
+        full_id,
+        created_at,
+        owner,
+        inspect,
+    })
+}
+
+/// The `{id}` segment of a `/sandboxes/{id}/...` request path, without
+/// pulling in axum's path-matching machinery — the middleware runs before
+/// routing extracts `Path<String>` for the eventual handler, so it reads the
+/// same segment straight from the URI it already has.
+fn sandbox_id_from_path(path: &str) -> Option<&str> {
+    path.strip_prefix("/sandboxes/")?
+        .split('/')
+        .next()
+        .filter(|s| !s.is_empty())
+}
+
+/// Activity keepalive: runs the handler, and only when it answers with a
+/// 2xx, bumps the sandbox's expiry.
+///
+/// Ordering is what makes this safe to trust: every sandbox-scoped route
+/// this wraps already runs `authorize` / `verify_surface_token` before doing
+/// anything else, and answers 401/403 on failure — so by the time this
+/// middleware sees a 2xx, authentication (and, for owner/manager routes,
+/// authorization) has already succeeded inside the handler. An unauthenticated
+/// prober never produces a 2xx, so it can never keep a box alive. This
+/// middleware does not re-check identity itself; it trusts the status code
+/// the handler already gated on.
+///
+/// The bump is `extended_expiry(now, created_at, KEEPALIVE_GRACE_SECONDS)` —
+/// the same clamp `extend_sandbox` uses, so continuous use can delay a
+/// sandbox's death but never lift the `created_at + MAX_TTL_SECONDS` ceiling.
+/// Only the in-memory `expiry` map is touched on every bump (cheap, and all
+/// the reaper reads); the kind:48200 re-announcement is throttled to once
+/// per `KEEPALIVE_REPUBLISH_THRESHOLD_SECONDS` of actual movement so normal
+/// traffic does not spam the relay.
+async fn keepalive_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let id = sandbox_id_from_path(request.uri().path()).map(str::to_string);
+    let response = next.run(request).await;
+
+    if !response.status().is_success() {
+        return response;
+    }
+    let Some(id) = id else {
+        return response;
+    };
+    let Some(target) = resolve_keepalive_target(&state, &id).await else {
+        return response;
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let expires_at =
+        sandbox::extended_expiry(now, target.created_at, sandbox::KEEPALIVE_GRACE_SECONDS);
+    state.set_expiry(&target.full_id, expires_at);
+
+    let last_published = state.last_published_expiry_of(&target.full_id);
+    let moved_enough = match last_published {
+        Some(last) => (expires_at - last).abs() >= sandbox::KEEPALIVE_REPUBLISH_THRESHOLD_SECONDS,
+        None => true,
+    };
+    if moved_enough {
+        republish_expiry(
+            &state,
+            &target.inspect,
+            &target.full_id,
+            target.owner.as_deref(),
+            expires_at,
+        )
+        .await;
+        state.set_last_published_expiry(&target.full_id, expires_at);
+    }
+
+    response
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::routing::{get, post};
+    use tower::ServiceExt;
+
+    #[test]
+    fn extracts_the_id_segment_from_a_sandbox_scoped_path() {
+        assert_eq!(sandbox_id_from_path("/sandboxes/abc123"), Some("abc123"));
+        assert_eq!(
+            sandbox_id_from_path("/sandboxes/abc123/exec"),
+            Some("abc123")
+        );
+        assert_eq!(
+            sandbox_id_from_path("/sandboxes/abc123/desktop/t/tok/view"),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn returns_none_for_paths_with_no_id_segment() {
+        assert_eq!(sandbox_id_from_path("/sandboxes"), None);
+        assert_eq!(sandbox_id_from_path("/sandboxes/"), None);
+        assert_eq!(sandbox_id_from_path("/health"), None);
+        assert_eq!(sandbox_id_from_path("/"), None);
+    }
+
+    /// A stub router with the real middleware layered over handlers whose
+    /// status is chosen by the test, isolating "does the middleware attempt
+    /// a bump" from "does a Docker inspect succeed" — the router tests below
+    /// use `test_state()`'s dead docker socket, so any attempted resolve
+    /// fails closed; what they can prove directly is whether the middleware
+    /// even reaches for the id after a given status.
+    fn stub_router(state: AppState) -> Router {
+        Router::new()
+            .route("/sandboxes/{id}/ok", get(|| async { StatusCode::OK }))
+            .route(
+                "/sandboxes/{id}/created",
+                post(|| async { StatusCode::CREATED }),
+            )
+            .route(
+                "/sandboxes/{id}/unauthorized",
+                get(|| async { StatusCode::UNAUTHORIZED }),
+            )
+            .route(
+                "/sandboxes/{id}/forbidden",
+                get(|| async { StatusCode::FORBIDDEN }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                keepalive_middleware,
+            ))
+            .with_state(state)
+    }
+
+    /// The response the caller sees must be exactly what the handler
+    /// returned, regardless of whether the middleware's own bump attempt
+    /// (which fails closed here — `test_state()` has no live Docker socket)
+    /// succeeds. The middleware must never fail the response or shadow the
+    /// handler's actual status.
+    #[tokio::test]
+    async fn a_2xx_response_passes_through_unchanged() {
+        let app = stub_router(router_tests::test_state());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/sandboxes/deadbeef/ok")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_201_response_passes_through_unchanged() {
+        let app = stub_router(router_tests::test_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/sandboxes/deadbeef/created")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// The critical safety property: a 401 (unauthenticated) must short
+    /// -circuit before any bump attempt and pass straight through — proven
+    /// here by never touching Docker (a bump attempt would hang/err against
+    /// `test_state()`'s dead socket, so a passing test with a correct status
+    /// confirms the `is_success()` gate ran first).
+    #[tokio::test]
+    async fn a_401_response_is_never_treated_as_a_keepalive_signal() {
+        let app = stub_router(router_tests::test_state());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/sandboxes/deadbeef/unauthorized")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_403_response_is_never_treated_as_a_keepalive_signal() {
+        let app = stub_router(router_tests::test_state());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/sandboxes/deadbeef/forbidden")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// `resolve_keepalive_target` returning `None` (no live Docker here, so
+    /// this is the "id doesn't resolve" path every real deployment also
+    /// hits for a stale/foreign id) must not turn a successful handler
+    /// response into an error — the bump is best-effort.
+    #[tokio::test]
+    async fn an_unresolvable_id_does_not_fail_the_response() {
+        let app = stub_router(router_tests::test_state());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/sandboxes/does-not-exist/ok")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Pins the same clamp `extend_sandbox` relies on, applied to the
+    /// keepalive grace window: a bump requested near the end of a sandbox's
+    /// life is capped at `created_at + MAX_TTL_SECONDS`, never past it —
+    /// continuous use can delay death but never grant immortality.
+    #[test]
+    fn a_keepalive_bump_near_the_cap_does_not_exceed_max_ttl() {
+        let created_at = 1_000_000;
+        let cap = created_at + sandbox::MAX_TTL_SECONDS as i64;
+        let now = cap - 60; // 1 minute from the hard ceiling
+        let bumped = sandbox::extended_expiry(now, created_at, sandbox::KEEPALIVE_GRACE_SECONDS);
+        assert_eq!(bumped, cap);
+    }
+
+    #[test]
+    fn a_keepalive_bump_well_before_the_cap_grants_the_full_grace_window() {
+        let created_at = 1_000_000;
+        let now = created_at + 100;
+        let bumped = sandbox::extended_expiry(now, created_at, sandbox::KEEPALIVE_GRACE_SECONDS);
+        assert_eq!(bumped, now + sandbox::KEEPALIVE_GRACE_SECONDS as i64);
+    }
+
+    /// The republish throttle's own decision, exercised directly: two bumps
+    /// whose expiry moves less than the threshold apart should not each
+    /// trigger a publish — only movement past
+    /// `KEEPALIVE_REPUBLISH_THRESHOLD_SECONDS` since the last announcement
+    /// should. This mirrors the `moved_enough` check inside
+    /// `keepalive_middleware` without needing a live publisher to observe
+    /// call counts through.
+    #[test]
+    fn republish_throttle_suppresses_small_movements_but_not_large_ones() {
+        let moved_enough = |last: i64, next: i64| {
+            (next - last).abs() >= sandbox::KEEPALIVE_REPUBLISH_THRESHOLD_SECONDS
+        };
+        let last_published = 1_000_000i64;
+        // Two rapid bumps within the threshold: the second must not publish.
+        assert!(!moved_enough(last_published, last_published + 5));
+        assert!(!moved_enough(
+            last_published,
+            last_published + sandbox::KEEPALIVE_REPUBLISH_THRESHOLD_SECONDS - 1
+        ));
+        // A bump that crosses the threshold must publish.
+        assert!(moved_enough(
+            last_published,
+            last_published + sandbox::KEEPALIVE_REPUBLISH_THRESHOLD_SECONDS
+        ));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_route_reaches_its_handler_and_fails_auth_without_a_signature() {
+        let app = build_router(router_tests::test_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/sandboxes/abc123def456/heartbeat")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unsigned request must reach heartbeat and be refused there \
+             (401), not 404 at the router layer"
+        );
+    }
 }
 
 /// Seed the live expiry map at startup.
@@ -2499,7 +3018,12 @@ mod router_tests {
     /// is never dialed (no test here reaches a handler that calls Docker) and
     /// no relay is configured, so `require_membership` stays irrelevant — the
     /// request never gets past token verification.
-    fn test_state() -> AppState {
+    ///
+    /// `pub(super)` so `keepalive_tests` (a sibling test module) can build
+    /// the same fixture rather than duplicating it — both need an `AppState`
+    /// with a dead Docker socket for the same reason: proving a request
+    /// short-circuits before ever reaching Docker.
+    pub(super) fn test_state() -> AppState {
         AppState {
             docker: docker::Docker::new("/nonexistent/docker.sock"),
             verifier: Arc::new(identity::Verifier::new(
@@ -2516,6 +3040,9 @@ mod router_tests {
             host_cpus: 1,
             slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             expiry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            last_published_expiry: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
         }
     }
 

@@ -36,6 +36,18 @@ pub const MAX_CONCURRENT: usize = 6;
 pub const DEFAULT_CPUS: f64 = 2.0;
 pub const DEFAULT_MEMORY_MB: u64 = 4096;
 pub const DEFAULT_TTL_SECONDS: u64 = 60 * 60;
+/// Grace window a keepalive bump buys, on every authenticated 2xx call
+/// against a sandbox's own routes. Equal to the self-service TTL
+/// (`DEFAULT_TTL_SECONDS`) — every real use resets the clock to a fresh
+/// full window, still clamped by [`extended_expiry`] so continuous use
+/// never makes a sandbox immortal past `created_at + MAX_TTL_SECONDS`.
+pub const KEEPALIVE_GRACE_SECONDS: u64 = 60 * 30;
+/// Minimum movement in expiry before the keepalive middleware republishes a
+/// fresh kind:48200. Bumping the in-memory expiry map on every call is
+/// cheap and is all the reaper needs; re-announcing to the relay on every
+/// call would spam it, so only a move past this threshold since the last
+/// publish triggers a fresh announcement.
+pub const KEEPALIVE_REPUBLISH_THRESHOLD_SECONDS: i64 = 60;
 /// Process cap. Build tooling is fork-heavy, so this is generous — it exists to
 /// stop a fork bomb taking the host down, not to constrain normal work.
 pub const PIDS_LIMIT: i64 = 2048;
@@ -692,6 +704,39 @@ pub fn validate_window_id(window: &str) -> Result<(), String> {
 /// open.
 pub fn is_owner_or_manager(caller: &str, owner: Option<&str>, manager: Option<&str>) -> bool {
     owner == Some(caller) || (manager.is_some() && manager == Some(caller))
+}
+
+/// One existing managed container's shape, as far as the create-dedupe
+/// decision needs to know it — a pure projection of a Docker list entry so
+/// the decision in [`existing_sandbox_for_owner`] can be exercised without a
+/// Docker socket.
+pub struct ExistingSandbox<'a> {
+    pub owner: Option<&'a str>,
+    pub running: bool,
+}
+
+/// Should `create_sandbox` reuse an existing container instead of making a
+/// new one?
+///
+/// Per-owner dedup: an owner that already has a live (running) managed
+/// sandbox gets that one back rather than a second box. Returns the index
+/// of the first matching entry, so the caller can look up the full record
+/// it needs to build a response from. `None` means proceed with a normal
+/// create — either the owner is unset (nothing to dedupe against) or none
+/// of their sandboxes are currently running.
+///
+/// Pure decision, factored out of `create_sandbox` (main.rs) the same way
+/// `is_owner_or_manager` is factored out of `require_owner_or_manager`: the
+/// broker's own test harness has no live Docker socket to list containers
+/// through, so the *logic* is tested directly against a plain slice.
+pub fn existing_sandbox_for_owner(
+    owner: Option<&str>,
+    existing: &[ExistingSandbox],
+) -> Option<usize> {
+    let owner = owner?;
+    existing
+        .iter()
+        .position(|s| s.running && s.owner == Some(owner))
 }
 
 /// Is this image allowed to hold an agent's private key?
@@ -1444,5 +1489,77 @@ mod tests {
     fn an_absent_manager_label_falls_back_to_owner_only() {
         assert!(is_owner_or_manager("owner-pk", Some("owner-pk"), None));
         assert!(!is_owner_or_manager("random-pk", Some("owner-pk"), None));
+    }
+
+    #[test]
+    fn create_dedup_finds_a_running_sandbox_for_the_same_owner() {
+        let existing = [
+            ExistingSandbox {
+                owner: Some("someone-else"),
+                running: true,
+            },
+            ExistingSandbox {
+                owner: Some("owner-pk"),
+                running: true,
+            },
+        ];
+        assert_eq!(
+            existing_sandbox_for_owner(Some("owner-pk"), &existing),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn create_dedup_ignores_stopped_sandboxes() {
+        let existing = [ExistingSandbox {
+            owner: Some("owner-pk"),
+            running: false,
+        }];
+        assert_eq!(
+            existing_sandbox_for_owner(Some("owner-pk"), &existing),
+            None
+        );
+    }
+
+    #[test]
+    fn create_dedup_ignores_other_owners() {
+        let existing = [ExistingSandbox {
+            owner: Some("someone-else"),
+            running: true,
+        }];
+        assert_eq!(
+            existing_sandbox_for_owner(Some("owner-pk"), &existing),
+            None
+        );
+    }
+
+    /// A create with no owner has nothing to dedupe against — every such
+    /// call is unconditionally a new sandbox, never matched to another
+    /// ownerless one.
+    #[test]
+    fn create_dedup_is_a_no_op_without_an_owner() {
+        let existing = [ExistingSandbox {
+            owner: None,
+            running: true,
+        }];
+        assert_eq!(existing_sandbox_for_owner(None, &existing), None);
+    }
+
+    #[test]
+    fn create_dedup_picks_the_first_match() {
+        let existing = [
+            ExistingSandbox {
+                owner: Some("owner-pk"),
+                running: true,
+            },
+            ExistingSandbox {
+                owner: Some("owner-pk"),
+                running: true,
+            },
+        ];
+        assert_eq!(
+            existing_sandbox_for_owner(Some("owner-pk"), &existing),
+            Some(0)
+        );
     }
 }

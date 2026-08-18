@@ -308,13 +308,11 @@ pub(super) async fn start_local_agent_pairs_with_preflight(
         }
     }
 
+    use crate::managed_agents::start_managed_agent_runtime_pair_lazy as start_pair_lazy;
     let mut errors = Vec::new();
     for relay_url in relay_urls {
-        if let Err(error) = crate::managed_agents::start_managed_agent_runtime_pair_lazy(
-            pubkey.to_string(),
-            relay_url.clone(),
-            app.clone(),
-        ) {
+        let start = start_pair_lazy(pubkey.to_string(), relay_url.clone(), app.clone());
+        if let Err(error) = start.await {
             errors.push(format!("{relay_url}: {error}"));
         }
     }

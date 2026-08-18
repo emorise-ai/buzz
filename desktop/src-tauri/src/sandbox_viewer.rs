@@ -164,7 +164,7 @@ pub async fn create_agent_sandbox(
     // The sandbox exists (id known) before we touch the agent record, so a
     // freshly-spawned agent always gets a valid id to attach to.
     if let Some(sandbox_id) = parsed.get("id").and_then(|v| v.as_str()) {
-        attach_sandbox_to_local_agent(&app, &agent_pubkey, sandbox_id)?;
+        attach_sandbox_to_local_agent(&app, &agent_pubkey, sandbox_id).await?;
     } else {
         eprintln!(
             "buzz-desktop: sandbox broker create response had no string `id`; agent {agent_pubkey} was not attached"
@@ -179,7 +179,7 @@ pub async fn create_agent_sandbox(
 ///
 /// Silently no-ops (not an error) when the agent isn't locally managed — the
 /// sandbox is still created and viewable, just not agent-driven from here.
-fn attach_sandbox_to_local_agent(
+async fn attach_sandbox_to_local_agent(
     app: &AppHandle,
     agent_pubkey: &str,
     sandbox_id: &str,
@@ -192,7 +192,9 @@ fn attach_sandbox_to_local_agent(
         agent_pubkey.to_string(),
         relay_url,
         app.clone(),
-    ) {
+    )
+    .await
+    {
         eprintln!(
             "buzz-desktop: sandbox {sandbox_id} attached to agent {agent_pubkey}, but the restart to pick it up failed: {error}"
         );
@@ -225,6 +227,70 @@ fn restamp_sandbox_id(
     let relay_url = record.relay_url.clone();
     crate::managed_agents::save_managed_agents(app, &records)?;
     Ok(Some(relay_url))
+}
+
+/// Bump a sandbox's expiry — the viewer's passive-watching keepalive.
+///
+/// `SandboxStage` calls this on an interval while its screen is mounted and
+/// visible, so a human just watching (no clicks) keeps the computer alive the
+/// same way real activity does. Mirrors `destroy_agent_sandbox`'s request
+/// shape (same `broker_base`, `build_nip98_auth_header`, error handling) with
+/// no request body — the broker resolves the id and clamps the new expiry
+/// itself; the app has no expiry math to get right here.
+///
+/// Owner-or-manager gated on the broker side. A sandbox that's already gone
+/// answers 404, which this surfaces as an ordinary error — callers treat a
+/// failed heartbeat as best-effort and must not toast or crash the view.
+#[tauri::command]
+pub async fn sandbox_heartbeat(sandbox_id: String, state: State<'_, AppState>) -> CmdResult<()> {
+    let id = validate_sandbox_id(&sandbox_id)?;
+    let url = format!("{}/sandboxes/{id}/heartbeat", broker_base(&state));
+    let auth = build_nip98_auth_header(&Method::POST, &url, &[], &state)?;
+    let response = state
+        .http_client
+        .post(&url)
+        .header("Authorization", auth)
+        .send()
+        .await
+        .map_err(|e| format!("could not reach the sandbox broker: {e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(broker_error(status.as_u16(), &text));
+    }
+    Ok(())
+}
+
+/// Probe whether a sandbox is still alive on the broker (`GET
+/// /sandboxes/{id}`, unauthenticated-by-ownership — any NIP-98-valid caller
+/// may read status). Used at agent-start to decide whether a record's stored
+/// `sandbox_id` still refers to a live computer before handing it to a freshly
+/// spawned agent.
+///
+/// Returns `Ok(true)` on a 2xx (alive), `Ok(false)` on a definitive 404
+/// (gone). Any other failure (network error, non-404 error status) is an
+/// `Err` — the caller's contract is to treat that as "unknown, don't touch
+/// the id," never as "gone."
+pub(crate) async fn sandbox_is_alive(sandbox_id: &str, state: &AppState) -> CmdResult<bool> {
+    let id = validate_sandbox_id(sandbox_id)?;
+    let url = format!("{}/sandboxes/{id}", broker_base(state));
+    let auth = build_nip98_auth_header(&Method::GET, &url, &[], state)?;
+    let response = state
+        .http_client
+        .get(&url)
+        .header("Authorization", auth)
+        .send()
+        .await
+        .map_err(|e| format!("could not reach the sandbox broker: {e}"))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(true);
+    }
+    if status.as_u16() == 404 {
+        return Ok(false);
+    }
+    let text = response.text().await.unwrap_or_default();
+    Err(broker_error(status.as_u16(), &text))
 }
 
 /// Destroy a sandbox now — the app-side "Stop computer". The broker announces
@@ -264,7 +330,7 @@ pub async fn destroy_agent_sandbox(
         return Err(broker_error(status.as_u16(), &text));
     }
 
-    detach_sandbox_from_local_agent(&app, id);
+    detach_sandbox_from_local_agent(&app, id).await;
     Ok(())
 }
 
@@ -272,7 +338,7 @@ pub async fn destroy_agent_sandbox(
 /// and restart that agent. A no-op (not an error, and not surfaced to the
 /// caller) when no local record has this sandbox attached — the box may
 /// belong to an agent unmanaged on this machine, or to no agent at all.
-fn detach_sandbox_from_local_agent(app: &AppHandle, sandbox_id: &str) {
+async fn detach_sandbox_from_local_agent(app: &AppHandle, sandbox_id: &str) {
     let pubkey = match find_agent_pubkey_for_sandbox(app, sandbox_id) {
         Ok(Some(pubkey)) => pubkey,
         Ok(None) => return,
@@ -289,7 +355,9 @@ fn detach_sandbox_from_local_agent(app: &AppHandle, sandbox_id: &str) {
                 pubkey.clone(),
                 relay_url,
                 app.clone(),
-            ) {
+            )
+            .await
+            {
                 eprintln!(
                     "buzz-desktop: sandbox {sandbox_id} detached from agent {pubkey}, but the restart to drop it failed: {error}"
                 );

@@ -80,6 +80,7 @@ pub use repos::{
     write_persisted_repos_dir,
 };
 pub use restore::*;
+pub(crate) use runtime::sandbox_env::{decide_sandbox_liveness, SandboxLivenessOutcome};
 pub use runtime::*;
 pub use runtime_commands::*;
 pub use runtime_types::*;

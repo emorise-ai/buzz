@@ -5,12 +5,18 @@ import { toast } from "sonner";
 import { SandboxDock } from "./SandboxDock";
 import { SandboxFilesView } from "./SandboxFilesView";
 import { type LaunchableApp, launchSandboxApp } from "./sandboxLaunch";
+import { sandboxHeartbeat, shouldSendHeartbeat } from "./sandboxHeartbeat";
 import { actOnSandboxWindow, type SandboxWindow } from "./sandboxWindows";
 import { useSandboxWindows } from "./useSandboxWindows";
 import { useContainedAspectBox } from "./useContainedAspectBox";
 
 /** The sandbox screen is a fixed 1920x1080 remote desktop. */
 const SCREEN_ASPECT_RATIO = 16 / 9;
+
+/** How often a mounted, visible stage pings the broker to keep its computer
+ *  alive — well under the broker's keepalive grace window so a brief network
+ *  blip between pings never drops the box (see the broker's `/heartbeat`). */
+const HEARTBEAT_INTERVAL_MS = 120_000;
 
 export type SandboxStageHandle = {
   /** Open the "Transfer files" overlay — driven by a host surface's own
@@ -86,6 +92,29 @@ export const SandboxStage = React.forwardRef<
     sandboxId,
     active && !expired,
   );
+
+  // Passive-watching keepalive: while this stage is mounted, visible, and
+  // showing a live screen, ping the broker on an interval so a human who's
+  // just watching (no clicks) keeps the computer alive the same way real
+  // activity does. Best-effort — a failed ping (e.g. the box already expired)
+  // must not toast or crash the view; the normal `expired` prop takes over
+  // once the next kind:48200/48201 event lands.
+  React.useEffect(() => {
+    if (!active || expired) return;
+    const tick = () => {
+      if (!shouldSendHeartbeat(active, expired, document.visibilityState)) {
+        return;
+      }
+      sandboxHeartbeat(sandboxId).catch((error: unknown) => {
+        console.warn(
+          `[SandboxStage] heartbeat failed for ${sandboxId}:`,
+          error,
+        );
+      });
+    };
+    const interval = window.setInterval(tick, HEARTBEAT_INTERVAL_MS);
+    return () => window.clearInterval(interval);
+  }, [sandboxId, active, expired]);
 
   async function handleWindowClick(w: SandboxWindow) {
     // Using the taskbar is using the computer, same as launching an app.
