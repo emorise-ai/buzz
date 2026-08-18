@@ -243,6 +243,34 @@ enum Cmd {
     /// Community moderation — reports queue, bans, timeouts, audit trail
     #[command(subcommand)]
     Moderation(ModerationCmd),
+    /// Save a taught skill (Teach a Task) as a signed kind:48202 event
+    #[command(subcommand)]
+    Skills(SkillsCmd),
+}
+
+#[derive(Subcommand)]
+pub enum SkillsCmd {
+    /// Publish a taught skill. Body JSON comes from --body-file (a path, or
+    /// "-" for stdin); the signing key's own pubkey is recorded as the
+    /// `agent` tag automatically.
+    Save {
+        /// Skill id — becomes the `d` tag.
+        #[arg(long)]
+        id: String,
+        /// Human-readable name — becomes the `name` tag.
+        #[arg(long)]
+        name: String,
+        /// Owner pubkey (hex) this skill is taught for — becomes the `p` tag.
+        #[arg(long)]
+        owner: String,
+        /// Recording media URL, if this skill was captured from a screen
+        /// recording — becomes the `recording` tag.
+        #[arg(long)]
+        recording: Option<String>,
+        /// Path to the skill body JSON, or "-" to read it from stdin.
+        #[arg(long)]
+        body_file: String,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -2000,6 +2028,23 @@ pub enum SandboxCmd {
         #[arg(long)]
         url: Option<String>,
     },
+    /// Start recording the sandbox's screen to video
+    RecordStart {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        #[command(flatten)]
+        sandbox: SandboxIdArg,
+    },
+    /// Stop an in-progress screen recording and save it as an mp4
+    RecordStop {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        #[command(flatten)]
+        sandbox: SandboxIdArg,
+        /// Output path. Default: ./sandbox-recording-<id8>-<unixts>.mp4
+        #[arg(short, long)]
+        output: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2314,6 +2359,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Sandbox(sub) => commands::sandbox::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
+        Cmd::Skills(sub) => commands::skills::dispatch(sub, &client).await,
         Cmd::Pack(_) => unreachable!("handled above"),
     }
 }
@@ -2420,6 +2466,7 @@ mod tests {
             "reactions",
             "repos",
             "sandbox",
+            "skills",
             "social",
             "upload",
             "users",

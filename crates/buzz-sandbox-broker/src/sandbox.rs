@@ -639,6 +639,53 @@ pub fn append_launch_url<'a>(argv: &[&'a str], url: Option<&'a str>) -> Vec<&'a 
     full
 }
 
+/// Path inside the container that a screen recording is captured to and read
+/// back from. Fixed, like `SCREENSHOT_PATH` in main.rs — there is exactly one
+/// recording per sandbox, so there is nothing for a caller to name.
+pub const RECORDING_PATH: &str = "/tmp/buzz-teach-recording.mp4";
+
+/// Build the argv that starts screen recording inside a sandbox, backgrounded
+/// so the exec that launches it returns immediately.
+///
+/// Runs under `sh -c` with a literal, caller-independent script — there is no
+/// dynamic value anywhere in this command, so unlike `sandbox_exec`'s argv
+/// wrapping there is nothing here for an injected value to escape from.
+/// `setsid` detaches the ffmpeg process from the exec's own session so it
+/// keeps running (and stays reachable by name for `recording_is_running_argv`
+/// and `recording_stop_argv`) after this exec's stdout/stderr stream closes.
+pub fn recording_start_argv() -> Vec<&'static str> {
+    vec![
+        "sh",
+        "-c",
+        "setsid ffmpeg -y -f x11grab -framerate 10 -i :1 -codec:v libx264 \
+         -preset ultrafast -pix_fmt yuv420p \
+         /tmp/buzz-teach-recording.mp4 > /tmp/buzz-teach-recording.log 2>&1 < /dev/null &",
+    ]
+}
+
+/// Build the argv that reports whether a recording is currently in progress.
+///
+/// `pgrep -f` matches the ffmpeg command line by the fixed output path baked
+/// into [`recording_start_argv`], so this and the start/stop commands agree
+/// on identity without tracking a PID across requests. Exit code 0 means a
+/// match was found; the caller (main.rs) reads only the exit code, not
+/// stdout.
+pub fn recording_is_running_argv() -> Vec<&'static str> {
+    vec!["pgrep", "-f", "ffmpeg.*buzz-teach-recording.mp4"]
+}
+
+/// Build the argv that asks a running recording to stop gracefully.
+///
+/// `SIGINT` (not `SIGKILL`/`SIGTERM`... well, `SIGTERM` too — ffmpeg treats
+/// both as "finish the file"): either lets ffmpeg flush its muxer and write a
+/// valid `moov` atom before exiting, which a hard kill would skip, producing
+/// an mp4 with no index. The caller polls `recording_is_running_argv` after
+/// this until the process is gone rather than assuming the signal landed
+/// instantly.
+pub fn recording_stop_argv() -> Vec<&'static str> {
+    vec!["pkill", "-INT", "-f", "ffmpeg.*buzz-teach-recording.mp4"]
+}
+
 /// May `caller` act on a sandbox as its owner or manager?
 ///
 /// Pure decision, factored out of `require_owner_or_manager` (main.rs) so it
@@ -1471,5 +1518,51 @@ mod tests {
             existing_sandbox_for_owner(Some("owner-pk"), &existing),
             Some(0)
         );
+    }
+
+    #[test]
+    fn recording_start_argv_targets_the_fixed_output_path_and_backgrounds() {
+        let argv = recording_start_argv();
+        assert_eq!(argv[0], "sh");
+        assert_eq!(argv[1], "-c");
+        let script = argv[2];
+        assert!(script.contains("ffmpeg"));
+        assert!(script.contains(RECORDING_PATH));
+        assert!(script.contains("-f x11grab"));
+        assert!(script.contains("-i :1"));
+        // Backgrounded and detached from the exec's own session so it
+        // survives after the starting exec's stream closes.
+        assert!(script.trim_end().ends_with('&'));
+        assert!(script.contains("setsid"));
+    }
+
+    #[test]
+    fn recording_is_running_argv_matches_by_the_fixed_output_path() {
+        let argv = recording_is_running_argv();
+        assert_eq!(argv[0], "pgrep");
+        assert!(argv.iter().any(|a| a.contains("buzz-teach-recording.mp4")));
+    }
+
+    #[test]
+    fn recording_stop_argv_sends_sigint_not_sigkill() {
+        let argv = recording_stop_argv();
+        assert_eq!(argv[0], "pkill");
+        assert!(argv.contains(&"-INT"));
+        assert!(!argv.contains(&"-KILL"));
+        assert!(!argv.contains(&"-9"));
+        assert!(argv.iter().any(|a| a.contains("buzz-teach-recording.mp4")));
+    }
+
+    /// The three argv builders must all identify the same process by the
+    /// same fixed path — a mismatch here would mean start/is-running/stop
+    /// silently disagree about what they're tracking.
+    #[test]
+    fn recording_argv_builders_agree_on_the_process_identity() {
+        let start = recording_start_argv().join(" ");
+        let is_running = recording_is_running_argv().join(" ");
+        let stop = recording_stop_argv().join(" ");
+        assert!(start.contains(RECORDING_PATH));
+        assert!(is_running.contains("buzz-teach-recording.mp4"));
+        assert!(stop.contains("buzz-teach-recording.mp4"));
     }
 }

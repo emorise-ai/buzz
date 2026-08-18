@@ -180,6 +180,23 @@ pub async fn dispatch(cmd: crate::SandboxCmd, client: &BuzzClient) -> Result<(),
             }
             print_json(&client.sandbox_launch(&broker.broker, &id, &body).await?)
         }
+        crate::SandboxCmd::RecordStart { broker, sandbox } => {
+            let id = sandbox.require()?;
+            print_json(&client.sandbox_recording_start(&broker.broker, &id).await?)
+        }
+        crate::SandboxCmd::RecordStop {
+            broker,
+            sandbox,
+            output,
+        } => {
+            let id = sandbox.require()?;
+            let bytes = client.sandbox_recording_stop(&broker.broker, &id).await?;
+            let path = output.unwrap_or_else(|| default_recording_path(&id));
+            std::fs::write(&path, &bytes).map_err(|e| {
+                CliError::Other(format!("failed to write recording to {path}: {e}"))
+            })?;
+            print_json(&serde_json::json!({ "path": path, "bytes": bytes.len() }))
+        }
     }
 }
 
@@ -192,6 +209,16 @@ fn default_screenshot_path(id: &str) -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("./sandbox-screenshot-{id8}-{unixts}.png")
+}
+
+/// Default recording filename, same shape as `default_screenshot_path`.
+fn default_recording_path(id: &str) -> String {
+    let id8: String = id.chars().take(8).collect();
+    let unixts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("./sandbox-recording-{id8}-{unixts}.mp4")
 }
 
 fn print_json(value: &serde_json::Value) -> Result<(), CliError> {

@@ -305,6 +305,17 @@ fn build_router(state: AppState) -> Router {
         .route("/sandboxes/{id}/exec", post(sandbox_exec))
         .route("/sandboxes/{id}/screenshot", get(sandbox_screenshot))
         .route("/sandboxes/{id}/input", post(sandbox_input))
+        // Screen recording: same owner-or-manager gate as the rest of the
+        // computer-use surface above — a recording captures the same screen
+        // exec/input/screenshot already expose to owner and manager alike.
+        .route(
+            "/sandboxes/{id}/recording/start",
+            post(sandbox_recording_start),
+        )
+        .route(
+            "/sandboxes/{id}/recording/stop",
+            post(sandbox_recording_stop),
+        )
         // Activity signal only — the desktop viewer pings this while a
         // sandbox's screen is mounted so passive watching (no exec/input of
         // its own) still counts as use. The handler itself does nothing;
@@ -2087,6 +2098,193 @@ async fn sandbox_input(
         .into_response()
 }
 
+/// How long `sandbox_recording_stop` waits for ffmpeg to finish flushing its
+/// muxer after a graceful stop signal before giving up. ffmpeg's own shutdown
+/// on SIGINT/SIGTERM is normally near-instant for a screen-capture stream —
+/// this is a generous ceiling against a slow container, not the expected case.
+const RECORDING_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How often `sandbox_recording_stop` polls for ffmpeg's exit while waiting
+/// out [`RECORDING_STOP_TIMEOUT`].
+const RECORDING_STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// `POST /sandboxes/{id}/recording/start` — start capturing the sandbox's
+/// screen to a fixed in-container path via `ffmpeg`, detached (the exec
+/// returns as soon as the process is launched, not when it exits). Same
+/// owner-or-manager gate as exec/input/screenshot: a recording shows exactly
+/// what those already expose live.
+///
+/// Only one recording may run at a time per sandbox — a second `start` while
+/// one is already in progress is a 409, not a silently-ignored no-op, so a
+/// caller cannot lose track of which capture it will get back from `stop`.
+async fn sandbox_recording_start(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if !is_safe_id(&id) {
+        return bad_request("malformed sandbox id");
+    }
+    let caller = match authorize(
+        &state,
+        &headers,
+        "POST",
+        &format!("/sandboxes/{id}/recording/start"),
+        &body,
+    )
+    .await
+    {
+        Ok(pubkey) => pubkey,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_owner_or_manager(&state, &id, &caller).await {
+        return response;
+    }
+
+    let is_running_argv = sandbox::recording_is_running_argv();
+    match state.docker.exec(&id, &is_running_argv, FS_EXEC_USER).await {
+        Ok((0, _)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "a recording is already in progress"})),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(e) => return internal(e),
+    }
+
+    let env = ["DISPLAY=:1".to_string()];
+    let start_argv = sandbox::recording_start_argv();
+    if let Err(e) = state
+        .docker
+        .exec_detached(&id, &start_argv, FS_EXEC_USER, &env)
+        .await
+    {
+        return internal(e);
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"recording": true}))).into_response()
+}
+
+/// `POST /sandboxes/{id}/recording/stop` — gracefully stop an in-progress
+/// recording and return the finished mp4's raw bytes. Owner-or-manager, same
+/// as `start`.
+///
+/// "Gracefully" matters here: ffmpeg writes the mp4's index (`moov` atom)
+/// only on a clean shutdown, so this sends `SIGINT` and polls for the process
+/// to actually exit before reading the file — pulling it out from under a
+/// still-running (or force-killed) ffmpeg would return an unplayable file.
+/// Reuses the exact `get_archive` + tar-extraction path `sandbox_screenshot`
+/// uses for its PNG.
+async fn sandbox_recording_stop(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if !is_safe_id(&id) {
+        return bad_request("malformed sandbox id");
+    }
+    let caller = match authorize(
+        &state,
+        &headers,
+        "POST",
+        &format!("/sandboxes/{id}/recording/stop"),
+        &body,
+    )
+    .await
+    {
+        Ok(pubkey) => pubkey,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_owner_or_manager(&state, &id, &caller).await {
+        return response;
+    }
+
+    let is_running_argv = sandbox::recording_is_running_argv();
+    match state.docker.exec(&id, &is_running_argv, FS_EXEC_USER).await {
+        Ok((0, _)) => {}
+        Ok(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "no recording is in progress"})),
+            )
+                .into_response();
+        }
+        Err(e) => return internal(e),
+    }
+
+    let stop_argv = sandbox::recording_stop_argv();
+    if let Err(e) = state.docker.exec(&id, &stop_argv, FS_EXEC_USER).await {
+        return internal(e);
+    }
+
+    // Poll for ffmpeg to actually exit (its own clean shutdown, not the
+    // signal delivery, is what finalizes the mp4) rather than reading the
+    // file immediately after sending the signal.
+    let deadline = tokio::time::Instant::now() + RECORDING_STOP_TIMEOUT;
+    loop {
+        match state.docker.exec(&id, &is_running_argv, FS_EXEC_USER).await {
+            Ok((0, _)) => {
+                if tokio::time::Instant::now() >= deadline {
+                    warn!(sandbox = %id, "recording did not stop within the timeout; reading file anyway");
+                    break;
+                }
+                tokio::time::sleep(RECORDING_STOP_POLL_INTERVAL).await;
+            }
+            Ok(_) => break,
+            Err(e) => return internal(e),
+        }
+    }
+
+    let tar_bytes = match state.docker.get_archive(&id, sandbox::RECORDING_PATH).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(sandbox = %id, error = %e, "recording file missing after stop");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "recording file was not found after stopping"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+    let entries = match archive.entries() {
+        Ok(e) => e,
+        Err(e) => return internal(format!("could not read archive: {e}")),
+    };
+    for entry in entries {
+        let mut entry = match entry {
+            Ok(e) => e,
+            Err(e) => return internal(format!("could not read archive entry: {e}")),
+        };
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        if let Err(e) = std::io::Read::read_to_end(&mut entry, &mut bytes) {
+            return internal(format!("could not read recording contents: {e}"));
+        }
+        return (
+            [(axum::http::header::CONTENT_TYPE, "video/mp4".to_string())],
+            bytes,
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({
+            "error": "recording file was not found after stopping"
+        })),
+    )
+        .into_response()
+}
+
 /// `POST /sandboxes/{id}/heartbeat` — a pure activity signal, owner-or-manager
 /// gated like every other computer-use route. Does nothing itself; its only
 /// purpose is to give the desktop viewer a 2xx to send while a sandbox's
@@ -3033,6 +3231,30 @@ mod router_tests {
         let app = build_router(test_state());
         let uri = "/sandboxes/abc123def456/screenshot";
         let resp = app.oneshot(forwarded_request("GET", uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn recording_start_reaches_the_handler_and_fails_auth_without_a_signature() {
+        let app = build_router(test_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/sandboxes/abc123def456/recording/start")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn recording_stop_reaches_the_handler_and_fails_auth_without_a_signature() {
+        let app = build_router(test_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/sandboxes/abc123def456/recording/stop")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 

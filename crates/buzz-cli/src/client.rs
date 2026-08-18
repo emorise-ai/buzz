@@ -2530,6 +2530,7 @@ impl BuzzClient {
             401 | 403 => Err(CliError::Auth(broker_detail(status, &text))),
             404 => Err(CliError::NotFound(broker_detail(status, &text))),
             400 => Err(CliError::Usage(broker_detail(status, &text))),
+            409 => Err(CliError::Conflict(broker_detail(status, &text))),
             _ => Err(CliError::Relay { status, body: text }),
         }
     }
@@ -2621,7 +2622,7 @@ impl BuzzClient {
             "{}/sandboxes/{id}/screenshot",
             broker_url.trim_end_matches('/')
         );
-        self.broker_call_binary(reqwest::Method::GET, &url, None)
+        self.broker_call_binary(reqwest::Method::GET, &url, None, "image/png")
             .await
     }
 
@@ -2662,14 +2663,50 @@ impl BuzzClient {
         parse_broker_json(&text)
     }
 
+    /// Start recording the sandbox's screen. Errors with `CliError::Conflict`
+    /// if a recording is already in progress (broker 409).
+    pub async fn sandbox_recording_start(
+        &self,
+        broker_url: &str,
+        id: &str,
+    ) -> Result<serde_json::Value, CliError> {
+        let url = format!(
+            "{}/sandboxes/{id}/recording/start",
+            broker_url.trim_end_matches('/')
+        );
+        let (_, text) = self
+            .broker_call(reqwest::Method::POST, &url, Some(Vec::new()))
+            .await?;
+        parse_broker_json(&text)
+    }
+
+    /// Stop an in-progress recording and return the finished mp4's raw bytes.
+    /// Errors with `CliError::Conflict` if nothing is recording (broker 409).
+    pub async fn sandbox_recording_stop(
+        &self,
+        broker_url: &str,
+        id: &str,
+    ) -> Result<Vec<u8>, CliError> {
+        let url = format!(
+            "{}/sandboxes/{id}/recording/stop",
+            broker_url.trim_end_matches('/')
+        );
+        self.broker_call_binary(reqwest::Method::POST, &url, Some(Vec::new()), "video/mp4")
+            .await
+    }
+
     /// Same signing/status-mapping as `broker_call`, but returns the raw
-    /// response body instead of decoding it as text/JSON — used for the
-    /// screenshot endpoint, which answers with PNG bytes.
+    /// response body instead of decoding it as text/JSON — used for endpoints
+    /// that answer with binary bytes (screenshot's PNG, recording's mp4).
+    /// `expected_content_type` is checked as a prefix (e.g. `"image/png"`,
+    /// `"video/mp4"`) so a broker error response that slips through with a
+    /// 2xx status is still caught rather than written to disk as-is.
     async fn broker_call_binary(
         &self,
         method: reqwest::Method,
         url: &str,
         body: Option<Vec<u8>>,
+        expected_content_type: &str,
     ) -> Result<Vec<u8>, CliError> {
         let auth = sign_nip98(&self.keys, method.as_str(), url, body.as_deref())?;
         let mut req = self
@@ -2689,6 +2726,7 @@ impl BuzzClient {
                 401 | 403 => CliError::Auth(broker_detail(status, &text)),
                 404 => CliError::NotFound(broker_detail(status, &text)),
                 400 => CliError::Usage(broker_detail(status, &text)),
+                409 => CliError::Conflict(broker_detail(status, &text)),
                 _ => CliError::Relay { status, body: text },
             });
         }
@@ -2698,9 +2736,9 @@ impl BuzzClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        if !content_type.starts_with("image/png") {
+        if !content_type.starts_with(expected_content_type) {
             return Err(CliError::Other(format!(
-                "expected image/png from screenshot endpoint, got '{content_type}'"
+                "expected {expected_content_type} from broker, got '{content_type}'"
             )));
         }
         let bytes = resp.bytes().await?;
