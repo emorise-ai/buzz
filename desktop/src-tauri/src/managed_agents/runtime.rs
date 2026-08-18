@@ -67,6 +67,7 @@ mod lifecycle;
 use lifecycle::kill_stale_tracked_processes_with;
 pub use lifecycle::{kill_stale_tracked_processes, sync_managed_agent_processes};
 
+mod sandbox_env;
 /// Classify an agent's persona against the live catalog for the Agents-menu
 /// drift indicator. Returns `(out_of_date, orphaned)`.
 ///
@@ -821,6 +822,9 @@ pub fn spawn_agent_child(
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
+
+    sandbox_env::apply_sandbox_env(&mut command, app, record.sandbox_id.as_deref());
+
     configure_runtime_cli(&mut command, runtime_meta);
 
     // Buzz shared compute is stored as a native provider; derive the OpenAI-compatible

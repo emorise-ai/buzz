@@ -13,7 +13,7 @@
 
 use base64::Engine;
 use reqwest::Method;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::app_state::AppState;
 use crate::relay::build_nip98_auth_header;
@@ -83,7 +83,12 @@ const BROKER_PROXY_PREFIX: &str = "/sandbox-viewer";
 /// Where the app reaches the broker: an explicit override, else the active
 /// community relay's origin plus the viewer proxy prefix — the same door the
 /// published viewer links already go through.
-fn broker_base(state: &State<'_, AppState>) -> String {
+///
+/// Shared with `managed_agents::runtime`, which stamps this exact value into
+/// a spawned agent's `BUZZ_SANDBOX_BROKER_URL` — the two call sites must never
+/// drift, or an agent's `buzz sandbox` calls would sign against a URL the
+/// broker's `BUZZ_SANDBOX_PUBLIC_URL` allowlist rejects.
+pub(crate) fn broker_base(state: &AppState) -> String {
     if let Ok(v) = std::env::var("BUZZ_SANDBOX_BROKER_URL") {
         let v = v.trim();
         if !v.is_empty() {
@@ -106,10 +111,19 @@ fn is_hex_pubkey(s: &str) -> bool {
 /// Returns the broker's create response. The UI does not need it to render:
 /// the broker announces the sandbox as a kind:48200 the app is already
 /// subscribed to, so the preview appears through the normal event path.
+///
+/// If `agent_pubkey` is a locally-managed agent, this also stamps the new
+/// sandbox id onto its record and restarts it — an agent's env is fixed at
+/// spawn, so attaching a computer requires a fresh process to pick up
+/// `BUZZ_SANDBOX_BROKER_URL`/`BUZZ_SANDBOX_ID` and the harness's "you have a
+/// computer" briefing. If the agent isn't managed here (e.g. running on
+/// another machine), the box is still created and viewable — it just isn't
+/// agent-driven from this desktop, matching today's behavior for such agents.
 #[tauri::command]
 pub async fn create_agent_sandbox(
     agent_pubkey: String,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> CmdResult<serde_json::Value> {
     if !is_hex_pubkey(&agent_pubkey) {
         return Err("agent pubkey must be 64 hex characters".to_string());
@@ -144,15 +158,87 @@ pub async fn create_agent_sandbox(
     if !status.is_success() {
         return Err(broker_error(status.as_u16(), &text));
     }
-    serde_json::from_str(&text).map_err(|e| format!("broker returned unparseable JSON: {e}"))
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("broker returned unparseable JSON: {e}"))?;
+
+    // The sandbox exists (id known) before we touch the agent record, so a
+    // freshly-spawned agent always gets a valid id to attach to.
+    if let Some(sandbox_id) = parsed.get("id").and_then(|v| v.as_str()) {
+        attach_sandbox_to_local_agent(&app, &agent_pubkey, sandbox_id)?;
+    } else {
+        eprintln!(
+            "buzz-desktop: sandbox broker create response had no string `id`; agent {agent_pubkey} was not attached"
+        );
+    }
+
+    Ok(parsed)
+}
+
+/// Stamp `sandbox_id` onto `agent_pubkey`'s managed-agent record, if one
+/// exists on this machine, and restart it so the new env takes effect.
+///
+/// Silently no-ops (not an error) when the agent isn't locally managed — the
+/// sandbox is still created and viewable, just not agent-driven from here.
+fn attach_sandbox_to_local_agent(
+    app: &AppHandle,
+    agent_pubkey: &str,
+    sandbox_id: &str,
+) -> CmdResult<()> {
+    let relay_url = restamp_sandbox_id(app, agent_pubkey, Some(sandbox_id.to_string()))?;
+    let Some(relay_url) = relay_url else {
+        return Ok(());
+    };
+    if let Err(error) = crate::managed_agents::restart_managed_agent_runtime(
+        agent_pubkey.to_string(),
+        relay_url,
+        app.clone(),
+    ) {
+        eprintln!(
+            "buzz-desktop: sandbox {sandbox_id} attached to agent {agent_pubkey}, but the restart to pick it up failed: {error}"
+        );
+    }
+    Ok(())
+}
+
+/// Find `pubkey`'s managed-agent record, set `sandbox_id`, and persist.
+///
+/// Returns `Ok(Some(relay_url))` when a record was found and updated (the
+/// caller should restart that agent next), `Ok(None)` when no local record
+/// exists for this pubkey (nothing to restart).
+fn restamp_sandbox_id(
+    app: &AppHandle,
+    pubkey: &str,
+    sandbox_id: Option<String>,
+) -> CmdResult<Option<String>> {
+    use tauri::Manager;
+    let state = app.state::<AppState>();
+    let _store = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let mut records = crate::managed_agents::load_managed_agents(app)?;
+    let Some(record) = records.iter_mut().find(|r| r.pubkey == pubkey) else {
+        return Ok(None);
+    };
+    record.sandbox_id = sandbox_id;
+    record.updated_at = crate::util::now_iso();
+    let relay_url = record.relay_url.clone();
+    crate::managed_agents::save_managed_agents(app, &records)?;
+    Ok(Some(relay_url))
 }
 
 /// Destroy a sandbox now — the app-side "Stop computer". The broker announces
 /// the destruction (kind:48201), which clears the preview.
+///
+/// If a locally-managed agent had this sandbox attached, this also clears its
+/// `sandbox_id` and restarts it, so it drops the now-dead broker env and
+/// correctly reports having no computer — rather than holding a dead id and
+/// having its `buzz sandbox` calls fail against a box that no longer exists.
 #[tauri::command]
 pub async fn destroy_agent_sandbox(
     sandbox_id: String,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> CmdResult<()> {
     let id = sandbox_id.trim();
     if id.is_empty()
@@ -177,7 +263,55 @@ pub async fn destroy_agent_sandbox(
         let text = response.text().await.unwrap_or_default();
         return Err(broker_error(status.as_u16(), &text));
     }
+
+    detach_sandbox_from_local_agent(&app, id);
     Ok(())
+}
+
+/// Find whichever locally-managed agent has `sandbox_id` attached, clear it,
+/// and restart that agent. A no-op (not an error, and not surfaced to the
+/// caller) when no local record has this sandbox attached — the box may
+/// belong to an agent unmanaged on this machine, or to no agent at all.
+fn detach_sandbox_from_local_agent(app: &AppHandle, sandbox_id: &str) {
+    let pubkey = match find_agent_pubkey_for_sandbox(app, sandbox_id) {
+        Ok(Some(pubkey)) => pubkey,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!(
+                "buzz-desktop: sandbox {sandbox_id} destroyed, but looking up its attached agent failed: {error}"
+            );
+            return;
+        }
+    };
+    match restamp_sandbox_id(app, &pubkey, None) {
+        Ok(Some(relay_url)) => {
+            if let Err(error) = crate::managed_agents::restart_managed_agent_runtime(
+                pubkey.clone(),
+                relay_url,
+                app.clone(),
+            ) {
+                eprintln!(
+                    "buzz-desktop: sandbox {sandbox_id} detached from agent {pubkey}, but the restart to drop it failed: {error}"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!(
+                "buzz-desktop: sandbox {sandbox_id} destroyed, but clearing it from agent {pubkey} failed: {error}"
+            );
+        }
+    }
+}
+
+/// Find the pubkey of the locally-managed agent whose record currently has
+/// `sandbox_id` attached, if any.
+fn find_agent_pubkey_for_sandbox(app: &AppHandle, sandbox_id: &str) -> CmdResult<Option<String>> {
+    let records = crate::managed_agents::load_managed_agents(app)?;
+    Ok(records
+        .into_iter()
+        .find(|r| r.sandbox_id.as_deref() == Some(sandbox_id))
+        .map(|r| r.pubkey))
 }
 
 /// Surface the broker's `{"error": "..."}` text rather than the JSON wrapper.

@@ -164,6 +164,7 @@ fn local_agent() -> ManagedAgentRecord {
         persona_id: Some("persona-local".to_string()),
         private_key_nsec: "nsec1localsecret".to_string(),
         auth_tag: Some("localauthtag".to_string()),
+        sandbox_id: None,
         relay_url: "wss://relay.local".to_string(),
         avatar_url: None,
         acp_command: "buzz-acp".to_string(),

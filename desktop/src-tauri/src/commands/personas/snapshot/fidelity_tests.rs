@@ -18,6 +18,7 @@ fn make_definition(slug: &str) -> ManagedAgentRecord {
         persona_id: None,
         private_key_nsec: String::new(),
         auth_tag: None,
+        sandbox_id: None,
         relay_url: String::new(),
         avatar_url: None,
         acp_command: String::new(),

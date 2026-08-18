@@ -593,8 +593,7 @@ pub async fn create_managed_agent(
         );
     }
 
-    // Snapshot the workspace owner pubkey for the legacy-record auth_tag
-    // fallback. Computed outside the records lock to keep lock ordering simple.
+    // Computed outside the records lock to keep lock ordering simple.
     let owner_hex = workspace_owner_hex(&state)?;
 
     // ── Phase 1: generate keys (sync lock) ────────────────────────────────────
@@ -828,6 +827,7 @@ pub async fn create_managed_agent(
             team_id,
             private_key_nsec: private_key_nsec.clone(),
             auth_tag: auth_tag.clone(),
+            sandbox_id: None,
             relay_url: resolved_relay_url.clone(),
             avatar_url: resolved_avatar_url.clone(),
             acp_command: input

@@ -104,6 +104,7 @@ impl AgentDefinition {
             persona_id: None,
             private_key_nsec: String::new(),
             auth_tag: None,
+            sandbox_id: None,
             relay_url: String::new(),
             avatar_url: self.avatar_url,
             acp_command: DEFAULT_ACP_COMMAND.to_string(),
@@ -235,6 +236,8 @@ pub struct ManagedAgentRecord {
     /// Re-attestation requires agent recreation (v2 migration scope).
     #[serde(default)]
     pub auth_tag: Option<String>,
+    #[serde(default)]
+    pub sandbox_id: Option<String>,
     pub relay_url: String,
     /// Avatar URL resolved at creation time (user-supplied input, else the
     /// command-based fallback). Persisted so startup reconciliation compares
@@ -961,9 +964,8 @@ pub fn resolve_mint_behavioral_defaults(
     }
 
     let parallelism = match input_parallelism {
-        // Explicit input is validated here too (not just at the command
-        // call sites) so the "validated when present" contract on
-        // `MintBehavioralDefaults.parallelism` is unskippable.
+        // Explicit input is validated here too (not just at the command call
+        // sites) so the "validated when present" contract is unskippable.
         Some(count) if (1..=32).contains(&count) => Some(count),
         Some(count) => {
             return Err(format!(

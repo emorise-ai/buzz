@@ -1482,6 +1482,7 @@ mod tests {
             persona_id: None,
             private_key_nsec: String::new(),
             auth_tag: None,
+            sandbox_id: None,
             relay_url: String::new(),
             avatar_url: None,
             acp_command: "buzz-acp".to_string(),
@@ -1550,8 +1551,7 @@ mod tests {
 
     #[test]
     fn buzz_agent_databricks_v2_with_databricks_model_but_no_buzz_agent_model_is_ready() {
-        // The baked buzz-releases env sets DATABRICKS_MODEL but not BUZZ_AGENT_MODEL.
-        // An agent with only DATABRICKS_MODEL must pass the readiness gate.
+        // The baked env sets DATABRICKS_MODEL but not BUZZ_AGENT_MODEL — still ready.
         let env = make_env(
             "buzz-agent",
             env_with(&[

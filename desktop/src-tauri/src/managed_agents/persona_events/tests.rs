@@ -10,6 +10,7 @@ pub(super) fn sample_record() -> ManagedAgentRecord {
         persona_id: Some("test-persona".into()),
         private_key_nsec: "nsec1fake".into(),
         auth_tag: None,
+        sandbox_id: None,
         relay_url: "ws://localhost:3000".into(),
         avatar_url: None,
         acp_command: "buzz-acp".into(),

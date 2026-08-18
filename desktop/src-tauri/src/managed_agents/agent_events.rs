@@ -169,6 +169,7 @@ mod tests {
             persona_id: Some("persona-1".to_string()),
             private_key_nsec: "nsec1secretdonotpublish".to_string(),
             auth_tag: Some("authtagsecret".to_string()),
+            sandbox_id: None,
             relay_url: "wss://relay.example".to_string(),
             avatar_url: Some("https://example.com/a.png".to_string()),
             acp_command: "buzz-acp".to_string(),
