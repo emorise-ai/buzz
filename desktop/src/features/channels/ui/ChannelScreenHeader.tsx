@@ -9,10 +9,13 @@ import { getDmParticipantPreview } from "@/features/channels/lib/dmParticipantDi
 import { ChannelHeaderStatusBadge } from "@/features/channels/ui/ChannelHeaderStatusBadge";
 import { ChannelMembersBar } from "@/features/channels/ui/ChannelMembersBar";
 import { useAgentSandbox } from "@/features/agents/sandbox/useAgentSandbox";
+import { useHasEverHadComputer } from "@/features/agents/sandbox/computerEverAssignedStore";
 import {
   toggleComputerPanel,
   useComputerPanel,
 } from "@/features/agents/sandbox/computerPanelStore";
+import { startAndOpenComputer } from "@/features/agents/sandbox/sandboxLifecycle";
+import { toast } from "sonner";
 import {
   DEFAULT_HOVER_PROFILE_STATUS_GEOMETRY,
   ProfileAvatarWithStatus,
@@ -108,6 +111,8 @@ export function ChannelScreenHeader({
       ? activeDmHeaderParticipants[0].pubkey
       : null;
   const dmCounterpartSandbox = useAgentSandbox(dmCounterpartPubkey);
+  const dmCounterpartEverHadComputer =
+    useHasEverHadComputer(dmCounterpartPubkey);
   const computerPanel = useComputerPanel();
   const isComputerPanelOpenForCounterpart =
     computerPanel.open &&
@@ -115,6 +120,9 @@ export function ChannelScreenHeader({
     computerPanel.ownerPubkey !== null &&
     normalizePubkey(computerPanel.ownerPubkey) ===
       normalizePubkey(dmCounterpartPubkey);
+  // Three states: never had a computer → no button; had one but it's gone
+  // (expired/stopped) → dim "asleep" button that starts a new one; live →
+  // bright button that opens the existing preview.
   const computerButton =
     activeChannel && dmCounterpartPubkey && dmCounterpartSandbox ? (
       <Button
@@ -126,6 +134,30 @@ export function ChannelScreenHeader({
         title="Computer"
         type="button"
         variant={isComputerPanelOpenForCounterpart ? "secondary" : "outline"}
+      >
+        <Monitor />
+      </Button>
+    ) : activeChannel && dmCounterpartPubkey && dmCounterpartEverHadComputer ? (
+      <Button
+        aria-label="Start computer"
+        className="opacity-50 hover:opacity-80"
+        onClick={() => {
+          startAndOpenComputer(dmCounterpartPubkey).catch((err) => {
+            console.error(
+              "[ChannelScreenHeader] startAndOpenComputer failed:",
+              err,
+            );
+            toast.error(
+              err instanceof Error
+                ? err.message
+                : "Could not start a computer.",
+            );
+          });
+        }}
+        size="icon"
+        title="Computer (asleep)"
+        type="button"
+        variant="outline"
       >
         <Monitor />
       </Button>

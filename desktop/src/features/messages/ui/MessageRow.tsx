@@ -45,6 +45,7 @@ import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
 import type { VideoReviewContext } from "@/shared/ui/VideoPlayer";
 import { VideoReviewCommentMarkdown } from "@/shared/ui/VideoReviewCommentMarkdown";
 import { MessageActionBar } from "./MessageActionBar";
+import { MessageComputerIndicator } from "@/features/agents/sandbox/MessageComputerIndicator";
 import { editMessage } from "@/shared/api/tauri";
 import { hasLinkPreviewSuppression } from "@/features/messages/lib/formatTimelineMessages";
 import { toast } from "sonner";
@@ -540,6 +541,13 @@ export const MessageRow = React.memo(
         ownerPubkey={message.ownerPubkey}
       />
     ) : null;
+    // The computer belongs to the agent itself (message.pubkey), not its
+    // human owner (message.ownerPubkey) — MessageAgentOwner labels the
+    // latter, this indicator is keyed to the former.
+    const computerIndicatorNode =
+      message.isAgent && message.pubkey ? (
+        <MessageComputerIndicator agentPubkey={message.pubkey} />
+      ) : null;
 
     const actionBarNode = (
       <div
@@ -648,6 +656,7 @@ export const MessageRow = React.memo(
         <MessageMetaSegments
           segments={[
             { key: "owner", node: agentOwnerNode },
+            { key: "computer", node: computerIndicatorNode },
             { key: "timestamp", node: inlineMetadataNode },
             { key: "persona", node: personaNode },
           ]}

@@ -1,5 +1,6 @@
 import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
+import { markComputerEverAssigned } from "./computerEverAssignedStore";
 import { reconstructAgentSandbox, type AgentSandbox } from "./sandboxState";
 
 /**
@@ -52,7 +53,12 @@ function recompute() {
   const next = new Map<string, AgentSandbox>();
   for (const [owner, events] of byOwner) {
     const sandbox = reconstructAgentSandbox(events);
-    if (sandbox) next.set(owner, sandbox);
+    if (sandbox) {
+      next.set(owner, sandbox);
+      // Passive observation: any owner seen with a live sandbox — not just
+      // ones this client started — sticks in "ever had a computer" memory.
+      markComputerEverAssigned(owner);
+    }
   }
   sandboxByOwner = next;
   console.error(

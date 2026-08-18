@@ -12,10 +12,12 @@ import {
 import type { AuxiliaryPanelLayout } from "@/shared/layout/AuxiliaryPanel";
 import { Button } from "@/shared/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
+import { cn } from "@/shared/lib/cn";
 import { useUserProfileQuery } from "@/features/profile/hooks";
 import { resolveProfileDisplayName } from "@/features/profile/ui/UserProfilePanelUtils";
 import { useNow } from "@/shared/lib/useNow";
 import { useAgentSandbox } from "./useAgentSandbox";
+import { useHasEverHadComputer } from "./computerEverAssignedStore";
 import { formatSandboxRemaining, isSandboxExpired } from "./sandboxCountdown";
 import { mintViewerUrl } from "./mintViewerUrl";
 import { openComputerWindow } from "./openComputerWindow";
@@ -43,6 +45,7 @@ export function ComputerPreviewPanel({
   onClose: () => void;
 }) {
   const sandbox = useAgentSandbox(ownerPubkey);
+  const everHadComputer = useHasEverHadComputer(ownerPubkey);
   const now = useNow(1000);
   const { data: profile } = useUserProfileQuery(ownerPubkey);
   const agentDisplayName = resolveProfileDisplayName({
@@ -166,9 +169,14 @@ export function ComputerPreviewPanel({
       <AuxiliaryPanelBody className="flex min-h-0 flex-1 flex-col overflow-hidden p-0">
         {!sandbox ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
-            <Monitor className="h-8 w-8 text-muted-foreground" />
+            <Monitor
+              className={cn(
+                "h-8 w-8 text-muted-foreground",
+                everHadComputer && "animate-pulse",
+              )}
+            />
             <p className="text-sm font-medium text-foreground">
-              No computer running
+              {everHadComputer ? "Starting computer…" : "No computer running"}
             </p>
           </div>
         ) : mintedUrl ? (
