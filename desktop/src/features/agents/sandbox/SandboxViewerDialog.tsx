@@ -79,8 +79,7 @@ export function SandboxViewerDialog({
   const {
     teaching,
     finishing,
-    narration,
-    setNarration,
+    listening,
     startTeaching,
     cancelTeaching,
     doneTeaching,
@@ -205,8 +204,7 @@ export function SandboxViewerDialog({
           />
           {teaching ? (
             <TeachTaskBanner
-              narration={narration}
-              onNarrationChange={setNarration}
+              listening={listening}
               onDone={() => void doneTeaching()}
               onCancel={() => void cancelTeaching()}
               busy={finishing}

@@ -292,18 +292,45 @@ pub async fn sandbox_recording_start(
 /// The frontend hands these straight to `uploadMediaBytes` (the same path
 /// used for pasted/dragged media) to turn them into a fetchable URL — this
 /// command only fetches the bytes, it does not host them anywhere itself.
+///
+/// `audio` is the "Teach a task" mic capture, already encoded to one of the
+/// broker's allowed containers (`audio_ext` names it — see the broker's
+/// `/recording/stop` handler). When present, the broker bakes it into the
+/// returned mp4 as its audio track instead of returning a silent video.
+/// Passing `audio: None` (or omitting it) is the original video-only path,
+/// unchanged.
+///
+/// The query string carrying `audio_ext` is part of the authorized request
+/// once audio is attached, so it MUST be included in the exact URL string
+/// passed to `build_nip98_auth_header` — signing the bare path and appending
+/// the query after the fact would let the broker compute a different NIP-98
+/// `u` tag than what was actually requested and 401 the call. Likewise the
+/// body hash covers the raw audio bytes, not an empty body, whenever audio is
+/// sent.
 #[tauri::command]
 pub async fn sandbox_recording_stop(
     sandbox_id: String,
+    audio: Option<Vec<u8>>,
+    audio_ext: Option<String>,
     state: State<'_, AppState>,
 ) -> CmdResult<Vec<u8>> {
     let id = validate_sandbox_id(&sandbox_id)?;
-    let url = format!("{}/sandboxes/{id}/recording/stop", broker_base(&state));
-    let auth = build_nip98_auth_header(&Method::POST, &url, &[], &state)?;
+    let base_url = format!("{}/sandboxes/{id}/recording/stop", broker_base(&state));
+    let body = audio.unwrap_or_default();
+    let url = if body.is_empty() {
+        base_url
+    } else {
+        let ext = audio_ext
+            .filter(|e| !e.is_empty())
+            .ok_or("audio_ext is required when audio bytes are provided".to_string())?;
+        format!("{base_url}?audio_ext={ext}")
+    };
+    let auth = build_nip98_auth_header(&Method::POST, &url, &body, &state)?;
     let response = state
         .http_client
         .post(&url)
         .header("Authorization", auth)
+        .body(body)
         .send()
         .await
         .map_err(|e| format!("could not reach the sandbox broker: {e}"))?;

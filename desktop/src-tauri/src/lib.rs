@@ -37,6 +37,7 @@ mod reset;
 mod sandbox_viewer;
 mod secret_store;
 mod shutdown;
+mod teach_task_stt;
 mod templates;
 mod terminal_runtime;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -580,6 +581,7 @@ pub fn run() {
             sandbox_viewer::sandbox_heartbeat,
             sandbox_viewer::sandbox_recording_start,
             sandbox_viewer::sandbox_recording_stop,
+            teach_task_stt::transcribe_teaching_audio,
             sandbox_viewer::sandbox_fs_list,
             sandbox_viewer::sandbox_fs_download,
             sandbox_viewer::sandbox_fs_upload,

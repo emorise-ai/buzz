@@ -69,8 +69,7 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
   const {
     teaching,
     finishing,
-    narration,
-    setNarration,
+    listening,
     startTeaching,
     cancelTeaching,
     doneTeaching,
@@ -206,8 +205,7 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
         />
         {teaching ? (
           <TeachTaskBanner
-            narration={narration}
-            onNarrationChange={setNarration}
+            listening={listening}
             onDone={() => void doneTeaching()}
             onCancel={() => void cancelTeaching()}
             busy={finishing}

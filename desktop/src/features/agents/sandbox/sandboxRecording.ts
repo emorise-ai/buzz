@@ -27,12 +27,20 @@ export async function startSandboxRecording(sandboxId: string): Promise<void> {
  * into a fetchable blob. The full descriptor (url + sha256 + mime + size) lets
  * the caller attach the clip as a real imeta media tag so it renders as a
  * playable video in the message, not a bare URL.
+ *
+ * `audio` is the "Teach a task" mic capture (WAV bytes) plus its extension.
+ * When provided, the broker bakes it into the mp4 as the video's audio track
+ * before handing the bytes back — same one round-trip, now with sound.
+ * Omitting it is the original silent-video behavior.
  */
 export async function stopSandboxRecording(
   sandboxId: string,
+  audio?: { bytes: Uint8Array; ext: string },
 ): Promise<BlobDescriptor> {
   const bytes = await invokeTauri<number[]>("sandbox_recording_stop", {
     sandboxId,
+    audio: audio ? Array.from(audio.bytes) : undefined,
+    audioExt: audio?.ext,
   });
   return uploadMediaBytes(bytes, "teach-task-recording.mp4");
 }

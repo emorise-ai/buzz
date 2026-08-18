@@ -1,25 +1,27 @@
-import { Circle, X } from "lucide-react";
+import { Circle, Mic, MicOff, X } from "lucide-react";
 
 import { Button } from "@/shared/ui/button";
-import { Textarea } from "@/shared/ui/textarea";
 
 /**
  * The overlay shown while a "Teach a task" recording is in progress —
  * a top bar over the stage so it never covers the screen the human is
  * demonstrating on. Purely presentational: `SandboxViewerDialog` owns the
- * recording lifecycle (start/stop broker calls, upload, and the message to
- * the agent) and passes down only what this banner needs to render and the
- * two exits (Done, Cancel).
+ * recording lifecycle (start/stop broker calls, mic capture, transcription,
+ * upload, and the message to the agent) and passes down only what this
+ * banner needs to render and the two exits (Done, Cancel).
+ *
+ * Narration is spoken, not typed — there's no text input here. `listening`
+ * reflects whether the mic tap is live; when the mic failed to start (denied
+ * permission, no device), the banner still shows so the human can finish the
+ * silent video recording instead of losing the whole flow.
  */
 export function TeachTaskBanner({
-  narration,
-  onNarrationChange,
+  listening,
   onDone,
   onCancel,
   busy,
 }: {
-  narration: string;
-  onNarrationChange: (value: string) => void;
+  listening: boolean;
   onDone: () => void;
   onCancel: () => void;
   busy: boolean;
@@ -36,14 +38,22 @@ export function TeachTaskBanner({
         </span>
       </div>
 
-      <Textarea
-        data-testid="teach-task-narration"
-        value={narration}
-        onChange={(e) => onNarrationChange(e.target.value)}
-        placeholder="Narrate what you're doing (optional)…"
-        disabled={busy}
-        className="min-h-14 text-sm"
-      />
+      <div
+        data-testid="teach-task-listening"
+        className="flex items-center gap-1.5 text-2xs text-muted-foreground"
+      >
+        {listening ? (
+          <>
+            <Mic className="h-3 w-3 shrink-0 animate-pulse text-red-500" />
+            <span>Listening — narrate as you demonstrate</span>
+          </>
+        ) : (
+          <>
+            <MicOff className="h-3 w-3 shrink-0" />
+            <span>No microphone — recording video only</span>
+          </>
+        )}
+      </div>
 
       <div className="flex items-center justify-end gap-2">
         <Button
