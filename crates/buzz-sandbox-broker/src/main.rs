@@ -1712,7 +1712,31 @@ async fn launch_app(
         return internal(e);
     }
 
-    (StatusCode::NO_CONTENT, ()).into_response()
+    // A body, not `NO_CONTENT`: every other mutating endpoint in this broker
+    // answers with JSON, and the CLI's `broker_call` always tries to parse
+    // the response body as JSON regardless of status code — an empty body
+    // here made a successful launch look like a client-side parse failure
+    // (`buzz sandbox open` reported an error even though the app opened).
+    (
+        StatusCode::OK,
+        Json(launch_success_body(&req.app, req.url.as_deref())),
+    )
+        .into_response()
+}
+
+/// The JSON body `launch_app` answers with once the app is actually running.
+///
+/// Pulled out as a pure function (mirroring `sandbox::launch_argv` and
+/// `sandbox::append_launch_url`) so the response shape is unit-testable
+/// without a live Docker daemon — every test in this module's `mod tests`
+/// runs against a dead Docker socket by design, so `launch_app` itself can
+/// never reach this line in a test.
+fn launch_success_body(app: &str, url: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "launched": true,
+        "app": app,
+        "url": url,
+    })
 }
 
 /// Inspect a sandbox by id, returning 404 (not the inspect error verbatim)
@@ -3010,6 +3034,32 @@ mod router_tests {
         let uri = "/sandboxes/abc123def456/screenshot";
         let resp = app.oneshot(forwarded_request("GET", uri)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Pins the fix for the CLI's `broker returned unparseable JSON: EOF
+    /// while parsing a value at line 1 column 0` — `launch_app`'s success
+    /// path must answer with a JSON body, never an empty one, because the
+    /// CLI's `broker_call` always tries to JSON-decode the response.
+    #[test]
+    fn launch_success_body_is_non_empty_json_with_the_launched_app() {
+        let body = launch_success_body("terminal", None);
+        assert_eq!(body["launched"], serde_json::json!(true));
+        assert_eq!(body["app"], serde_json::json!("terminal"));
+        assert_eq!(body["url"], serde_json::json!(null));
+        assert_ne!(
+            serde_json::to_string(&body).unwrap(),
+            "",
+            "an empty body is exactly what broke the CLI's JSON parse"
+        );
+    }
+
+    /// The browser case carries the launched `url` through to the response
+    /// too, not just `app`.
+    #[test]
+    fn launch_success_body_includes_the_browser_url() {
+        let body = launch_success_body("browser", Some("https://example.com"));
+        assert_eq!(body["app"], serde_json::json!("browser"));
+        assert_eq!(body["url"], serde_json::json!("https://example.com"));
     }
 
     #[tokio::test]
