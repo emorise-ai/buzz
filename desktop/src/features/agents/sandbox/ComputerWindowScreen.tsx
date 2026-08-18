@@ -1,8 +1,7 @@
 import * as React from "react";
-import { GraduationCap, Monitor } from "lucide-react";
+import { Monitor } from "lucide-react";
 import { toast } from "sonner";
 
-import { Button } from "@/shared/ui/button";
 import { useUserProfileQuery } from "@/features/profile/hooks";
 import { resolveProfileDisplayName } from "@/features/profile/ui/UserProfilePanelUtils";
 import { useNow } from "@/shared/lib/useNow";
@@ -12,7 +11,7 @@ import { mintViewerUrl } from "./mintViewerUrl";
 import { readComputerWindowHandoff } from "./computerWindow";
 import { SandboxStage } from "./SandboxStage";
 import { SandboxControlToggle } from "./SandboxControlToggle";
-import { TeachTaskBanner } from "./TeachTaskBanner";
+import { TeachTaskButton } from "./TeachTaskButton";
 import { useTeachTask } from "./useTeachTask";
 
 /** How long to wait for either the handoff params or the shared sandbox
@@ -69,7 +68,8 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
   const {
     teaching,
     finishing,
-    listening,
+    mode,
+    setMode,
     startTeaching,
     cancelTeaching,
     doneTeaching,
@@ -176,18 +176,15 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
           ) : null}
 
           {!expired && ownerPubkey ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              disabled={teaching}
-              data-testid="sandbox-teach-task"
-              onClick={() => void startTeaching()}
-              className="gap-1.5 text-2xs"
-            >
-              <GraduationCap className="h-3.5 w-3.5" />
-              Teach a task
-            </Button>
+            <TeachTaskButton
+              teaching={teaching}
+              finishing={finishing}
+              mode={mode}
+              setMode={setMode}
+              onStart={(startMode) => void startTeaching(startMode)}
+              onFinish={() => void doneTeaching()}
+              onCancel={() => void cancelTeaching()}
+            />
           ) : null}
         </div>
       </div>
@@ -203,14 +200,6 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
           userInControl={userInControl}
           onUserInControlChange={setUserInControl}
         />
-        {teaching ? (
-          <TeachTaskBanner
-            listening={listening}
-            onDone={() => void doneTeaching()}
-            onCancel={() => void cancelTeaching()}
-            busy={finishing}
-          />
-        ) : null}
       </div>
     </div>
   );

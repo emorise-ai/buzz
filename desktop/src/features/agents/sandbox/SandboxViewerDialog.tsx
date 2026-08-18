@@ -1,10 +1,5 @@
 import * as React from "react";
-import {
-  ExternalLink,
-  FolderInput,
-  GraduationCap,
-  Monitor,
-} from "lucide-react";
+import { ExternalLink, FolderInput, Monitor } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -18,7 +13,7 @@ import { Button } from "@/shared/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { SandboxControlToggle } from "./SandboxControlToggle";
 import { SandboxStage, type SandboxStageHandle } from "./SandboxStage";
-import { TeachTaskBanner } from "./TeachTaskBanner";
+import { TeachTaskButton } from "./TeachTaskButton";
 import { openComputerWindow } from "./openComputerWindow";
 import { useTeachTask } from "./useTeachTask";
 
@@ -79,7 +74,8 @@ export function SandboxViewerDialog({
   const {
     teaching,
     finishing,
-    listening,
+    mode,
+    setMode,
     startTeaching,
     cancelTeaching,
     doneTeaching,
@@ -157,18 +153,15 @@ export function SandboxViewerDialog({
             ) : null}
 
             {!expired ? (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={teaching}
-                data-testid="sandbox-teach-task"
-                onClick={() => void startTeaching()}
-                className="gap-1.5 text-2xs"
-              >
-                <GraduationCap className="h-3.5 w-3.5" />
-                Teach a task
-              </Button>
+              <TeachTaskButton
+                teaching={teaching}
+                finishing={finishing}
+                mode={mode}
+                setMode={setMode}
+                onStart={(startMode) => void startTeaching(startMode)}
+                onFinish={() => void doneTeaching()}
+                onCancel={() => void cancelTeaching()}
+              />
             ) : null}
 
             <Tooltip>
@@ -202,14 +195,6 @@ export function SandboxViewerDialog({
             userInControl={userInControl}
             onUserInControlChange={setUserInControl}
           />
-          {teaching ? (
-            <TeachTaskBanner
-              listening={listening}
-              onDone={() => void doneTeaching()}
-              onCancel={() => void cancelTeaching()}
-              busy={finishing}
-            />
-          ) : null}
         </div>
       </DialogContent>
     </Dialog>

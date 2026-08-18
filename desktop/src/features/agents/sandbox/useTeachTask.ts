@@ -14,6 +14,11 @@ import {
   transcribeTeachingAudio,
   type TeachTaskMicHandle,
 } from "./teachTaskMic";
+import {
+  setTeachTaskMode,
+  useTeachTaskMode,
+  type TeachTaskMode,
+} from "./teachTaskModePreference";
 
 /**
  * "Teach a task" hands the human the screen, records it via the broker's
@@ -28,6 +33,10 @@ import {
  * Extracted verbatim from `SandboxViewerDialog` (no behavior change) so the
  * fullscreen dialog and the pop-out native window share one teaching flow
  * instead of two copies drifting apart.
+ *
+ * Recording mode ("Audio + Video" vs "Video only") is a persisted preference
+ * (`teachTaskModePreference`), not per-call state — the human picks it once
+ * from the button's dropdown and it's remembered as the default next time.
  */
 export function useTeachTask({
   sandboxId,
@@ -41,6 +50,7 @@ export function useTeachTask({
   const [teaching, setTeaching] = React.useState(false);
   const [finishing, setFinishing] = React.useState(false);
   const [listening, setListening] = React.useState(false);
+  const mode = useTeachTaskMode();
   const micRef = React.useRef<TeachTaskMicHandle | null>(null);
   // True whenever a sandbox recording is running (ffmpeg live inside the
   // sandbox). A ref, not state, so the unmount cleanup below reads the latest
@@ -88,7 +98,7 @@ export function useTeachTask({
     setListening(false);
   }, [sandboxId]);
 
-  async function startTeaching() {
+  async function startTeaching(startMode: TeachTaskMode) {
     setUserInControl(true);
     setTeaching(true);
     try {
@@ -104,19 +114,25 @@ export function useTeachTask({
       setTeaching(false);
       return;
     }
-    // Mic capture is best-effort: a denied/unavailable mic shouldn't block
-    // the screen recording the human explicitly asked for — they just won't
-    // get a transcript alongside it.
-    try {
-      micRef.current = await startTeachingMic();
-      setListening(true);
-    } catch (err) {
-      console.error("[useTeachTask] mic capture failed to start:", err);
-      toast.error(
-        "Could not access the microphone — recording video only, no narration.",
+    if (startMode === "audio-video") {
+      // Mic capture is best-effort: a denied/unavailable mic shouldn't block
+      // the screen recording the human explicitly asked for — they just
+      // won't get a transcript alongside it.
+      try {
+        micRef.current = await startTeachingMic();
+        setListening(true);
+      } catch (err) {
+        console.error("[useTeachTask] mic capture failed to start:", err);
+        toast.error(
+          "Could not access the microphone — recording video only, no narration.",
+        );
+      }
+      toast.info(
+        "Recording — narrate the task out loud, click again when done.",
       );
+    } else {
+      toast.info("Recording video — click again when done.");
     }
-    toast.info("Recording — narrate the task out loud, then click Done.");
   }
 
   async function cancelTeaching() {
@@ -215,6 +231,8 @@ export function useTeachTask({
     teaching,
     finishing,
     listening,
+    mode,
+    setMode: setTeachTaskMode,
     startTeaching,
     cancelTeaching,
     doneTeaching,
