@@ -22,11 +22,11 @@ import { openComputerWindow } from "./openComputerWindow";
 
 /**
  * The agent's workspace: one live screen, the real-desktop metaphor all the
- * way through. There is no flat Files/Terminal panel to switch to anymore —
- * the dock's Browser/Files/Terminal icons open real windows on the
- * sandbox's own desktop (see `sandboxLaunch.ts`), which appear right there
- * in the stream, draggable like any other window. Computer is just "look at
- * the desktop" — the always-visible stage itself, not a separate view.
+ * way through. There is no flat Files/Terminal panel to switch to — the
+ * desktop's own native dock (tint2, running inside the sandbox — see
+ * Dockerfile.sprig-desktop) opens real windows on the sandbox's own
+ * desktop, which appear right there in the stream, draggable like any
+ * other window. This dialog no longer draws any dock chrome of its own.
  *
  * The one thing the in-desktop file manager can't do — move files between
  * this Mac and the sandbox — lives behind "Transfer files" in the top bar,

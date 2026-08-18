@@ -584,8 +584,6 @@ pub fn run() {
             sandbox_viewer::sandbox_fs_rename,
             sandbox_viewer::sandbox_fs_delete,
             sandbox_viewer::sandbox_launch_app,
-            sandbox_viewer::sandbox_list_windows,
-            sandbox_viewer::sandbox_window_action,
             sandbox_viewer::open_computer_window,
             take_pending_community_deep_link,
             acknowledge_pending_community_deep_link,

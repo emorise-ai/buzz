@@ -1,13 +1,8 @@
 import * as React from "react";
 import { Monitor, X } from "lucide-react";
-import { toast } from "sonner";
 
-import { SandboxDock } from "./SandboxDock";
 import { SandboxFilesView } from "./SandboxFilesView";
-import { type LaunchableApp, launchSandboxApp } from "./sandboxLaunch";
 import { sandboxHeartbeat, shouldSendHeartbeat } from "./sandboxHeartbeat";
-import { actOnSandboxWindow, type SandboxWindow } from "./sandboxWindows";
-import { useSandboxWindows } from "./useSandboxWindows";
 import { useContainedAspectBox } from "./useContainedAspectBox";
 
 /** The sandbox screen is a fixed 1920x1080 remote desktop. */
@@ -25,10 +20,13 @@ export type SandboxStageHandle = {
 };
 
 /**
- * The live view of an agent's computer: one screen (iframe), the dock
- * (Browser/Files/Terminal launchers + open-window taskbar), the
+ * The live view of an agent's computer: one screen (iframe), the
  * control-toggle overlay, and the "Transfer files" overlay, aspect-fit to
- * whatever container it's placed in.
+ * whatever container it's placed in. The dock (launcher + taskbar) is no
+ * longer drawn here — it runs natively inside the streamed desktop itself
+ * (tint2, see Dockerfile.sprig-desktop), so it scales with the stream's
+ * real resolution instead of being an app-level overlay sized for one
+ * container.
  *
  * Extracted verbatim from `SandboxViewerDialog` (no behavior change) so the
  * fullscreen dialog, the sidebar preview panel, and the pop-out native
@@ -48,14 +46,9 @@ export const SandboxStage = React.forwardRef<
     agentDisplayName: string | null;
     remaining: string | null;
     expired: boolean;
-    /** Whether this surface is currently visible/mounted-live — gates the
-     *  open-windows poll. Defaults true. */
+    /** Whether this surface is currently visible/mounted-live. Defaults
+     *  true. */
     active?: boolean;
-    /** Narrow-container mode — the sidebar preview panel, as opposed to the
-     *  fullscreen dialog or pop-out window. Shrinks the dock and drops
-     *  taskbar text labels so it fits a ~300px-wide panel instead of
-     *  overflowing it. Defaults false. */
-    compact?: boolean;
     userInControl: boolean;
     onUserInControlChange: (userInControl: boolean) => void;
   }
@@ -66,13 +59,11 @@ export const SandboxStage = React.forwardRef<
     agentDisplayName,
     expired,
     active = true,
-    compact = false,
     userInControl,
     onUserInControlChange,
   },
   ref,
 ) {
-  const [launching, setLaunching] = React.useState<LaunchableApp | null>(null);
   const [transferOpen, setTransferOpen] = React.useState(false);
   // State-backed callback ref: the stage element mounts only when the host
   // surface appears, so the measuring hook must re-run when it appears.
@@ -86,11 +77,6 @@ export const SandboxStage = React.forwardRef<
       openTransfer: () => setTransferOpen(true),
     }),
     [],
-  );
-
-  const { windows, refresh: refreshWindows } = useSandboxWindows(
-    sandboxId,
-    active && !expired,
   );
 
   // Passive-watching keepalive: while this stage is mounted, visible, and
@@ -115,38 +101,6 @@ export const SandboxStage = React.forwardRef<
     const interval = window.setInterval(tick, HEARTBEAT_INTERVAL_MS);
     return () => window.clearInterval(interval);
   }, [sandboxId, active, expired]);
-
-  async function handleWindowClick(w: SandboxWindow) {
-    // Using the taskbar is using the computer, same as launching an app.
-    onUserInControlChange(true);
-    try {
-      await actOnSandboxWindow(
-        sandboxId,
-        w.id,
-        w.active ? "minimize" : "activate",
-      );
-    } catch {
-      // The window may have closed between poll and click — the refresh
-      // below drops it from the taskbar; nothing to tell the user.
-    }
-    refreshWindows();
-  }
-
-  async function handleLaunch(app: LaunchableApp) {
-    if (launching) return;
-    setLaunching(app);
-    try {
-      await launchSandboxApp(sandboxId, app);
-      // A launch is a request to use the window right away.
-      onUserInControlChange(true);
-    } catch (err) {
-      toast.error(
-        err instanceof Error ? err.message : `Could not open ${app}.`,
-      );
-    } finally {
-      setLaunching(null);
-    }
-  }
 
   const title = agentDisplayName
     ? `${agentDisplayName}'s computer`
@@ -201,24 +155,11 @@ export const SandboxStage = React.forwardRef<
             />
           ) : null}
 
-          {/* The dock overlays the bottom edge of the screen itself, so it
-              reads as the computer's own dock sitting on the desktop — not a
-              strip of external controls floating under a VNC window. It
-              renders after the take-over overlay, so it stays clickable in
-              both control states. */}
-          <div className="pointer-events-none absolute inset-x-0 bottom-2 z-10 flex justify-center [&>*]:pointer-events-auto">
-            <SandboxDock
-              launching={launching}
-              onLaunch={handleLaunch}
-              windows={windows}
-              onWindowClick={handleWindowClick}
-              compact={compact}
-            />
-          </div>
-
           {/* "Transfer files" overlay: moving files between this Mac and the
               sandbox is the one thing the in-desktop file manager can't do,
-              so it lives here instead of on the dock. */}
+              so it lives here instead of on the dock (the dock itself now
+              runs natively inside the streamed desktop — see the module
+              doc comment above). */}
           {transferOpen ? (
             <div className="absolute inset-0 flex flex-col bg-background">
               <div className="flex items-center justify-between border-b border-border px-4 py-2.5">

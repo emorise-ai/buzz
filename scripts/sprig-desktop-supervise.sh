@@ -78,17 +78,29 @@ fi
 # desktop, and points at the BuzzDark theme (flat, dark — see
 # scripts/sprig-desktop-theme/) instead of openbox's stock beveled look.
 #
-# New windows are launched via the root-window right-click menu (also in
-# rc.xml) — 4 entries, styled by the same theme. An earlier version of this
-# image ran a tint2 dock for this instead; removed, because it rendered as
-# a second dock sitting directly on top of the app's own dock/UI chrome —
-# one dock too many on screen at once.
+# New windows can also be launched via the root-window right-click menu
+# (also in rc.xml) — 4 entries, styled by the same theme — but the primary
+# launcher is the tint2 dock started below.
 openbox >/tmp/openbox.log 2>&1 &
 
-# (No in-container taskbar: a tint2 top bar was tried for window switching
-# and replaced the same day — the window list lives in the app's own dock
-# overlay instead, fed by the broker's /windows endpoint, so the desktop
-# stays chrome-free and the dock is the one place to see and reach windows.)
+# --- dock -----------------------------------------------------------------
+# tint2: a native, in-screen dock — bottom-centered launcher (the 3 apps'
+# real .desktop files, so their real icons show) plus a taskbar reading the
+# window manager's own EWMH window list directly (no broker round trip, no
+# polling from the app). Started after openbox so its EWMH/_NET_* properties
+# already exist for tint2 to read; before picom so the compositor's
+# window-type exclusion rule (see sprig-desktop-picom.conf) has a real dock
+# window to match against by the time it starts watching for damage events.
+# Config (~/.config/tint2/tint2rc, from sprig-desktop-tint2rc) is set to
+# NOT reserve screen space (strut_policy = none) — see that file's header
+# for why: Chromium/Thunar/terminal's positions below are hand-tuned for a
+# strut-free 1920x1080 screen, and a space-reserving panel would shift them.
+if command -v tint2 >/dev/null 2>&1; then
+    tint2 >/tmp/tint2.log 2>&1 &
+    log "dock started (tint2)"
+else
+    log "tint2 not installed; no dock — use the root-window right-click menu"
+fi
 
 # --- compositor -----------------------------------------------------------
 # picom adds soft drop shadows on windows and a gentle fade-in on open — the

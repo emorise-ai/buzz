@@ -299,8 +299,6 @@ fn build_router(state: AppState) -> Router {
         // view, so multiple terminals/file windows can coexist and the
         // window manager handles drag/arrange.
         .route("/sandboxes/{id}/launch", post(launch_app))
-        .route("/sandboxes/{id}/windows", get(windows_list))
-        .route("/sandboxes/{id}/windows/action", post(window_action))
         // Computer-use surface: run a command, see the screen, click/type.
         // Same NIP-98 + owner-only pattern as `/extend` — these act on the
         // sandbox as its own owner, not as an unprivileged viewer.
@@ -1280,12 +1278,6 @@ struct LaunchRequest {
     url: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
-struct WindowActionRequest {
-    window: String,
-    action: String,
-}
-
 /// Authorize an fs-API call and validate its `path`, in that order — the
 /// signature check is local and must run before anything path-shaped is
 /// interpreted, and the path policy applies regardless of *who* is calling
@@ -2102,153 +2094,6 @@ async fn heartbeat(
         return response;
     }
     (StatusCode::OK, ()).into_response()
-}
-
-/// List the open windows on the sandbox's desktop, for the dock's taskbar
-/// segment: the window manager's own EWMH client list (`_NET_CLIENT_LIST`,
-/// exactly what an in-desktop taskbar would show), each with its title and
-/// whether it is the active window. The script is a fixed string — nothing
-/// caller-supplied reaches the exec.
-async fn windows_list(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Path(id): Path<String>,
-) -> axum::response::Response {
-    if !is_safe_id(&id) {
-        return bad_request("malformed sandbox id");
-    }
-    if let Err(response) = authorize(
-        &state,
-        &headers,
-        "GET",
-        &format!("/sandboxes/{id}/windows"),
-        b"",
-    )
-    .await
-    {
-        return response;
-    }
-
-    const LIST_SCRIPT: &str = r#"
-list=$(xprop -root -notype _NET_CLIENT_LIST 2>/dev/null | sed 's/.*# *//; s/,/ /g')
-active=$(xprop -root -notype _NET_ACTIVE_WINDOW 2>/dev/null | sed 's/.*# *//; s/,.*//')
-for w in $list; do
-  # Panels/docks are furniture, not windows a taskbar should list.
-  xprop -id "$w" -notype _NET_WM_WINDOW_TYPE 2>/dev/null | grep -q _NET_WM_WINDOW_TYPE_DOCK && continue
-  name=$(xdotool getwindowname "$w" 2>/dev/null) || continue
-  # WM_CLASS = "instance", "Class" — take the class (last field): the
-  # instance can embed launch details (chromium appends its profile dir).
-  class=$(xprop -id "$w" -notype WM_CLASS 2>/dev/null | sed 's/.*, *//; s/"//g')
-  if [ "$w" = "$active" ]; then a=1; else a=0; fi
-  printf '%s\t%s\t%s\t%s\n' "$w" "$a" "$class" "$name"
-done
-"#;
-    let env = ["DISPLAY=:1".to_string(), "HOME=/home/agent".to_string()];
-    let (exit_code, output) = match state
-        .docker
-        .exec_with_env(&id, &["sh", "-c", LIST_SCRIPT], FS_EXEC_USER, &env)
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => return internal(e),
-    };
-    if exit_code != 0 {
-        return internal(format!(
-            "window listing failed: {}",
-            String::from_utf8_lossy(&output).trim()
-        ));
-    }
-
-    let mut windows = Vec::new();
-    for line in String::from_utf8_lossy(&output).lines() {
-        // Title comes last: it is the one field that may itself contain tabs.
-        let mut parts = line.splitn(4, '\t');
-        let (Some(wid), Some(active), Some(class), Some(title)) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            continue;
-        };
-        if sandbox::validate_window_id(wid).is_err() {
-            continue;
-        }
-        windows.push(serde_json::json!({
-            "id": wid,
-            "title": title,
-            "class": class,
-            "active": active == "1",
-        }));
-    }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "windows": windows })),
-    )
-        .into_response()
-}
-
-/// Act on one desktop window (activate / minimize / close) — the dock's
-/// taskbar clicks. The action name resolves to a fixed argv
-/// ([`sandbox::window_action_argv`]) and the validated window id travels in
-/// the `BUZZ_WINDOW` environment variable, mirroring the fs API's
-/// path-in-env pattern so no caller string is ever interpolated into a
-/// command.
-async fn window_action(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Path(id): Path<String>,
-    body: axum::body::Bytes,
-) -> axum::response::Response {
-    if !is_safe_id(&id) {
-        return bad_request("malformed sandbox id");
-    }
-    if let Err(response) = authorize(
-        &state,
-        &headers,
-        "POST",
-        &format!("/sandboxes/{id}/windows/action"),
-        &body,
-    )
-    .await
-    {
-        return response;
-    }
-    let req: WindowActionRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(e) => return bad_request(format!("invalid request body: {e}")),
-    };
-    if let Err(e) = sandbox::validate_window_id(&req.window) {
-        return bad_request(e);
-    }
-    let argv = match sandbox::window_action_argv(&req.action) {
-        Ok(argv) => argv,
-        Err(e) => return bad_request(e),
-    };
-
-    let env = [
-        "DISPLAY=:1".to_string(),
-        "HOME=/home/agent".to_string(),
-        format!("BUZZ_WINDOW={}", req.window),
-    ];
-    let (exit_code, output) = match state
-        .docker
-        .exec_with_env(&id, argv, FS_EXEC_USER, &env)
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => return internal(e),
-    };
-    if exit_code != 0 {
-        // xdotool exits nonzero when the window is already gone — a race
-        // every taskbar has; tell the caller so it can just refresh.
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "no such window"})),
-        )
-            .into_response();
-    }
-    let _ = output;
-
-    (StatusCode::NO_CONTENT, ()).into_response()
 }
 
 /// The brand-free sandbox viewer: a full-bleed live screen, nothing else.

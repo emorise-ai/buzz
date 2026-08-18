@@ -639,60 +639,6 @@ pub fn append_launch_url<'a>(argv: &[&'a str], url: Option<&'a str>) -> Vec<&'a 
     full
 }
 
-/// The actions the window endpoint may perform on a desktop window, each a
-/// fixed argv — the caller-supplied window id travels in the `BUZZ_WINDOW`
-/// environment variable (validated by [`validate_window_id`] first), never
-/// interpolated into the script text, mirroring how the fs API hands paths
-/// to in-container scripts.
-pub const WINDOW_ACTIONS: &[(&str, &[&str])] = &[
-    (
-        "activate",
-        &["sh", "-c", "exec xdotool windowactivate \"$BUZZ_WINDOW\""],
-    ),
-    (
-        "minimize",
-        &["sh", "-c", "exec xdotool windowminimize \"$BUZZ_WINDOW\""],
-    ),
-    (
-        "close",
-        &["sh", "-c", "exec xdotool windowclose \"$BUZZ_WINDOW\""],
-    ),
-];
-
-/// Resolve a window request's `action` name to its fixed argv, or reject it.
-pub fn window_action_argv(action: &str) -> Result<&'static [&'static str], String> {
-    WINDOW_ACTIONS
-        .iter()
-        .find(|(name, _)| *name == action)
-        .map(|(_, argv)| *argv)
-        .ok_or_else(|| {
-            let allowed: Vec<&str> = WINDOW_ACTIONS.iter().map(|(name, _)| *name).collect();
-            format!("unknown action {action:?}; allowed: {}", allowed.join(", "))
-        })
-}
-
-/// Validate an X11 window id before it is handed to an in-container exec:
-/// `0x`-prefixed hex or plain decimal, nothing else — a window id is the
-/// only caller-controlled value the window endpoints forward, and this keeps
-/// every accepted form inert in the `BUZZ_WINDOW` environment variable.
-pub fn validate_window_id(window: &str) -> Result<(), String> {
-    let digits = window.strip_prefix("0x").unwrap_or(window);
-    let is_hex = window.starts_with("0x");
-    if digits.is_empty()
-        || digits.len() > 16
-        || !digits.bytes().all(|b| {
-            if is_hex {
-                b.is_ascii_hexdigit()
-            } else {
-                b.is_ascii_digit()
-            }
-        })
-    {
-        return Err("malformed window id".to_string());
-    }
-    Ok(())
-}
-
 /// May `caller` act on a sandbox as its owner or manager?
 ///
 /// Pure decision, factored out of `require_owner_or_manager` (main.rs) so it
@@ -1131,42 +1077,6 @@ mod tests {
             );
             assert!(err.contains("files"));
             assert!(err.contains("terminal"));
-        }
-    }
-
-    #[test]
-    fn window_action_argv_resolves_each_allowlisted_action_and_rejects_the_rest() {
-        for (name, _) in WINDOW_ACTIONS {
-            let argv = window_action_argv(name).unwrap();
-            // The window id must reach the command only via the environment
-            // variable — never as a literal argv slot a caller could fill.
-            assert!(argv.iter().any(|a| a.contains("$BUZZ_WINDOW")));
-        }
-        for bad in ["", "activate ", "Activate", "kill", "; reboot"] {
-            let err = window_action_argv(bad).unwrap_err();
-            assert!(
-                err.contains("activate") && err.contains("minimize") && err.contains("close"),
-                "error should list allowed actions: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn window_ids_accept_x11_forms_and_refuse_anything_shell_meaningful() {
-        for good in ["0x04000007", "0xdeadBEEF", "67108871", "1"] {
-            assert!(validate_window_id(good).is_ok(), "{good} should pass");
-        }
-        for bad in [
-            "",
-            "0x",
-            "-1",
-            "0x04000007; rm -rf /",
-            "$(reboot)",
-            "0x04 07",
-            "abc",
-            "0x11223344556677889900", // longer than any real X id
-        ] {
-            assert!(validate_window_id(bad).is_err(), "{bad:?} should fail");
         }
     }
 

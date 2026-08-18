@@ -28,6 +28,7 @@
 #   thunar      GUI file manager (opens /workspace) — GTK3, pairs with xfce4
 #   xfce4-term. GUI terminal, themed dark, separate from ttyd (see below)
 #   picom       compositor — soft window shadows and fade-in, nothing else
+#   tint2       native dock — launcher + taskbar, drawn inside the X display
 #
 # Everything is a Debian package except ttyd, which Debian does not package —
 # it is pinned by checksum below as a static binary straight from upstream.
@@ -47,12 +48,22 @@
 # window chrome from clashing with Yaru's signature purple-grey, real
 # fonts (Inter for UI, JetBrains Mono for code), and the navy-teal
 # wallpaper is kept as-is (not Ubuntu branding — that part stays ours).
-# New windows are launched from the root-window right-click menu (styled
-# by BuzzDark, see openbox-rc.xml) — a prior version of this image ran a
-# tint2 dock for that, removed because it rendered as a second dock on top
-# of the app's own dock/UI chrome. A tint2 top-edge taskbar was also tried
-# and replaced the same day: the open-window list is shown by the app's own
-# dock overlay instead, fed by the broker's /windows endpoint.
+# New windows can still be launched from the root-window right-click menu
+# (styled by BuzzDark, see openbox-rc.xml), but the primary launcher is now
+# a tint2 dock (sprig-desktop-tint2rc) docked at the bottom of the screen.
+# tint2 was in this image once before and got pulled — not because it was
+# broken, but because it was redundant with an app-level (React) overlay
+# dock drawn on top of the screen iframe, so the human saw two docks at
+# once. That overlay dock is gone now (its icons and taskbar polling lived
+# entirely in desktop/, fed by the broker's /windows endpoint, which is
+# gone too), so tint2 is back as the ONE dock, native to the desktop itself:
+# it scales with the stream's real resolution (proportional in a sidebar
+# preview the same as fullscreen, which a screen-space overlay never was),
+# and its launcher reads real .desktop files, so any app dropped into this
+# image shows up with its actual icon instead of needing a hand-drawn one
+# added to the app's dock code. See sprig-desktop-tint2rc for the panel
+# config and how it avoids reserving screen space (_NET_WM_STRUT) that
+# would shift Chromium/Thunar/terminal's hand-tuned positions below.
 #
 # Two terminals exist for two different jobs: ttyd is the one the broker's
 # web viewer and the agent's own shell access go through (no GUI needed,
@@ -100,6 +111,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       procps \
       scrot \
       thunar \
+      tint2 \
       websockify \
       x11-utils \
       x11-xserver-utils \
@@ -144,6 +156,7 @@ RUN install -d -o agent -g agent \
       /home/agent/.config/gtk-3.0 \
       /home/agent/.config/fontconfig \
       /home/agent/.config/xfce4/terminal \
+      /home/agent/.config/tint2 \
       /home/agent/.local/share/applications \
       /home/agent/.themes/BuzzDark \
       /home/agent/.vnc \
@@ -162,6 +175,7 @@ COPY --chown=agent:agent scripts/sprig-desktop-gtkrc-2.0 /home/agent/.gtkrc-2.0
 COPY --chown=agent:agent scripts/sprig-desktop-fontconfig.conf /home/agent/.config/fontconfig/fonts.conf
 COPY --chown=agent:agent scripts/sprig-desktop-picom.conf /home/agent/.config/picom.conf
 COPY --chown=agent:agent scripts/sprig-desktop-terminalrc /home/agent/.config/xfce4/terminal/terminalrc
+COPY --chown=agent:agent scripts/sprig-desktop-tint2rc /home/agent/.config/tint2/tint2rc
 
 USER agent
 WORKDIR /home/agent

@@ -179,7 +179,6 @@ export function ComputerPreviewPanel({
             agentDisplayName={agentDisplayName}
             remaining={remaining}
             expired={expired}
-            compact
             userInControl={userInControl}
             onUserInControlChange={setUserInControl}
           />

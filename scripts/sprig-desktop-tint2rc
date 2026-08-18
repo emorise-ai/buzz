@@ -1,0 +1,165 @@
+# tint2 config for the agent's desktop — a real, native, in-screen dock.
+#
+# This replaces the app-level (React) floating dock: the dock now lives
+# INSIDE the streamed desktop, drawn by the X server at the sandbox's native
+# resolution, so it is proportional in a 300px sidebar preview exactly the
+# way it is in a fullscreen viewer — no more hardcoded pixel sizing fighting
+# an iframe's scale factor. It also means "any installed app" (not just the
+# 3 the old React dock knew about) shows up with its real icon, because
+# tint2's launcher reads real .desktop files and icon theme, and its taskbar
+# reads the window manager's own EWMH state directly (no broker round trip).
+#
+# STRUT / POSITIONING — the constraint that shaped every other choice here:
+# supervise.sh centers Chromium at 1700x950 on a 1920x1080 screen
+# (position 110,65), which leaves a 65px strip of bare wallpaper below it
+# (y=1015..1080) and above it (y=0..65) by construction — see the comment
+# above the buzz-browser invocation in sprig-desktop-supervise.sh for the
+# exact math. Thunar and xfce4-terminal's spawn positions (openbox-rc.xml)
+# stay well inside that same window band. A tint2 PANEL that reserves screen
+# space via _NET_WM_STRUT would shrink the area openbox hands out for
+# maximize/fullscreen and could clip those hand-placed windows.
+# `strut_policy = none` below is the opt-out: tint2 still draws the panel
+# and still receives clicks, it just never tells the window manager to
+# shrink the usable desktop for it. The panel is sized and margined to fit
+# inside the existing 65px bottom strip instead of relying on a strut to
+# make room, so nothing else on screen has to move.
+#
+# Visual goal: read as a real OS dock (macOS/GNOME-style) — a small rounded,
+# softly translucent pill centered at the bottom, icons at a fraction of the
+# panel height with generous padding — themed with the same neutral dark
+# greys as openbox's BuzzDark titlebar (see
+# ../scripts/sprig-desktop-theme/openbox-3/themerc) so it reads as part of
+# the same desktop, not a second, differently-themed dock bolted on.
+#
+# tint2's config format: top-level `key = value` pairs, plus a handful of
+# `background_id = N` / `gradient_id = N` blocks that each open with their
+# own header line and are filled in by the `background_color` /
+# `border_color` / `rounded` keys that immediately follow, up to the next
+# background_id (or end of file). Items reference a background by number
+# via *_background_id keys (e.g. `task_background_id = 2`).
+
+# === Panel ====================================================================
+panel_items = LT
+panel_size = 62% 60
+panel_margin = 0 6
+panel_padding = 10 6 10
+panel_position = bottom center horizontal
+# tint2's stacking-order layer — always drawn above normal windows so the
+# dock is never hidden behind Chromium. This is NOT a strut/space
+# reservation; strut_policy (below) is what controls that, and it is off.
+panel_layer = top
+panel_dock = 0
+panel_pivot_struts = 0
+panel_monitor = all
+panel_shrink = 0
+autohide = 0
+strut_policy = none
+font_shadow = 0
+mouse_effects = 1
+disable_transparency = 0
+mouse_hover_icon_asb = 100 0 10
+mouse_pressed_icon_asb = 100 0 -10
+
+# Panel background (id 1): rounded, softly translucent pill in the same
+# neutral greys as BuzzDark's menu chrome (#232323 fill, #3a3a3a border —
+# see openbox-3/themerc) so the dock doesn't clash with the rest of the
+# desktop's window chrome.
+background_id = 1
+rounded = 16
+border_width = 1
+border_color = #3a3a3a 90
+background_color = #232323 82
+panel_background_id = 1
+
+# === Taskbar ===================================================================
+# Window switching, fed straight from the X server's own EWMH state — this
+# is what used to require polling the broker's /windows endpoint from React.
+# Single desktop (openbox-rc.xml sets <number>1</number>), so no pager/
+# desktop-name clutter applies here.
+taskbar_mode = single_desktop
+taskbar_padding = 6 2 4
+taskbar_background_id = 0
+taskbar_active_background_id = 0
+taskbar_name = 0
+taskbar_hide_if_empty = 1
+taskbar_sort_order = lru
+
+task_icon = 1
+task_text = 0
+task_thumbnail = 0
+task_font_tooltip = 0
+task_maximum_size = 40 40
+task_padding = 4 4 4
+task_tooltip = 1
+task_centered = 1
+task_align = center
+task_background_id = 2
+task_active_background_id = 3
+task_urgent_background_id = 3
+task_iconified_background_id = 2
+task_font = Inter 9
+task_font_color = #e8e8e8 100
+task_active_font_color = #ffffff 100
+
+# Task chip background (id 2): near-invisible until hovered — a taskbar
+# entry isn't a button-like tile the way a launcher is, it's a live window
+# indicator, so it stays flush with the panel except on interaction.
+background_id = 2
+rounded = 10
+border_width = 0
+background_color = #ffffff 0
+background_color_hover = #ffffff 14
+background_color_pressed = #ffffff 22
+
+# Active-task background (id 3): a soft highlight pill, the same visual
+# language macOS/GNOME use for "this window is focused."
+background_id = 3
+rounded = 10
+border_width = 0
+background_color = #ffffff 20
+background_color_hover = #ffffff 26
+background_color_pressed = #ffffff 32
+
+# === Separator =================================================================
+separator_style = dots
+separator_color = #ffffff 30
+separator_size = 1
+separator_background_id = 0
+
+# === Launcher ===================================================================
+# Points at the real .desktop files already shipped in this image (Debian's
+# chromium/thunar/xfce4-terminal packages install these to
+# /usr/share/applications/ — nothing here needs a new icon package; the Yaru
+# icon theme installed via yaru-theme-icon covers all three) so each
+# launcher tile gets its actual app icon, not a hand-drawn stand-in — the
+# point of moving off the React dock's 3 hardcoded SVGs onto a real desktop
+# launcher that would show any future .desktop file dropped into the image
+# too.
+launcher_padding = 6 4 8
+launcher_background_id = 0
+launcher_icon_theme = Yaru
+launcher_icon_size = 40
+launcher_icon_asb = 100 0 0
+launcher_icon_theme_override = 0
+launcher_item_app = /usr/share/applications/chromium.desktop
+launcher_item_app = /usr/share/applications/thunar.desktop
+launcher_item_app = /usr/share/applications/xfce4-terminal.desktop
+
+# === Clock (skipped) ===========================================================
+# No clock — this is an agent's computer, not a human's daily-driver
+# desktop, and the taskbar/launcher already fill the panel's intended role.
+time1_format =
+
+# === Tooltip ====================================================================
+tooltip_show_timeout = 0.4
+tooltip_hide_timeout = 0.1
+tooltip_padding = 6 4
+tooltip_font = Inter 9
+tooltip_font_color = #e8e8e8 100
+tooltip_background_id = 4
+
+background_id = 4
+rounded = 8
+border_width = 1
+border_color = #3a3a3a 90
+background_color = #1a1a1a 92

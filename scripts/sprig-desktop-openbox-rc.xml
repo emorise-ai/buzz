@@ -7,15 +7,16 @@
   draggable windows (browser, file manager, terminal), a way to launch
   them — not a stock Linux window manager. Desktop-switching keybinds stay
   disabled (there is only one desktop, nothing to switch to). The
-  root-window right-click menu, previously disabled, is back — but rebuilt
+  root-window right-click menu, previously disabled, is back — rebuilt
   from scratch as a minimal styled launcher (exactly 4 entries, no
   Debian/Reconfigure/Exit clutter openbox ships by default; see
-  sprig-desktop-menu.xml, referenced below via <menu><file>) instead of
-  removed outright: a tint2 dock tried to fill this role and ended up
-  looking like a second, redundant dock sitting on top of the app's own
-  UI. The launcher points at the BuzzDark theme (sprig-desktop-theme/,
-  installed to ~/.themes/BuzzDark) so window chrome and the menu itself
-  are flat and dark instead of openbox's stock 1990s beveled look.
+  sprig-desktop-menu.xml, referenced below via <menu><file>) — as a
+  secondary way to open a window alongside the primary one: the tint2
+  dock (sprig-desktop-tint2rc, started by supervise.sh) now docked at the
+  bottom of the screen. The launcher points at the BuzzDark theme
+  (sprig-desktop-theme/, installed to ~/.themes/BuzzDark) so window chrome
+  and the menu itself are flat and dark instead of openbox's stock 1990s
+  beveled look.
 
   Chromium used to be forced fullscreen/undecorated here. Reverted: full
   reasoning in sprig-desktop-supervise.sh above the chromium launch — the
