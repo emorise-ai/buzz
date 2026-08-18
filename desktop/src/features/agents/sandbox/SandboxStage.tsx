@@ -45,6 +45,11 @@ export const SandboxStage = React.forwardRef<
     /** Whether this surface is currently visible/mounted-live — gates the
      *  open-windows poll. Defaults true. */
     active?: boolean;
+    /** Narrow-container mode — the sidebar preview panel, as opposed to the
+     *  fullscreen dialog or pop-out window. Shrinks the dock and drops
+     *  taskbar text labels so it fits a ~300px-wide panel instead of
+     *  overflowing it. Defaults false. */
+    compact?: boolean;
     userInControl: boolean;
     onUserInControlChange: (userInControl: boolean) => void;
   }
@@ -55,6 +60,7 @@ export const SandboxStage = React.forwardRef<
     agentDisplayName,
     expired,
     active = true,
+    compact = false,
     userInControl,
     onUserInControlChange,
   },
@@ -177,6 +183,7 @@ export const SandboxStage = React.forwardRef<
               onLaunch={handleLaunch}
               windows={windows}
               onWindowClick={handleWindowClick}
+              compact={compact}
             />
           </div>
 

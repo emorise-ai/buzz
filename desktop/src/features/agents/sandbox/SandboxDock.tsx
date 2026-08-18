@@ -73,12 +73,18 @@ function groupWindows(windows: SandboxWindow[]): WindowGroup[] {
  * Real app-style icons (see `sandboxDockIcons.tsx`) sit on a translucent
  * blurred pill detached from the stage, so it reads as a dock floating over
  * the screen rather than a full-width toolbar strip.
+ *
+ * `compact` shrinks the icons and drops the taskbar's text labels (icons and
+ * counts only) for the sidebar preview panel, which is roughly 300px wide —
+ * the full-size dock's labeled taskbar chips overflow that width. The
+ * fullscreen dialog and pop-out window keep the full-size dock.
  */
 export function SandboxDock({
   launching,
   onLaunch,
   windows,
   onWindowClick,
+  compact = false,
 }: {
   /** The app currently mid-launch, for a per-icon busy state, or null. */
   launching: LaunchableApp | null;
@@ -87,10 +93,22 @@ export function SandboxDock({
    *  launchers — click focuses a window, click the focused one to minimize. */
   windows: SandboxWindow[];
   onWindowClick: (window: SandboxWindow) => void;
+  /** Narrow-container mode — see doc comment above. Defaults false. */
+  compact?: boolean;
 }) {
+  const iconBoxClass = compact ? "h-7 w-7" : "h-11 w-11";
+  const groupIconBoxClass = compact ? "h-4 w-4" : "h-6 w-6";
+
   return (
-    <div className="flex justify-center pb-3 pt-1">
-      <div className="flex items-end gap-3 rounded-2xl border border-border/60 bg-background/70 px-3 py-2 shadow-lg backdrop-blur-md">
+    <div
+      className={cn("flex justify-center", compact ? "pb-1.5" : "pb-3 pt-1")}
+    >
+      <div
+        className={cn(
+          "flex items-end rounded-2xl border border-border/60 bg-background/70 shadow-lg backdrop-blur-md",
+          compact ? "gap-1.5 px-1.5 py-1" : "gap-3 px-3 py-2",
+        )}
+      >
         {LAUNCH_ITEMS.map(({ app, label, Icon }) => {
           const isLaunching = launching === app;
           return (
@@ -103,11 +121,15 @@ export function SandboxDock({
                   aria-pressed={isLaunching}
                   disabled={launching !== null}
                   onClick={() => onLaunch(app)}
-                  className="group flex flex-col items-center gap-1.5 rounded-xl outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:cursor-default"
+                  className={cn(
+                    "group flex flex-col items-center rounded-xl outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:cursor-default",
+                    compact ? "gap-1" : "gap-1.5",
+                  )}
                 >
                   <span
                     className={cn(
-                      "block h-11 w-11 drop-shadow-lg transition-all duration-150 ease-out motion-reduce:transition-none",
+                      "block drop-shadow-lg transition-all duration-150 ease-out motion-reduce:transition-none",
+                      iconBoxClass,
                       "group-active:scale-95 motion-reduce:group-active:scale-100",
                       isLaunching
                         ? "scale-95 opacity-100 saturate-100"
@@ -141,9 +163,17 @@ export function SandboxDock({
               role="status"
               data-testid="sandbox-dock-computer"
               aria-label="Computer — active"
-              className="flex flex-col items-center gap-1.5 rounded-xl"
+              className={cn(
+                "flex flex-col items-center rounded-xl",
+                compact ? "gap-1" : "gap-1.5",
+              )}
             >
-              <span className="block h-11 w-11 opacity-100 drop-shadow-lg saturate-100">
+              <span
+                className={cn(
+                  "block opacity-100 drop-shadow-lg saturate-100",
+                  iconBoxClass,
+                )}
+              >
                 <ComputerDockIcon />
               </span>
               <span className="h-1 w-1 rounded-full bg-foreground opacity-70" />
@@ -156,14 +186,26 @@ export function SandboxDock({
             window manager via the broker. Click focuses a window; clicking
             the focused one minimizes it — the running-windows half of a
             Windows-style taskbar, sharing the dock pill with the launchers
-            so there is exactly one strip of chrome on screen. */}
+            so there is exactly one strip of chrome on screen. Compact mode
+            drops the title text (icon + count only) so chips stay narrow
+            enough for the sidebar panel. */}
         {windows.length > 0 ? (
           <>
             <span
               aria-hidden="true"
-              className="mb-1.5 h-10 w-px self-end bg-border/60"
+              className={cn(
+                "self-end bg-border/60",
+                compact ? "mb-1 h-6 w-px" : "mb-1.5 h-10 w-px",
+              )}
             />
-            <div className="mb-1.5 flex min-w-0 max-w-[52rem] items-center gap-1.5 self-end overflow-x-auto">
+            <div
+              className={cn(
+                "flex min-w-0 items-center self-end overflow-x-auto",
+                compact
+                  ? "mb-1 max-w-40 gap-1"
+                  : "mb-1.5 max-w-[52rem] gap-1.5",
+              )}
+            >
               {groupWindows(windows).map((group) => {
                 const { Icon: GroupIcon } = group;
                 const activeInGroup = group.windows.some((w) => w.active);
@@ -183,26 +225,36 @@ export function SandboxDock({
                           aria-pressed={w.active}
                           onClick={() => onWindowClick(w)}
                           className={cn(
-                            "flex max-w-44 shrink-0 items-center gap-2 rounded-xl border px-2.5 py-2 outline-hidden transition-colors duration-150",
+                            "flex shrink-0 items-center rounded-xl border outline-hidden transition-colors duration-150",
                             "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+                            compact
+                              ? "h-7 w-7 justify-center px-0 py-0"
+                              : "max-w-44 gap-2 px-2.5 py-2",
                             w.active
                               ? "border-border/60 bg-foreground/15"
                               : "border-transparent hover:bg-foreground/10",
                           )}
                         >
-                          <span className="block h-6 w-6 shrink-0 drop-shadow-md">
-                            <GroupIcon />
-                          </span>
                           <span
                             className={cn(
-                              "truncate text-xs",
-                              w.active
-                                ? "text-foreground"
-                                : "text-foreground/70",
+                              "block shrink-0 drop-shadow-md",
+                              groupIconBoxClass,
                             )}
                           >
-                            {w.title}
+                            <GroupIcon />
                           </span>
+                          {!compact ? (
+                            <span
+                              className={cn(
+                                "truncate text-xs",
+                                w.active
+                                  ? "text-foreground"
+                                  : "text-foreground/70",
+                              )}
+                            >
+                              {w.title}
+                            </span>
+                          ) : null}
                         </button>
                       </TooltipTrigger>
                       <TooltipContent side="top">
@@ -224,14 +276,22 @@ export function SandboxDock({
                             data-testid={`sandbox-dock-group-${group.kind}`}
                             aria-label={`${group.label}: ${group.windows.length} windows`}
                             className={cn(
-                              "relative flex shrink-0 items-center gap-2 rounded-xl border px-2.5 py-2 outline-hidden transition-colors duration-150",
+                              "relative flex shrink-0 items-center rounded-xl border outline-hidden transition-colors duration-150",
                               "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+                              compact
+                                ? "gap-1 px-1.5 py-1"
+                                : "gap-2 px-2.5 py-2",
                               activeInGroup
                                 ? "border-border/60 bg-foreground/15"
                                 : "border-transparent hover:bg-foreground/10",
                             )}
                           >
-                            <span className="block h-6 w-6 shrink-0 drop-shadow-md">
+                            <span
+                              className={cn(
+                                "block shrink-0 drop-shadow-md",
+                                groupIconBoxClass,
+                              )}
+                            >
                               <GroupIcon />
                             </span>
                             <span

@@ -42,20 +42,31 @@ export function SandboxViewerDialog({
   open,
   onOpenChange,
   viewerUrl,
+  rawViewerUrl,
   sandboxId,
   sandboxName,
+  ownerPubkey,
   agentDisplayName,
   remaining,
   expired,
+  expiresAt,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** Already-minted, openable URL — what the iframe loads. */
   viewerUrl: string;
+  /** The un-minted URL the relay announced, handed to the pop-out window so
+   *  it can mint its own token instead of waiting on the shared sandbox
+   *  store (see `openComputerWindow`). Falls back to `viewerUrl` if a
+   *  caller doesn't have the raw one on hand. */
+  rawViewerUrl?: string;
   sandboxId: string;
   sandboxName: string | null;
+  ownerPubkey?: string | null;
   agentDisplayName: string | null;
   remaining: string | null;
   expired: boolean;
+  expiresAt?: number | null;
 }) {
   const [userInControl, setUserInControl] = React.useState(false);
   const stageRef = React.useRef<SandboxStageHandle>(null);
@@ -74,7 +85,13 @@ export function SandboxViewerDialog({
 
   async function handlePopOut() {
     try {
-      await openComputerWindow(sandboxId, title);
+      await openComputerWindow(sandboxId, title, {
+        viewerUrl: rawViewerUrl ?? viewerUrl,
+        sandboxName,
+        ownerPubkey,
+        agentDisplayName,
+        expiresAt,
+      });
     } catch (err) {
       console.error("[SandboxViewerDialog] pop-out failed:", err);
       toast.error(

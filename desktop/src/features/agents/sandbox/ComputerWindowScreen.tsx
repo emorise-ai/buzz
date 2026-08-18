@@ -8,29 +8,57 @@ import { useNow } from "@/shared/lib/useNow";
 import { useAgentSandboxById } from "./useAgentSandboxById";
 import { formatSandboxRemaining, isSandboxExpired } from "./sandboxCountdown";
 import { mintViewerUrl } from "./mintViewerUrl";
+import { readComputerWindowHandoff } from "./computerWindow";
 import { SandboxStage } from "./SandboxStage";
+
+/** How long to wait for either the handoff params or the shared sandbox
+ *  store before giving up on "Connecting…" and showing an actionable error.
+ *  The pop-out's own community/relay bootstrap can stall (a second identity
+ *  check, a slow relay) even though the parent window already had
+ *  everything it needed — an infinite spinner then looks indistinguishable
+ *  from "working on it." */
+const CONNECT_TIMEOUT_MS = 10_000;
 
 /**
  * Full-window content for the computer pop-out (`#/computer/:sandboxId`,
  * rendered with no app chrome — see `computerWindowSandboxId` / `root.tsx`).
  * Same live view as the sidebar panel and the fullscreen dialog
  * (`SandboxStage`), just filling the whole native window.
+ *
+ * The pop-out is a second webview that boots its own community/relay init
+ * from scratch, so the shared sandbox store (`useAgentSandboxById`) can take
+ * a while to repopulate — or never does, if that second bootstrap stalls.
+ * The opener already has everything (see `openComputerWindow`), so this
+ * prefers the handoff carried in the window's own URL and only falls back
+ * to the store for whatever the handoff didn't include.
  */
 export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
+  const [handoff] = React.useState(readComputerWindowHandoff);
   const found = useAgentSandboxById(sandboxId);
   const now = useNow(1000);
-  const { data: profile } = useUserProfileQuery(found?.ownerPubkey);
-  const agentDisplayName = found
+
+  const ownerPubkey = handoff.ownerPubkey ?? found?.ownerPubkey ?? null;
+  const { data: profile } = useUserProfileQuery(ownerPubkey ?? undefined);
+  const resolvedDisplayName = ownerPubkey
     ? resolveProfileDisplayName({
         persona: undefined,
         profile,
-        pubkey: found.ownerPubkey,
+        pubkey: ownerPubkey,
       })
     : null;
+  // The handoff's display name (resolved once, parent-side) is the initial
+  // paint; the profile query above refines it once this window's own query
+  // cache warms up, same as any other profile-driven name.
+  const agentDisplayName =
+    resolvedDisplayName ?? handoff.agentDisplayName ?? null;
+
   const [userInControl, setUserInControl] = React.useState(false);
   const [mintedUrl, setMintedUrl] = React.useState<string | null>(null);
+  const [timedOut, setTimedOut] = React.useState(false);
 
-  const viewerUrl = found?.sandbox.viewerUrl ?? null;
+  const viewerUrl = handoff.viewerUrl ?? found?.sandbox.viewerUrl ?? null;
+  const sandboxName = handoff.sandboxName ?? found?.sandbox.name ?? null;
+  const expiresAt = handoff.expiresAt ?? found?.sandbox.expiresAt ?? null;
 
   React.useEffect(() => {
     setMintedUrl(null);
@@ -51,11 +79,33 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
     };
   }, [viewerUrl]);
 
-  if (!found) {
-    // Either the sandbox is gone, or the shared sandbox subscription hasn't
-    // reported it yet — the window boots through the same community/relay
-    // init as the main window, so there's a brief window where this is
-    // legitimately still loading rather than truly missing.
+  // Nothing to connect to yet (no viewer URL from the handoff, and the store
+  // hasn't reported the sandbox either) — give the store a bounded window to
+  // catch up before treating it as unreachable rather than spinning forever.
+  React.useEffect(() => {
+    if (viewerUrl) return;
+    setTimedOut(false);
+    const timer = window.setTimeout(
+      () => setTimedOut(true),
+      CONNECT_TIMEOUT_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [viewerUrl]);
+
+  if (!viewerUrl) {
+    if (timedOut) {
+      return (
+        <div className="flex h-screen w-screen flex-col items-center justify-center gap-2 bg-background p-6 text-center">
+          <Monitor className="h-8 w-8 text-muted-foreground" />
+          <p className="text-sm font-medium text-foreground">
+            Couldn't reach the computer
+          </p>
+          <p className="max-w-sm text-2xs text-muted-foreground">
+            Close this window and reopen it from the agent's chat.
+          </p>
+        </div>
+      );
+    }
     return (
       <div className="flex h-screen w-screen flex-col items-center justify-center gap-2 bg-background p-6 text-center">
         <Monitor className="h-8 w-8 text-muted-foreground" />
@@ -66,13 +116,9 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
     );
   }
 
-  const { sandbox } = found;
-  const expired =
-    sandbox.expiresAt != null && isSandboxExpired(sandbox.expiresAt, now);
+  const expired = expiresAt != null && isSandboxExpired(expiresAt, now);
   const remaining =
-    sandbox.expiresAt != null
-      ? formatSandboxRemaining(sandbox.expiresAt, now)
-      : null;
+    expiresAt != null ? formatSandboxRemaining(expiresAt, now) : null;
 
   if (!mintedUrl) {
     return (
@@ -87,8 +133,8 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
     <div className="flex h-screen w-screen flex-col bg-background">
       <SandboxStage
         viewerUrl={mintedUrl}
-        sandboxId={sandbox.id}
-        sandboxName={sandbox.name}
+        sandboxId={sandboxId}
+        sandboxName={sandboxName}
         agentDisplayName={agentDisplayName}
         remaining={remaining}
         expired={expired}

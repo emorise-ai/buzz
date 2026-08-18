@@ -215,11 +215,14 @@ export function AgentSandboxPreview({ agentPubkey }: { agentPubkey: string }) {
           open={viewerOpen}
           onOpenChange={setViewerOpen}
           viewerUrl={mintedUrl}
+          rawViewerUrl={sandbox.viewerUrl ?? undefined}
           sandboxId={sandbox.id}
           sandboxName={sandbox.name}
+          ownerPubkey={agentPubkey}
           agentDisplayName={agentDisplayName}
           remaining={remaining}
           expired={expired}
+          expiresAt={sandbox.expiresAt}
         />
       ) : null}
     </div>

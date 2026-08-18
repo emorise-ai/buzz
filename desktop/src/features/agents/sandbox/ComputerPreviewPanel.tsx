@@ -93,7 +93,13 @@ export function ComputerPreviewPanel({
   async function handlePopOut() {
     if (!sandbox) return;
     try {
-      await openComputerWindow(sandbox.id, title);
+      await openComputerWindow(sandbox.id, title, {
+        viewerUrl: sandbox.viewerUrl,
+        sandboxName: sandbox.name,
+        ownerPubkey,
+        agentDisplayName,
+        expiresAt: sandbox.expiresAt,
+      });
     } catch (err) {
       console.error("[ComputerPreviewPanel] pop-out failed:", err);
       toast.error(
@@ -173,6 +179,7 @@ export function ComputerPreviewPanel({
             agentDisplayName={agentDisplayName}
             remaining={remaining}
             expired={expired}
+            compact
             userInControl={userInControl}
             onUserInControlChange={setUserInControl}
           />

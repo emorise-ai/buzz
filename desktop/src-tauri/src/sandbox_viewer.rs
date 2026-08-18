@@ -721,15 +721,70 @@ fn computer_window_label(sandbox_id: &str) -> String {
     format!("computer-{sandbox_id}")
 }
 
+/// Build the `#/computer/<id>?...` hash route for the pop-out window,
+/// carrying the parent's already-known sandbox info as query params so the
+/// second webview can render immediately instead of waiting on its own
+/// community/relay bootstrap to repopulate the shared sandbox store (which
+/// left the window stuck on "Connecting…" forever — see
+/// `ComputerWindowScreen`'s param-first read). Every param is optional; the
+/// frontend falls back to the store for whatever is missing.
+fn computer_window_hash_route(id: &str, params: &ComputerWindowParams) -> String {
+    let mut query = Vec::new();
+    if let Some(viewer_url) = params.viewer_url.as_deref().filter(|s| !s.is_empty()) {
+        query.push(format!("viewerUrl={}", encode_query_value(viewer_url)));
+    }
+    if let Some(sandbox_name) = params.sandbox_name.as_deref().filter(|s| !s.is_empty()) {
+        query.push(format!("sandboxName={}", encode_query_value(sandbox_name)));
+    }
+    if let Some(owner_pubkey) = params.owner_pubkey.as_deref().filter(|s| !s.is_empty()) {
+        query.push(format!("ownerPubkey={}", encode_query_value(owner_pubkey)));
+    }
+    if let Some(agent_display_name) = params
+        .agent_display_name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        query.push(format!(
+            "agentDisplayName={}",
+            encode_query_value(agent_display_name)
+        ));
+    }
+    if let Some(expires_at) = params.expires_at {
+        query.push(format!("expiresAt={expires_at}"));
+    }
+
+    if query.is_empty() {
+        format!("index.html#/computer/{id}")
+    } else {
+        format!("index.html#/computer/{id}?{}", query.join("&"))
+    }
+}
+
+/// Optional sandbox info the parent window already has, passed through to the
+/// pop-out so it can render without waiting on its own relay subscription.
+/// Mirrors the fields `ComputerPreviewPanel`/`SandboxViewerDialog` already
+/// hold from the shared sandbox store.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputerWindowParams {
+    pub viewer_url: Option<String>,
+    pub sandbox_name: Option<String>,
+    pub owner_pubkey: Option<String>,
+    pub agent_display_name: Option<String>,
+    pub expires_at: Option<i64>,
+}
+
 /// Open (or focus, if already open) a native window showing `sandbox_id`'s
 /// live desktop. The window loads the ordinary app bundle and lands on the
-/// `#/computer/<sandboxId>` route, which resolves the sandbox from the
-/// shared frontend store and mints its own viewer token — this command only
-/// owns window lifecycle, not the sandbox lookup or the viewer URL.
+/// `#/computer/<sandboxId>` route, carrying `params` as query params so
+/// `ComputerWindowScreen` can mint its own viewer token immediately —
+/// this command only owns window lifecycle and the hand-off payload, not the
+/// sandbox lookup.
 #[tauri::command]
 pub async fn open_computer_window(
     sandbox_id: String,
     title: String,
+    params: Option<ComputerWindowParams>,
     app: AppHandle,
 ) -> CmdResult<()> {
     let id = validate_sandbox_id(&sandbox_id)?;
@@ -746,11 +801,12 @@ pub async fn open_computer_window(
     } else {
         title
     };
+    let params = params.unwrap_or_default();
 
     WebviewWindowBuilder::new(
         &app,
         label,
-        WebviewUrl::App(format!("index.html#/computer/{id}").into()),
+        WebviewUrl::App(computer_window_hash_route(id, &params).into()),
     )
     .title(window_title)
     .inner_size(1280.0, 820.0)
@@ -762,7 +818,10 @@ pub async fn open_computer_window(
 
 #[cfg(test)]
 mod tests {
-    use super::{computer_window_label, to_base64url, validate_sandbox_id};
+    use super::{
+        computer_window_hash_route, computer_window_label, to_base64url, validate_sandbox_id,
+        ComputerWindowParams,
+    };
     use base64::Engine;
 
     #[test]
@@ -800,5 +859,49 @@ mod tests {
             computer_window_label(id),
             computer_window_label("other-sandbox-id")
         );
+    }
+
+    #[test]
+    fn hash_route_with_no_params_has_no_query_string() {
+        let route = computer_window_hash_route("sbx-1", &ComputerWindowParams::default());
+        assert_eq!(route, "index.html#/computer/sbx-1");
+    }
+
+    #[test]
+    fn hash_route_round_trips_every_param() {
+        let params = ComputerWindowParams {
+            viewer_url: Some("https://relay.example.com/sandbox-viewer/sbx-1".to_string()),
+            sandbox_name: Some("buzz-sandbox-fq5ijxh7lt".to_string()),
+            owner_pubkey: Some("deadbeef".repeat(8)),
+            agent_display_name: Some("Fern the Agent".to_string()),
+            expires_at: Some(1_700_000_000),
+        };
+        let route = computer_window_hash_route("sbx-1", &params);
+
+        assert!(route.starts_with("index.html#/computer/sbx-1?"));
+        assert!(
+            route.contains("viewerUrl=https%3A%2F%2Frelay.example.com%2Fsandbox-viewer%2Fsbx-1")
+        );
+        assert!(route.contains("sandboxName=buzz-sandbox-fq5ijxh7lt"));
+        assert!(route.contains(&format!("ownerPubkey={}", "deadbeef".repeat(8))));
+        assert!(route.contains("agentDisplayName=Fern%20the%20Agent"));
+        assert!(route.contains("expiresAt=1700000000"));
+    }
+
+    #[test]
+    fn hash_route_omits_blank_and_absent_params() {
+        // Empty strings from the frontend (e.g. an agent with no resolved
+        // display name) must not produce an empty `foo=` param — omitted
+        // entirely is what lets the frontend's "fall back to the store"
+        // check (`param === null`) work correctly.
+        let params = ComputerWindowParams {
+            viewer_url: Some(String::new()),
+            sandbox_name: None,
+            owner_pubkey: Some("  ".to_string()).filter(|s| !s.trim().is_empty()),
+            agent_display_name: None,
+            expires_at: None,
+        };
+        let route = computer_window_hash_route("sbx-1", &params);
+        assert_eq!(route, "index.html#/computer/sbx-1");
     }
 }
