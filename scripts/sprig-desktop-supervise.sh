@@ -200,6 +200,15 @@ fi
 # buzz-browser resolves to Google Chrome on amd64 and Chromium elsewhere;
 # both accept this flag set, and both get the same profile dir so a switch
 # of binary never orphans the human's logins.
+#
+# --use-gl=angle --use-angle=swiftshader-webgl / --enable-unsafe-swiftshader /
+# --ignore-gpu-blocklist: there is no GPU or DRI device in this container (see
+# the picom --backend xrender note above), so Chromium's default GPU checks
+# blocklist this environment and WebGL reports "not enabled" to pages (e.g.
+# Onshape, Figma, any three.js/WebGL app) even though the CPU has plenty of
+# headroom to software-render it via SwiftShader. These flags force Chromium
+# onto its CPU-rasterized WebGL path instead of trying (and failing) to find
+# real GPU hardware.
 buzz-browser \
     --remote-debugging-port="${CDP_PORT}" \
     --remote-allow-origins='*' \
@@ -214,6 +223,10 @@ buzz-browser \
     --window-position=110,65 \
     --no-sandbox \
     --test-type \
+    --use-gl=angle \
+    --use-angle=swiftshader-webgl \
+    --enable-unsafe-swiftshader \
+    --ignore-gpu-blocklist \
     "$BUZZ_DESKTOP_HOME" \
     >/tmp/chromium.log 2>&1 &
 
@@ -247,6 +260,10 @@ while true; do
             --window-position=110,65 \
             --test-type \
             --no-sandbox \
+            --use-gl=angle \
+            --use-angle=swiftshader-webgl \
+            --enable-unsafe-swiftshader \
+            --ignore-gpu-blocklist \
             "$BUZZ_DESKTOP_HOME" \
             >>/tmp/chromium.log 2>&1 &
     fi
