@@ -15,14 +15,18 @@
 # (y=1015..1080) and above it (y=0..65) by construction — see the comment
 # above the buzz-browser invocation in sprig-desktop-supervise.sh for the
 # exact math. Thunar and xfce4-terminal's spawn positions (openbox-rc.xml)
-# stay well inside that same window band. A tint2 PANEL that reserves screen
-# space via _NET_WM_STRUT would shrink the area openbox hands out for
-# maximize/fullscreen and could clip those hand-placed windows.
-# `strut_policy = none` below is the opt-out: tint2 still draws the panel
-# and still receives clicks, it just never tells the window manager to
-# shrink the usable desktop for it. The panel is sized and margined to fit
-# inside the existing 65px bottom strip instead of relying on a strut to
-# make room, so nothing else on screen has to move.
+# stay well inside that same window band, so none of that hand-placed
+# geometry is affected by the strut below.
+#
+# `strut_policy = follow_size` makes tint2 report its real panel height
+# (panel_size's 60px + panel_margin's 6px top/bottom ≈ the same ~65px strip
+# above) as a _NET_WM_STRUT_PARTIAL, so openbox shrinks _NET_WORKAREA to
+# match. Without this, maximize/fullscreen filled the whole 1920x1080 screen
+# and Chromium's content ran underneath the dock instead of stopping above
+# it — the dock is drawn panel_layer = top so it stayed visually on top, but
+# nothing told openbox the space was spoken for. `follow_size` (not
+# `minimum`) ties the strut to the panel's actual rendered height instead of
+# a fixed value, so it stays correct if panel_size/panel_margin ever change.
 #
 # Visual goal: read as a real OS dock (macOS/GNOME-style) — a small rounded,
 # softly translucent pill centered at the bottom, shrunk to its own content
@@ -104,8 +108,8 @@ panel_padding = 10 6 10
 panel_background_id = 1
 panel_position = bottom center horizontal
 # tint2's stacking-order layer — always drawn above normal windows so the
-# dock is never hidden behind Chromium. This is NOT a strut/space
-# reservation; strut_policy (below) is what controls that, and it is off.
+# dock is never hidden behind Chromium. This is a separate mechanism from
+# the strut/space reservation; strut_policy (below) is what controls that.
 panel_layer = top
 panel_dock = 0
 panel_monitor = all
@@ -119,7 +123,7 @@ panel_monitor = all
 # taskbar-stranded-in-the-middle layout.
 panel_shrink = 1
 autohide = 0
-strut_policy = none
+strut_policy = follow_size
 font_shadow = 0
 mouse_effects = 1
 disable_transparency = 0

@@ -91,10 +91,11 @@ openbox >/tmp/openbox.log 2>&1 &
 # already exist for tint2 to read; before picom so the compositor's
 # window-type exclusion rule (see sprig-desktop-picom.conf) has a real dock
 # window to match against by the time it starts watching for damage events.
-# Config (~/.config/tint2/tint2rc, from sprig-desktop-tint2rc) is set to
-# NOT reserve screen space (strut_policy = none) — see that file's header
-# for why: Chromium/Thunar/terminal's positions below are hand-tuned for a
-# strut-free 1920x1080 screen, and a space-reserving panel would shift them.
+# Config (~/.config/tint2/tint2rc, from sprig-desktop-tint2rc) reserves
+# screen space for the panel (strut_policy = follow_size) so maximize/
+# fullscreen windows stop above the dock instead of running underneath it —
+# see that file's header for the math against Chromium/Thunar/terminal's
+# hand-placed positions below.
 if command -v tint2 >/dev/null 2>&1; then
     tint2 >/tmp/tint2.log 2>&1 &
     log "dock started (tint2)"
