@@ -1,3 +1,5 @@
+import { Loader2 } from "lucide-react";
+
 import {
   Dialog,
   DialogContent,
@@ -66,6 +68,11 @@ export function TeachTaskPreviewDialog({
           {narrationText ? (
             <p className="text-sm text-foreground">
               <span className="font-medium">What I heard:</span> {narrationText}
+            </p>
+          ) : preview?.transcribing ? (
+            <p className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              Transcribing your narration…
             </p>
           ) : (
             <p className="text-sm text-muted-foreground">

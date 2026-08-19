@@ -23,9 +23,18 @@ use crate::huddle::{models, stt::SttPipeline};
 const BATCH_SAMPLES: usize = 4_800;
 const BATCH_BYTES: usize = BATCH_SAMPLES * 4;
 
+/// Inter-batch feed delay — small enough to run far faster than real time,
+/// large enough that the bounded audio queue drains between pushes rather than
+/// overflowing (which would silently drop frames on `try_send`).
+const FEED_DELAY: Duration = Duration::from_millis(8);
+
 /// Trailing silence fed after the real clip so the VAD's silence-flush window
 /// closes and the final utterance is decoded instead of left buffered.
 const TRAILING_SILENCE_BATCHES: usize = 10;
+
+/// Delay between trailing-silence batches — enough to let the VAD advance its
+/// silence window without pacing to real time.
+const TRAILING_SILENCE_DELAY: Duration = Duration::from_millis(20);
 
 /// How long to keep polling for transcript segments after the feed thread
 /// finishes, in case a decode is still in flight.
@@ -59,20 +68,19 @@ fn transcribe_blocking(
 ) -> Result<String, String> {
     let (stt, mut text_rx) = SttPipeline::new(model_dir, None, None)?;
 
-    // Feed the real clip in fixed-size batches, paced to real time so the
-    // bounded audio queue (sized for live 100 ms cadence) never overflows and
-    // silently drops frames.
+    // Feed the clip in fixed-size batches. The bounded audio queue (`try_send`,
+    // drops on full) must not overflow, but pacing to *real time* meant a 30 s
+    // clip took ~30 s to transcribe — far too slow for a "finish → preview"
+    // flow. Instead feed much faster than real time with a small inter-batch
+    // delay that still lets the decode worker drain the queue between pushes.
+    // FEED_DELAY << real-time-per-batch (100 ms), so this runs ~an order of
+    // magnitude faster while staying comfortably under the queue's capacity.
     let mut cursor = 0usize;
-    let feed_start = std::time::Instant::now();
     while cursor < pcm_bytes.len() {
         let end = (cursor + BATCH_BYTES).min(pcm_bytes.len());
         stt.push_audio(pcm_bytes[cursor..end].to_vec())?;
         cursor = end;
-        let target = feed_start + Duration::from_millis((cursor / 192) as u64);
-        let now = std::time::Instant::now();
-        if target > now {
-            std::thread::sleep(target - now);
-        }
+        std::thread::sleep(FEED_DELAY);
     }
 
     // Trailing silence forces the VAD's silence-flush window to close so the
@@ -81,7 +89,7 @@ fn transcribe_blocking(
     let silence = vec![0u8; BATCH_BYTES];
     for _ in 0..TRAILING_SILENCE_BATCHES {
         stt.push_audio(silence.clone())?;
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(TRAILING_SILENCE_DELAY);
     }
 
     // Collect every emitted segment (VAD may split one narration into several

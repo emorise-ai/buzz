@@ -41,6 +41,11 @@ export type TeachTaskPreview = {
   bytes: Uint8Array;
   /** On-device transcript of the narration, or "" if none/video-only. */
   transcript: string;
+  /** True while transcription is still running in the background — the preview
+   *  opens as soon as the video is ready and the transcript backfills after,
+   *  so the dialog can show "Transcribing…" instead of a misleading "no
+   *  narration". False for video-only (no mic) and once the transcript lands. */
+  transcribing: boolean;
   /** The same WAV bytes already muxed into the clip — kept only for
    *  reference/debugging, not re-sent (they're already baked into `bytes`). */
   wavBytes: Uint8Array | null;
@@ -297,33 +302,41 @@ export function useTeachTask({
     // `processing` overlay tracks the background work, then the preview
     // dialog opens once the bytes are ready — nothing is uploaded or sent
     // until the human confirms it there.
+    // Show the processing overlay FIRST — before the synchronous mic teardown
+    // below (audio-context close + WAV encode of the whole clip), which can
+    // block the main thread long enough that the overlay would otherwise paint
+    // seconds late.
+    recordingActiveRef.current = false;
+    setListening(false);
+    setTeaching(false);
+    setProcessing(true);
+
     const mic = micRef.current;
     micRef.current = null;
     const { pcmBytes, wavBytes } = mic?.stop() ?? {
       pcmBytes: new Uint8Array(0),
       wavBytes: null,
     };
-    recordingActiveRef.current = false;
-    setListening(false);
-    setTeaching(false);
-    setProcessing(true);
+
+    // Kick off transcription in PARALLEL and DON'T block the preview on it —
+    // on-device STT runs the clip in real time (a 30s clip ≈ 30s), so waiting
+    // for it before showing the video made "processing" drag on and, if STT
+    // hung, the preview never opened at all. The preview appears as soon as the
+    // video bytes are ready; the transcript fills in when it lands.
+    const transcriptPromise: Promise<string> = pcmBytes.length
+      ? transcribeTeachingAudio(pcmBytes).catch((err) => {
+          console.error("[useTeachTask] transcription failed:", err);
+          toast.warning(
+            `Transcription failed: ${err instanceof Error ? err.message : "unknown"}`,
+          );
+          return "";
+        })
+      : Promise.resolve("");
 
     const process = async () => {
-      // Transcribe first — stopping the recording below hands the same WAV
-      // bytes to the broker to bake into the video, so a transcription
-      // failure (e.g. model not downloaded yet) shouldn't also block that.
-      let transcript = "";
-      try {
-        transcript = await transcribeTeachingAudio(pcmBytes);
-      } catch (err) {
-        console.error("[useTeachTask] transcription failed:", err);
-        toast.warning(
-          `Transcription failed: ${err instanceof Error ? err.message : "unknown"}`,
-        );
-        // Non-fatal — preview the recording without a transcript rather than
-        // dropping the whole teaching handoff over an STT hiccup.
-      }
-
+      // The preview only needs the video; fetch it and open the dialog right
+      // away (the mp4 already has the audio muxed in, so playback has sound
+      // regardless of the transcript).
       const bytes = await stopSandboxRecording(
         sandboxId,
         wavBytes ? { bytes: wavBytes, ext: "wav" } : undefined,
@@ -332,8 +345,18 @@ export function useTeachTask({
         new Blob([bytes.buffer as ArrayBuffer], { type: "video/mp4" }),
       );
       previewUrlRef.current = videoUrl;
+      const transcribing = pcmBytes.length > 0;
       setProcessing(false);
-      setPreview({ videoUrl, bytes, transcript, wavBytes });
+      setPreview({ videoUrl, bytes, transcript: "", transcribing, wavBytes });
+
+      // Backfill the transcript into the open preview once STT finishes, and
+      // clear the "transcribing" flag either way.
+      const transcript = await transcriptPromise;
+      setPreview((current) =>
+        current && current.videoUrl === videoUrl
+          ? { ...current, transcript, transcribing: false }
+          : current,
+      );
     };
 
     void process().catch((err) => {
