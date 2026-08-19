@@ -24,7 +24,6 @@ import type { TeachTaskMode } from "./teachTaskModePreference";
  */
 export function TeachTaskButton({
   teaching,
-  finishing,
   mode,
   setMode,
   onStart,
@@ -32,7 +31,6 @@ export function TeachTaskButton({
   onCancel,
 }: {
   teaching: boolean;
-  finishing: boolean;
   mode: TeachTaskMode;
   setMode: (mode: TeachTaskMode) => void;
   onStart: (mode: TeachTaskMode) => void;
@@ -40,6 +38,9 @@ export function TeachTaskButton({
   onCancel: () => void;
 }) {
   if (teaching) {
+    // Click either control returns to idle immediately — finishing/discarding
+    // both hand off to background work (see `useTeachTask`), so there's no
+    // in-between "Finishing…" state to show or to disable against.
     return (
       <div className="flex items-center gap-1">
         <Button
@@ -48,13 +49,12 @@ export function TeachTaskButton({
           size="sm"
           data-testid="sandbox-teach-task"
           onClick={onFinish}
-          disabled={finishing}
           className={cn(
             "gap-1.5 border-red-500 text-2xs text-red-500 hover:bg-red-500/10 hover:text-red-500",
           )}
         >
           <Circle className="h-2.5 w-2.5 fill-red-500 text-red-500 animate-pulse" />
-          {finishing ? "Finishing…" : "Recording…"}
+          Recording…
         </Button>
         <Button
           type="button"
@@ -63,7 +63,6 @@ export function TeachTaskButton({
           aria-label="Discard recording"
           data-testid="sandbox-teach-task-discard"
           onClick={onCancel}
-          disabled={finishing}
           className="text-muted-foreground hover:text-foreground"
         >
           <X className="h-3.5 w-3.5" />

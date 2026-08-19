@@ -67,7 +67,6 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
   // shared rather than forked so the pop-out doesn't drift from the dialog.
   const {
     teaching,
-    finishing,
     mode,
     setMode,
     startTeaching,
@@ -178,7 +177,6 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
           {!expired && ownerPubkey ? (
             <TeachTaskButton
               teaching={teaching}
-              finishing={finishing}
               mode={mode}
               setMode={setMode}
               onStart={(startMode) => void startTeaching(startMode)}

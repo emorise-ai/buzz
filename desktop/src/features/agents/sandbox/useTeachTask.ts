@@ -27,12 +27,15 @@ import {
  * instead of typed text, then on Done stops both, transcribes the narration
  * on-device, uploads the finished (now audio+video) clip, and messages the
  * agent's channel with the URL + transcript so the agent can watch it and
- * propose a skill. `teaching` gates the banner; `finishing` covers the
- * stop→transcribe→upload→send window so Done/Cancel can't double-fire.
+ * propose a skill. `teaching` gates the button's recording state.
  *
- * Extracted verbatim from `SandboxViewerDialog` (no behavior change) so the
- * fullscreen dialog and the pop-out native window share one teaching flow
- * instead of two copies drifting apart.
+ * Done and Discard both return the button to idle IMMEDIATELY and hand the
+ * multi-second work (stop+flush ffmpeg, transcribe, upload, send) off to the
+ * background with a progress toast — so the button never freezes on a slow or
+ * hung server round-trip.
+ *
+ * Shared by `SandboxViewerDialog` and the pop-out native window so the two
+ * surfaces run one teaching flow instead of two copies drifting apart.
  *
  * Recording mode ("Audio + Video" vs "Video only") is a persisted preference
  * (`teachTaskModePreference`), not per-call state — the human picks it once
@@ -48,7 +51,6 @@ export function useTeachTask({
   setUserInControl: (userInControl: boolean) => void;
 }) {
   const [teaching, setTeaching] = React.useState(false);
-  const [finishing, setFinishing] = React.useState(false);
   const [listening, setListening] = React.useState(false);
   const mode = useTeachTaskMode();
   const micRef = React.useRef<TeachTaskMicHandle | null>(null);
@@ -94,7 +96,6 @@ export function useTeachTask({
       });
     }
     setTeaching(false);
-    setFinishing(false);
     setListening(false);
   }, [sandboxId]);
 
@@ -135,39 +136,44 @@ export function useTeachTask({
     }
   }
 
-  async function cancelTeaching() {
-    setFinishing(true);
-    setListening(false);
+  function cancelTeaching() {
+    // Discard is instant: exit the recording UI at once, then stop the sandbox
+    // ffmpeg in the background. The human doesn't care about the result — they
+    // asked to throw it away — so there's no reason to hold the button while
+    // the broker waits for ffmpeg to flush.
     micRef.current?.stop();
     micRef.current = null;
     recordingActiveRef.current = false;
-    try {
-      await stopSandboxRecording(sandboxId);
-    } catch (err) {
-      // Discarding regardless — the human asked to cancel, and a stop
-      // failure here (e.g. nothing was recording) shouldn't trap them in
-      // teaching mode.
+    setListening(false);
+    setTeaching(false);
+    void stopSandboxRecording(sandboxId).catch((err) => {
+      // Nothing to surface — the recording is being discarded regardless.
       console.warn("[useTeachTask] recording stop on cancel:", err);
-    } finally {
-      setFinishing(false);
-      setTeaching(false);
-    }
+    });
   }
 
-  async function doneTeaching() {
+  function doneTeaching() {
     if (!ownerPubkey) {
       toast.error("This agent has no known pubkey to message.");
       return;
     }
-    setFinishing(true);
-    setListening(false);
+    // Grab the mic buffers, then EXIT the recording UI immediately. Everything
+    // below (stop+flush the sandbox ffmpeg, transcribe, upload, send) is a
+    // multi-second server round-trip; holding the button in "Finishing…" until
+    // it all completes made the UI feel frozen and, if any step hung, left it
+    // stuck forever. Instead the button returns to idle at once and a toast
+    // tracks the background work.
     const mic = micRef.current;
     micRef.current = null;
     const { pcmBytes, wavBytes } = mic?.stop() ?? {
       pcmBytes: new Uint8Array(0),
       wavBytes: null,
     };
-    try {
+    recordingActiveRef.current = false;
+    setListening(false);
+    setTeaching(false);
+
+    const process = async () => {
       // Transcribe first — the recording upload below hands the same WAV
       // bytes to the broker to bake into the video, so a transcription
       // failure (e.g. model not downloaded yet) shouldn't also block that.
@@ -180,7 +186,6 @@ export function useTeachTask({
         // dropping the whole teaching handoff over an STT hiccup.
       }
 
-      recordingActiveRef.current = false;
       const recording = await stopSandboxRecording(
         sandboxId,
         wavBytes ? { bytes: wavBytes, ext: "wav" } : undefined,
@@ -212,24 +217,23 @@ export function useTeachTask({
         mentionPubkeys: [ownerPubkey],
         mediaTags,
       });
-      toast.success("Sent the recording to the agent.");
-    } catch (err) {
-      console.error("[useTeachTask] finishing teaching failed:", err);
-      toast.error(
-        err instanceof Error
+    };
+
+    // Background work with a progress toast — the button is already free.
+    toast.promise(process(), {
+      loading: "Processing recording — sending to the agent…",
+      success: "Sent the recording to the agent.",
+      error: (err) => {
+        console.error("[useTeachTask] finishing teaching failed:", err);
+        return err instanceof Error
           ? err.message
-          : "Could not finish teaching. Try again.",
-      );
-      return;
-    } finally {
-      setFinishing(false);
-    }
-    setTeaching(false);
+          : "Could not finish teaching. Try again.";
+      },
+    });
   }
 
   return {
     teaching,
-    finishing,
     listening,
     mode,
     setMode: setTeachTaskMode,

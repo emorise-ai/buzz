@@ -73,7 +73,6 @@ export function SandboxViewerDialog({
   // two surfaces don't drift.
   const {
     teaching,
-    finishing,
     mode,
     setMode,
     startTeaching,
@@ -155,7 +154,6 @@ export function SandboxViewerDialog({
             {!expired ? (
               <TeachTaskButton
                 teaching={teaching}
-                finishing={finishing}
                 mode={mode}
                 setMode={setMode}
                 onStart={(startMode) => void startTeaching(startMode)}
