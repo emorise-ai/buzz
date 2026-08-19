@@ -2516,6 +2516,167 @@ const VIEWER_PAGE: &str = r##"<!doctype html>
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const url = `${proto}://${location.host}${base}/websockify`;
   let retry = 0;
+  // Clipboard bridge, both directions, without ever touching the keyboard
+  // path. The VM's X selection reaches the host clipboard through noVNC's
+  // "clipboard" event (fed by x11vnc's default selection polling). The host
+  // clipboard reaches the VM by mirroring it into the VM's selection ahead
+  // of time, so the user's own Cmd/Ctrl+V — forwarded verbatim by noVNC as
+  // an ordinary keystroke — finds the text already there.
+  //
+  // Deliberately NOT intercepting the paste keystroke: swallowing a keydown
+  // and synthesizing Ctrl+V via sendKey() desynchronizes noVNC's modifier
+  // tracking (it sees a keyup for a press it never observed) and strands the
+  // VM with a stuck Ctrl if anything between the synthetic down and up
+  // throws. A stuck modifier makes the session unusable, which is far worse
+  // than a paste that misses by a beat.
+  //
+  // Mirroring is driven by focus/visibility rather than a timer: readText()
+  // needs the document focused to resolve, and those are exactly the moments
+  // the user has just come back from copying something on the host.
+  // Reconnects call wireClipboard again with a fresh rfb; drop the previous
+  // connection's listeners first so they don't pile up.
+  let unwireClipboard = () => {};
+  function wireClipboard(rfb) {
+    unwireClipboard();
+    let lastPushed = null;
+    rfb.addEventListener("clipboard", (e) => {
+      // Remember what the VM already has so the mirror below doesn't echo
+      // it straight back on the next focus.
+      lastPushed = e.detail.text;
+      // Same origin restriction applies writing back out, so hand it to the
+      // embedder when there is one and only write directly when standalone.
+      if (window.parent !== window) {
+        window.parent.postMessage(
+          { type: "buzz:clipboard-copy", text: e.detail.text },
+          "*",
+        );
+        return;
+      }
+      navigator.clipboard.writeText(e.detail.text).catch(() => {});
+    });
+    // Host clipboard -> VM. The viewer is a cross-origin, sandboxed iframe,
+    // so navigator.clipboard.readText() is refused with NotAllowedError no
+    // matter how genuine the user gesture is — a sandboxed frame gets an
+    // opaque origin and `clipboard-read` simply is not grantable there.
+    // Instead the embedder (which is a Tauri app with native clipboard
+    // access) reads the clipboard for us and posts the text in. When the
+    // viewer is opened standalone in a browser tab there is no embedder, so
+    // fall back to reading the clipboard directly — that path works, being a
+    // top-level document.
+    const applyToVm = (text) => {
+      if (!text || text === lastPushed) return;
+      lastPushed = text;
+      rfb.clipboardPasteFrom(text);
+    };
+    const embedded = window.parent !== window;
+    const onMessage = (e) => {
+      const d = e.data;
+      if (!d || d.type !== "buzz:clipboard" || typeof d.text !== "string") return;
+      applyToVm(d.text);
+    };
+    window.addEventListener("message", onMessage);
+    // Ask the embedder for the current clipboard whenever the user is about
+    // to interact — it answers with a buzz:clipboard message.
+    const requestFromHost = () => {
+      if (document.visibilityState !== "visible") return;
+      window.parent.postMessage({ type: "buzz:clipboard-request" }, "*");
+    };
+    const readLocally = () => {
+      if (document.visibilityState !== "visible") return;
+      navigator.clipboard?.readText?.().then(applyToVm).catch(() => {});
+    };
+    const poke = () => (embedded ? requestFromHost() : readLocally());
+    window.addEventListener("focus", poke);
+    document.addEventListener("visibilitychange", poke);
+    const screen = document.getElementById("screen");
+    screen.addEventListener("pointerenter", poke);
+    screen.addEventListener("pointerdown", poke);
+    poke();
+    unwireClipboard = () => {
+      window.removeEventListener("message", onMessage);
+      window.removeEventListener("focus", poke);
+      document.removeEventListener("visibilitychange", poke);
+      screen.removeEventListener("pointerenter", poke);
+      screen.removeEventListener("pointerdown", poke);
+    };
+  }
+  // Mac hosts: translate ⌘<key> into Ctrl+<key> for the standard editing
+  // shortcuts, because the VM is Linux and expects Ctrl. noVNC maps the
+  // Command key to Alt (see its keyboard.js), so an untranslated ⌘V arrives
+  // as Alt+V and no Linux app treats that as paste.
+  //
+  // Deliberately an allowlist, not a blanket ⌘→Ctrl swap: remapping every
+  // Command chord would hijack window-manager and application shortcuts
+  // (⌘Q, ⌘Tab …) and hand the VM keystrokes the user never intended. These
+  // are the letters whose ⌘ meaning on the Mac matches Ctrl on Linux —
+  // editing (a c v x z y), find/reload/save (f r s), browser tabs and
+  // windows (t w n l p).
+  //
+  // Matched on the typed letter (e.key), not the physical position (e.code):
+  // on non-US layouts the two disagree — a Swiss QWERTZ keyboard's Z sits on
+  // the physical KeyY position, so a code-keyed table silently missed ⌘Z
+  // while ⌘C/⌘V happened to line up. The letter is what the user means, on
+  // every layout. Shift is deliberately allowed through untouched (it isn't
+  // remapped by noVNC), so ⌘⇧Z arrives as Ctrl+Shift+Z — redo — for free.
+  const CTRL_SHORTCUT_LETTERS = new Set([
+    "a", "c", "v", "x", "z", "y",
+    "f", "r", "s",
+    "t", "w", "n", "l", "p",
+  ]);
+  // No platform sniffing: navigator.platform is deprecated and webviews lie
+  // about the user agent. metaKey being set *is* the signal — the user
+  // pressed ⌘ (or the Windows key), and either way the Linux VM wants Ctrl.
+  function wireMacShortcuts(rfb) {
+    const onKeydown = (e) => {
+      // Only a bare ⌘<letter> (⇧ allowed); leave ⌘⌥ chords alone, and never
+      // touch a combination the user is already forming with Ctrl.
+      if (!e.metaKey || e.ctrlKey || e.altKey) return;
+      const letter = e.key?.toLowerCase();
+      if (!letter || !/^[a-z]$/.test(letter)) return;
+      if (!CTRL_SHORTCUT_LETTERS.has(letter)) return;
+      const keysym = letter.charCodeAt(0);
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      // The ⌘ keydown itself already went through to the VM before this
+      // letter arrived, and noVNC forwards a Mac ⌘ as Alt — so the VM is
+      // holding Alt right now, and Ctrl+V sent into that state lands as
+      // Ctrl+Alt+V, which no app treats as paste. Release the phantom
+      // modifiers first (releasing an unpressed key is a no-op in X), then
+      // send the chord. The user's eventual ⌘ keyup just re-releases Alt,
+      // also harmless.
+      //
+      // Press and release as one unit, and always release Ctrl — including
+      // if sending the letter throws — so the VM can never be left with a
+      // stuck modifier.
+      try {
+        rfb.sendKey(0xffe9, "AltLeft", false);
+        rfb.sendKey(0xffea, "AltRight", false);
+        rfb.sendKey(0xffeb, "MetaLeft", false);
+        rfb.sendKey(0xffec, "MetaRight", false);
+        rfb.sendKey(0xffe3, "ControlLeft", true);
+        // Code derived from the letter, not e.code: they diverge on non-US
+        // layouts, and the keysym is what the VM acts on — keep them agreeing.
+        rfb.sendKey(keysym, `Key${letter.toUpperCase()}`);
+      } finally {
+        rfb.sendKey(0xffe3, "ControlLeft", false);
+      }
+    };
+    // If focus leaves mid-chord, make sure Ctrl is not left down in the VM.
+    const onBlur = () => {
+      try {
+        rfb.sendKey(0xffe3, "ControlLeft", false);
+      } catch {
+        /* connection already gone; nothing to release */
+      }
+    };
+    window.addEventListener("keydown", onKeydown, true);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", onKeydown, true);
+      window.removeEventListener("blur", onBlur);
+    };
+  }
+  let unwireMacShortcuts = () => {};
   function connect() {
     const rfb = new RFB(document.getElementById("screen"), url);
     rfb.scaleViewport = true;
@@ -2527,6 +2688,9 @@ const VIEWER_PAGE: &str = r##"<!doctype html>
       retry += 1;
       if (retry <= 30) setTimeout(connect, Math.min(1000 * retry, 5000));
     });
+    wireClipboard(rfb);
+    unwireMacShortcuts();
+    unwireMacShortcuts = wireMacShortcuts(rfb);
   }
   connect();
 </script>

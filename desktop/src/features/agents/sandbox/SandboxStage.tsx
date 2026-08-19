@@ -1,6 +1,11 @@
 import * as React from "react";
 import { Monitor, X } from "lucide-react";
 
+import {
+  copyTextToSystemClipboard,
+  readTextFromSystemClipboard,
+} from "@/shared/api/tauriMedia";
+
 import { SandboxFilesView } from "./SandboxFilesView";
 import { sandboxHeartbeat, shouldSendHeartbeat } from "./sandboxHeartbeat";
 import { useContainedAspectBox } from "./useContainedAspectBox";
@@ -70,6 +75,7 @@ export const SandboxStage = React.forwardRef<
   const [stageContainer, setStageContainer] =
     React.useState<HTMLDivElement | null>(null);
   const stageBox = useContainedAspectBox(stageContainer, SCREEN_ASPECT_RATIO);
+  const iframeRef = React.useRef<HTMLIFrameElement | null>(null);
 
   React.useImperativeHandle(
     ref,
@@ -101,6 +107,57 @@ export const SandboxStage = React.forwardRef<
     const interval = window.setInterval(tick, HEARTBEAT_INTERVAL_MS);
     return () => window.clearInterval(interval);
   }, [sandboxId, active, expired]);
+
+  // Clipboard bridge between this Mac and the sandbox's desktop.
+  //
+  // The viewer is a cross-origin, sandboxed iframe, so the DOM Clipboard API
+  // inside it is refused outright (`NotAllowedError`) regardless of user
+  // gesture — a sandboxed frame gets an opaque origin and `clipboard-read` is
+  // not grantable there. The app shell, by contrast, is a Tauri webview with
+  // a native clipboard path (`read_clipboard_text` / `copy_text_to_clipboard`,
+  // arboard-backed). So the shell does the clipboard I/O and exchanges plain
+  // text with the viewer over postMessage:
+  //   viewer -> "buzz:clipboard-request"      (user is about to interact)
+  //   shell  -> "buzz:clipboard" {text}       (current host clipboard)
+  //   viewer -> "buzz:clipboard-copy" {text}  (VM's selection changed)
+  React.useEffect(() => {
+    if (expired) return;
+    const onMessage = (event: MessageEvent) => {
+      const frame = iframeRef.current;
+      // Only listen to our own viewer frame.
+      if (!frame || event.source !== frame.contentWindow) return;
+      const data = event.data as { type?: unknown; text?: unknown } | null;
+      if (!data || typeof data.type !== "string") return;
+
+      if (data.type === "buzz:clipboard-request") {
+        void readTextFromSystemClipboard()
+          .then((text) => {
+            if (!text) return;
+            frame.contentWindow?.postMessage(
+              { type: "buzz:clipboard", text },
+              "*",
+            );
+          })
+          .catch(() => {
+            // Nothing on the clipboard, or the read failed — paste simply
+            // has nothing to deliver this time.
+          });
+        return;
+      }
+
+      if (
+        data.type === "buzz:clipboard-copy" &&
+        typeof data.text === "string"
+      ) {
+        void copyTextToSystemClipboard(data.text).catch(() => {
+          // Copying out of the VM is best-effort; a failure here must not
+          // disturb the live view.
+        });
+      }
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [expired]);
 
   const title = agentDisplayName
     ? `${agentDisplayName}'s computer`
@@ -139,6 +196,7 @@ export const SandboxStage = React.forwardRef<
         >
           <iframe
             key={viewerUrl}
+            ref={iframeRef}
             src={viewerUrl}
             title={title}
             className="h-full w-full border-0"
