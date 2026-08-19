@@ -1,9 +1,10 @@
 import * as React from "react";
-import { ExternalLink, FolderInput, Monitor } from "lucide-react";
+import { ExternalLink, FolderInput, Monitor, X } from "lucide-react";
 import { toast } from "sonner";
 
 import {
   Dialog,
+  DialogClose,
   DialogContent,
   DialogHeader,
   DialogTitle,
@@ -119,8 +120,11 @@ export function SandboxViewerDialog({
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className="flex h-[95vh] w-[95vw] max-w-[1600px] flex-col gap-0 p-0">
-          <DialogHeader className="flex-row items-center justify-between gap-4 border-b border-border px-5 py-3 pr-12">
+        <DialogContent
+          showCloseButton={false}
+          className="flex h-[95vh] w-[95vw] max-w-[1600px] flex-col gap-0 p-0"
+        >
+          <DialogHeader className="flex-row items-center justify-between gap-4 border-b border-border px-5 py-3">
             <div className="min-w-0">
               <DialogTitle
                 title={sandboxName ?? undefined}
@@ -182,6 +186,17 @@ export function SandboxViewerDialog({
                 </TooltipTrigger>
                 <TooltipContent>Open in a new window</TooltipContent>
               </Tooltip>
+
+              <DialogClose asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  aria-label="Close"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </DialogClose>
             </div>
           </DialogHeader>
 
