@@ -19,6 +19,12 @@ import { invokeTauri } from "@/shared/api/tauri";
 const SAMPLE_RATE = 48_000;
 
 export type TeachTaskMicHandle = {
+  /** Begin collecting samples. Call this at the exact moment the video
+   *  recording starts so the audio track and the video track share a t=0 —
+   *  the mic is opened earlier (to warm up during the countdown) but discards
+   *  everything until this is called, so the countdown seconds don't end up
+   *  as a leading offset that shifts the audio ahead of the video. */
+  beginCapture: () => void;
   /** Stop capturing and release the mic. Safe to call once. */
   stop: () => TeachTaskMicResult;
 };
@@ -70,13 +76,21 @@ export async function startTeachingMic(): Promise<TeachTaskMicHandle> {
 
   const batches: Float32Array[] = [];
   let totalSamples = 0;
+  // Mic is live immediately (warming up during the countdown), but samples are
+  // dropped until `beginCapture()` flips this on — so the recorded audio starts
+  // in lockstep with the video instead of leading it by the countdown.
+  let capturing = false;
   workletNode.port.onmessage = (event: MessageEvent<Float32Array>) => {
+    if (!capturing) return;
     batches.push(event.data);
     totalSamples += event.data.length;
   };
 
   let stopped = false;
   return {
+    beginCapture: () => {
+      capturing = true;
+    },
     stop: () => {
       if (stopped) {
         return { pcmBytes: new Uint8Array(0), wavBytes: null };

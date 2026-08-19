@@ -224,6 +224,11 @@ export function useTeachTask({
       try {
         await startSandboxRecording(sandboxId);
         recordingActiveRef.current = true;
+        // Start collecting mic samples now, in lockstep with ffmpeg's first
+        // frame — the mic has been warm since the countdown began, but only
+        // from here do its samples count, so audio and video share a t=0 and
+        // the audio isn't shifted ahead by the countdown duration.
+        micRef.current?.beginCapture();
         setCountdown(null);
         toast.info(
           startMode === "audio-video"
