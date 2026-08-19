@@ -108,6 +108,15 @@ export function useTeachTask({
   // always clear it — a ref (not state) since it's imperative bookkeeping, not
   // something a render depends on.
   const countdownTimerRef = React.useRef<number | null>(null);
+  // Guards the countdown→recording-start handoff so it fires EXACTLY once. The
+  // start is a side effect and must never run inside a `setState` updater (React
+  // may invoke updaters twice), which double-called the broker: the first call
+  // started ffmpeg, the second got a 409 whose catch reset the UI to idle while
+  // ffmpeg kept running — the "shows stopped but says already recording" bug.
+  const startFiredRef = React.useRef(false);
+  // Mirrors the countdown value for the interval callback to read without a
+  // stale closure — the tick decrements this and starts recording at zero.
+  const countdownRef = React.useRef<number | null>(null);
   // Mirrors `preview.videoUrl` so the unmount cleanup can revoke it without
   // depending on `preview` (which would re-run the effect on every preview
   // open/close and re-register the unmount handler needlessly).
@@ -121,6 +130,7 @@ export function useTeachTask({
       window.clearInterval(countdownTimerRef.current);
       countdownTimerRef.current = null;
     }
+    countdownRef.current = null;
   }, []);
 
   // On unmount (window/dialog closed) while a recording is still running, stop
@@ -176,6 +186,8 @@ export function useTeachTask({
   async function startTeaching(startMode: TeachTaskMode) {
     setUserInControl(true);
     setTeaching(true);
+    startFiredRef.current = false;
+    countdownRef.current = COUNTDOWN_SECONDS;
     setCountdown(COUNTDOWN_SECONDS);
 
     if (startMode === "audio-video") {
@@ -197,45 +209,49 @@ export function useTeachTask({
       }
     }
 
-    // A cancel (or unmount/reset) during the countdown clears `teaching` and
-    // the timer, so the tick below is a no-op the next time it fires — it
-    // never resurrects a cancelled countdown into a recording start.
-    countdownTimerRef.current = window.setInterval(() => {
-      setCountdown((current) => {
-        if (current == null) return current;
-        const next = current - 1;
-        if (next > 0) return next;
+    // Actually start the sandbox recording once the countdown elapses. Kept
+    // OUT of any `setState` updater (updaters must stay pure) and guarded by
+    // `startFiredRef` so it runs exactly once even if a tick double-fires.
+    const beginRecording = async () => {
+      if (startFiredRef.current) return;
+      startFiredRef.current = true;
+      clearCountdownTimer();
+      try {
+        await startSandboxRecording(sandboxId);
+        recordingActiveRef.current = true;
+        setCountdown(null);
+        toast.info(
+          startMode === "audio-video"
+            ? "Recording — narrate the task out loud, click again when done."
+            : "Recording video — click again when done.",
+        );
+      } catch (err) {
+        console.error("[useTeachTask] recording start failed:", err);
+        toast.error(
+          err instanceof Error
+            ? err.message
+            : "Could not start recording. Try again.",
+        );
+        micRef.current?.stop();
+        micRef.current = null;
+        setListening(false);
+        setCountdown(null);
+        setTeaching(false);
+      }
+    };
 
-        // Countdown reached zero — stop ticking and start the real recording.
-        clearCountdownTimer();
-        void (async () => {
-          try {
-            await startSandboxRecording(sandboxId);
-            recordingActiveRef.current = true;
-            setCountdown(null);
-            if (startMode === "audio-video") {
-              toast.info(
-                "Recording — narrate the task out loud, click again when done.",
-              );
-            } else {
-              toast.info("Recording video — click again when done.");
-            }
-          } catch (err) {
-            console.error("[useTeachTask] recording start failed:", err);
-            toast.error(
-              err instanceof Error
-                ? err.message
-                : "Could not start recording. Try again.",
-            );
-            micRef.current?.stop();
-            micRef.current = null;
-            setListening(false);
-            setCountdown(null);
-            setTeaching(false);
-          }
-        })();
-        return next;
-      });
+    // Tick the visible number down each second; when it reaches zero, start the
+    // recording. `countdownRef` is the source of truth (no stale closure); the
+    // state mirror just drives the overlay. A cancel/reset/unmount clears the
+    // timer first, so a queued tick can't resurrect a cancelled countdown.
+    countdownTimerRef.current = window.setInterval(() => {
+      const next = (countdownRef.current ?? 1) - 1;
+      countdownRef.current = next;
+      if (next <= 0) {
+        void beginRecording();
+      } else {
+        setCountdown(next);
+      }
     }, COUNTDOWN_TICK_MS);
   }
 
