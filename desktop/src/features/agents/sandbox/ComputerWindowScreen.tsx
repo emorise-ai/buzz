@@ -12,6 +12,7 @@ import { readComputerWindowHandoff } from "./computerWindow";
 import { SandboxStage } from "./SandboxStage";
 import { SandboxControlToggle } from "./SandboxControlToggle";
 import { TeachTaskButton } from "./TeachTaskButton";
+import { TeachTaskPreviewDialog } from "./TeachTaskPreviewDialog";
 import { useTeachTask } from "./useTeachTask";
 
 /** How long to wait for either the handoff params or the shared sandbox
@@ -67,11 +68,14 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
   // shared rather than forked so the pop-out doesn't drift from the dialog.
   const {
     teaching,
+    preview,
     mode,
     setMode,
     startTeaching,
     cancelTeaching,
     doneTeaching,
+    sendPreview,
+    discardPreview,
   } = useTeachTask({ sandboxId, ownerPubkey, setUserInControl });
 
   React.useEffect(() => {
@@ -148,57 +152,64 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
     : "Agent's computer";
 
   return (
-    <div className="flex h-screen w-screen flex-col bg-background">
-      {/* A real top bar (mirrors the in-app dialog header) rather than a
+    <>
+      <div className="flex h-screen w-screen flex-col bg-background">
+        {/* A real top bar (mirrors the in-app dialog header) rather than a
           floating button — keeps the control toggle + "Teach a task" out of
           the streamed browser's own window chrome, where a floating button
           overlapped the sandbox Chromium's min/close buttons. */}
-      <div className="flex shrink-0 items-center justify-between gap-4 border-b border-border px-4 py-2">
-        <div className="flex min-w-0 items-center gap-2">
-          <Monitor className="h-4 w-4 shrink-0 text-muted-foreground" />
-          <span className="truncate text-sm font-medium text-foreground">
-            {title}
-          </span>
-          {remaining && !expired ? (
-            <span className="shrink-0 text-2xs text-muted-foreground">
-              {remaining}
+        <div className="flex shrink-0 items-center justify-between gap-4 border-b border-border px-4 py-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <Monitor className="h-4 w-4 shrink-0 text-muted-foreground" />
+            <span className="truncate text-sm font-medium text-foreground">
+              {title}
             </span>
-          ) : null}
+            {remaining && !expired ? (
+              <span className="shrink-0 text-2xs text-muted-foreground">
+                {remaining}
+              </span>
+            ) : null}
+          </div>
+
+          <div className="flex shrink-0 items-center gap-3">
+            {!expired ? (
+              <SandboxControlToggle
+                userInControl={userInControl}
+                onToggle={() => setUserInControl((v) => !v)}
+              />
+            ) : null}
+
+            {!expired && ownerPubkey ? (
+              <TeachTaskButton
+                teaching={teaching}
+                mode={mode}
+                setMode={setMode}
+                onStart={(startMode) => void startTeaching(startMode)}
+                onFinish={() => void doneTeaching()}
+                onCancel={() => void cancelTeaching()}
+              />
+            ) : null}
+          </div>
         </div>
 
-        <div className="flex shrink-0 items-center gap-3">
-          {!expired ? (
-            <SandboxControlToggle
-              userInControl={userInControl}
-              onToggle={() => setUserInControl((v) => !v)}
-            />
-          ) : null}
-
-          {!expired && ownerPubkey ? (
-            <TeachTaskButton
-              teaching={teaching}
-              mode={mode}
-              setMode={setMode}
-              onStart={(startMode) => void startTeaching(startMode)}
-              onFinish={() => void doneTeaching()}
-              onCancel={() => void cancelTeaching()}
-            />
-          ) : null}
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          <SandboxStage
+            viewerUrl={mintedUrl}
+            sandboxId={sandboxId}
+            sandboxName={sandboxName}
+            agentDisplayName={agentDisplayName}
+            remaining={remaining}
+            expired={expired}
+            userInControl={userInControl}
+            onUserInControlChange={setUserInControl}
+          />
         </div>
       </div>
-
-      <div className="relative flex min-h-0 flex-1 flex-col">
-        <SandboxStage
-          viewerUrl={mintedUrl}
-          sandboxId={sandboxId}
-          sandboxName={sandboxName}
-          agentDisplayName={agentDisplayName}
-          remaining={remaining}
-          expired={expired}
-          userInControl={userInControl}
-          onUserInControlChange={setUserInControl}
-        />
-      </div>
-    </div>
+      <TeachTaskPreviewDialog
+        preview={preview}
+        onSend={sendPreview}
+        onDiscard={discardPreview}
+      />
+    </>
   );
 }

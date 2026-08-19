@@ -52,6 +52,18 @@ export async function startTeachingMic(): Promise<TeachTaskMicHandle> {
   if (audioContext.state === "suspended") {
     await audioContext.resume();
   }
+  // The worklet + the STT resampler both assume exactly 48 kHz; getUserMedia's
+  // sampleRate constraint is advisory and macOS often ignores it. Log the real
+  // rate so a mismatch (→ garbled/empty transcript) is visible.
+  if (audioContext.sampleRate !== SAMPLE_RATE) {
+    console.warn(
+      `[teachTaskMic] AudioContext is ${audioContext.sampleRate} Hz, expected ${SAMPLE_RATE} Hz — transcription may be wrong.`,
+    );
+  } else {
+    console.info(
+      `[teachTaskMic] AudioContext at ${audioContext.sampleRate} Hz`,
+    );
+  }
   await audioContext.audioWorklet.addModule("/worklet.js");
 
   const source = audioContext.createMediaStreamSource(
@@ -91,6 +103,9 @@ export async function startTeachingMic(): Promise<TeachTaskMicHandle> {
         merged.set(batch, offset);
         offset += batch.length;
       }
+      console.info(
+        `[teachTaskMic] captured ${totalSamples} samples (${(totalSamples / SAMPLE_RATE).toFixed(1)}s of audio)`,
+      );
       const pcmBytes = new Uint8Array(merged.buffer);
       const wavBytes = encodeWav(merged, SAMPLE_RATE);
       return { pcmBytes, wavBytes };

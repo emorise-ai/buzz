@@ -17,30 +17,40 @@ export async function startSandboxRecording(sandboxId: string): Promise<void> {
 }
 
 /**
- * Stop an in-progress recording, upload the finished mp4 to media storage,
- * and return the full media descriptor.
+ * Stop an in-progress recording and return the raw finished mp4 bytes. Does
+ * NOT upload anywhere — the caller decides what to do with the clip first
+ * (e.g. show it in a preview dialog) before committing to a Blossom upload.
  *
- * Two Tauri round-trips: `sandbox_recording_stop` fetches the raw mp4 bytes
- * from the broker (which does not host them anywhere durable — the file lives
- * only inside the sandbox's own filesystem), then `uploadMediaBytes` — the
- * same Blossom upload path used for pasted/dragged media — turns those bytes
- * into a fetchable blob. The full descriptor (url + sha256 + mime + size) lets
- * the caller attach the clip as a real imeta media tag so it renders as a
- * playable video in the message, not a bare URL.
+ * `sandbox_recording_stop` fetches the mp4 bytes from the broker, which does
+ * not host them anywhere durable — the file lives only inside the sandbox's
+ * own filesystem, so this is the only chance to grab them.
  *
  * `audio` is the "Teach a task" mic capture (WAV bytes) plus its extension.
  * When provided, the broker bakes it into the mp4 as the video's audio track
- * before handing the bytes back — same one round-trip, now with sound.
- * Omitting it is the original silent-video behavior.
+ * before handing the bytes back. Omitting it is the original silent-video
+ * behavior.
  */
 export async function stopSandboxRecording(
   sandboxId: string,
   audio?: { bytes: Uint8Array; ext: string },
-): Promise<BlobDescriptor> {
+): Promise<Uint8Array> {
   const bytes = await invokeTauri<number[]>("sandbox_recording_stop", {
     sandboxId,
     audio: audio ? Array.from(audio.bytes) : undefined,
     audioExt: audio?.ext,
   });
-  return uploadMediaBytes(bytes, "teach-task-recording.mp4");
+  return new Uint8Array(bytes);
+}
+
+/**
+ * Upload a previously-stopped recording's raw mp4 bytes to media storage
+ * (Blossom, via the same `uploadMediaBytes` path used for pasted/dragged
+ * media) and return the full descriptor. Split from `stopSandboxRecording` so
+ * a "Teach a task" preview can show the local clip before committing to an
+ * upload the human might discard instead.
+ */
+export async function uploadRecording(
+  bytes: Uint8Array,
+): Promise<BlobDescriptor> {
+  return uploadMediaBytes(Array.from(bytes), "teach-task-recording.mp4");
 }

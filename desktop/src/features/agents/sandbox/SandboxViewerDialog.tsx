@@ -14,6 +14,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { SandboxControlToggle } from "./SandboxControlToggle";
 import { SandboxStage, type SandboxStageHandle } from "./SandboxStage";
 import { TeachTaskButton } from "./TeachTaskButton";
+import { TeachTaskPreviewDialog } from "./TeachTaskPreviewDialog";
 import { openComputerWindow } from "./openComputerWindow";
 import { useTeachTask } from "./useTeachTask";
 
@@ -68,16 +69,19 @@ export function SandboxViewerDialog({
   const [userInControl, setUserInControl] = React.useState(false);
   const stageRef = React.useRef<SandboxStageHandle>(null);
 
-  // "Teach a task" — see `useTeachTask` for the full flow (record → upload →
-  // message the agent's DM). Shared with the pop-out computer window so the
-  // two surfaces don't drift.
+  // "Teach a task" — see `useTeachTask` for the full flow (record → preview →
+  // upload → message the agent's DM). Shared with the pop-out computer
+  // window so the two surfaces don't drift.
   const {
     teaching,
+    preview,
     mode,
     setMode,
     startTeaching,
     cancelTeaching,
     doneTeaching,
+    sendPreview,
+    discardPreview,
     resetTeaching,
   } = useTeachTask({ sandboxId, ownerPubkey, setUserInControl });
 
@@ -113,88 +117,95 @@ export function SandboxViewerDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex h-[95vh] w-[95vw] max-w-[1600px] flex-col gap-0 p-0">
-        <DialogHeader className="flex-row items-center justify-between gap-4 border-b border-border px-5 py-3 pr-12">
-          <div className="min-w-0">
-            <DialogTitle
-              title={sandboxName ?? undefined}
-              className="flex items-center gap-2 text-base"
-            >
-              <Monitor className="h-4 w-4 shrink-0" />
-              <span className="truncate">{title}</span>
-            </DialogTitle>
-            <DialogDescription className="mt-0.5 text-2xs">
-              {remaining && !expired ? remaining : null}
-            </DialogDescription>
-          </div>
-
-          <div className="flex shrink-0 items-center gap-3">
-            {!expired ? (
-              <SandboxControlToggle
-                userInControl={userInControl}
-                onToggle={() => setUserInControl((v) => !v)}
-              />
-            ) : null}
-
-            {!expired ? (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                data-testid="sandbox-transfer-files"
-                onClick={() => stageRef.current?.openTransfer()}
-                className="gap-1.5 text-2xs"
+    <>
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent className="flex h-[95vh] w-[95vw] max-w-[1600px] flex-col gap-0 p-0">
+          <DialogHeader className="flex-row items-center justify-between gap-4 border-b border-border px-5 py-3 pr-12">
+            <div className="min-w-0">
+              <DialogTitle
+                title={sandboxName ?? undefined}
+                className="flex items-center gap-2 text-base"
               >
-                <FolderInput className="h-3.5 w-3.5" />
-                Transfer files
-              </Button>
-            ) : null}
+                <Monitor className="h-4 w-4 shrink-0" />
+                <span className="truncate">{title}</span>
+              </DialogTitle>
+              <DialogDescription className="mt-0.5 text-2xs">
+                {remaining && !expired ? remaining : null}
+              </DialogDescription>
+            </div>
 
-            {!expired ? (
-              <TeachTaskButton
-                teaching={teaching}
-                mode={mode}
-                setMode={setMode}
-                onStart={(startMode) => void startTeaching(startMode)}
-                onFinish={() => void doneTeaching()}
-                onCancel={() => void cancelTeaching()}
-              />
-            ) : null}
+            <div className="flex shrink-0 items-center gap-3">
+              {!expired ? (
+                <SandboxControlToggle
+                  userInControl={userInControl}
+                  onToggle={() => setUserInControl((v) => !v)}
+                />
+              ) : null}
 
-            <Tooltip>
-              <TooltipTrigger asChild>
+              {!expired ? (
                 <Button
                   type="button"
                   variant="outline"
-                  size="icon"
-                  data-testid="sandbox-pop-out"
-                  aria-label="Open in a new window"
-                  onClick={() => void handlePopOut()}
+                  size="sm"
+                  data-testid="sandbox-transfer-files"
+                  onClick={() => stageRef.current?.openTransfer()}
+                  className="gap-1.5 text-2xs"
                 >
-                  <ExternalLink className="h-4 w-4" />
+                  <FolderInput className="h-3.5 w-3.5" />
+                  Transfer files
                 </Button>
-              </TooltipTrigger>
-              <TooltipContent>Open in a new window</TooltipContent>
-            </Tooltip>
-          </div>
-        </DialogHeader>
+              ) : null}
 
-        <div className="relative flex min-h-0 flex-1 flex-col">
-          <SandboxStage
-            ref={stageRef}
-            viewerUrl={viewerUrl}
-            sandboxId={sandboxId}
-            sandboxName={sandboxName}
-            agentDisplayName={agentDisplayName}
-            remaining={remaining}
-            expired={expired}
-            active={open}
-            userInControl={userInControl}
-            onUserInControlChange={setUserInControl}
-          />
-        </div>
-      </DialogContent>
-    </Dialog>
+              {!expired ? (
+                <TeachTaskButton
+                  teaching={teaching}
+                  mode={mode}
+                  setMode={setMode}
+                  onStart={(startMode) => void startTeaching(startMode)}
+                  onFinish={() => void doneTeaching()}
+                  onCancel={() => void cancelTeaching()}
+                />
+              ) : null}
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    data-testid="sandbox-pop-out"
+                    aria-label="Open in a new window"
+                    onClick={() => void handlePopOut()}
+                  >
+                    <ExternalLink className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Open in a new window</TooltipContent>
+              </Tooltip>
+            </div>
+          </DialogHeader>
+
+          <div className="relative flex min-h-0 flex-1 flex-col">
+            <SandboxStage
+              ref={stageRef}
+              viewerUrl={viewerUrl}
+              sandboxId={sandboxId}
+              sandboxName={sandboxName}
+              agentDisplayName={agentDisplayName}
+              remaining={remaining}
+              expired={expired}
+              active={open}
+              userInControl={userInControl}
+              onUserInControlChange={setUserInControl}
+            />
+          </div>
+        </DialogContent>
+      </Dialog>
+      <TeachTaskPreviewDialog
+        preview={preview}
+        onSend={sendPreview}
+        onDiscard={discardPreview}
+      />
+    </>
   );
 }
