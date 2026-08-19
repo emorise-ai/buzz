@@ -21,6 +21,15 @@ import {
   type TeachTaskMode,
 } from "./teachTaskModePreference";
 
+/** How long the pre-recording countdown runs, in whole seconds. The mic (for
+ *  audio-video mode) starts warming up the moment the countdown begins, and
+ *  the sandbox screen recording only starts once it reaches zero — so by the
+ *  time ffmpeg's first frame lands, the mic has been live for the full
+ *  countdown instead of the ~1s `getUserMedia`/`AudioContext.resume`/worklet
+ *  warm-up eating into the start of the narration. */
+const COUNTDOWN_SECONDS = 3;
+const COUNTDOWN_TICK_MS = 1000;
+
 /** A stopped-but-not-yet-sent recording, awaiting the human's confirmation in
  *  the preview dialog. `bytes` and `wavBytes` are kept around (not just the
  *  object URL) so `sendPreview` can upload and mux without re-stopping the
@@ -59,6 +68,12 @@ export type TeachTaskPreview = {
  * Recording mode ("Audio + Video" vs "Video only") is a persisted preference
  * (`teachTaskModePreference`), not per-call state — the human picks it once
  * from the button's dropdown and it's remembered as the default next time.
+ *
+ * `startTeaching` runs a visible 3-2-1 countdown (`countdown`) before the
+ * sandbox recording actually starts. For audio-video mode, the mic is warmed
+ * up (`getUserMedia`/`AudioContext.resume`/worklet load, ~1s) DURING that
+ * countdown instead of after the recording starts — previously the mic
+ * warm-up raced the recording start and lost the first ~second of narration.
  */
 export function useTeachTask({
   sandboxId,
@@ -71,6 +86,15 @@ export function useTeachTask({
 }) {
   const [teaching, setTeaching] = React.useState(false);
   const [listening, setListening] = React.useState(false);
+  // Seconds remaining in the pre-recording countdown, or `null` when not
+  // counting down (idle, actively recording, or processing). Drives the
+  // countdown overlay in both surfaces.
+  const [countdown, setCountdown] = React.useState<number | null>(null);
+  // True while `doneTeaching`'s background stop+transcribe work is in
+  // flight — drives the "Processing recording…" overlay so the human isn't
+  // staring at a stage that looks frozen for the several seconds ffmpeg
+  // takes to flush.
+  const [processing, setProcessing] = React.useState(false);
   const [preview, setPreview] = React.useState<TeachTaskPreview | null>(null);
   const mode = useTeachTaskMode();
   const micRef = React.useRef<TeachTaskMicHandle | null>(null);
@@ -80,6 +104,10 @@ export function useTeachTask({
   // mid-recording unmounts the hook and orphans ffmpeg — it keeps recording in
   // the sandbox forever with no UI left to stop it.
   const recordingActiveRef = React.useRef(false);
+  // Handle for the countdown's `setInterval`, so cancel/unmount/completion can
+  // always clear it — a ref (not state) since it's imperative bookkeeping, not
+  // something a render depends on.
+  const countdownTimerRef = React.useRef<number | null>(null);
   // Mirrors `preview.videoUrl` so the unmount cleanup can revoke it without
   // depending on `preview` (which would re-run the effect on every preview
   // open/close and re-register the unmount handler needlessly).
@@ -87,6 +115,13 @@ export function useTeachTask({
   const identityQuery = useIdentityQuery();
   const sendMessageMutation = useSendMessageMutation(null, identityQuery.data);
   const openDmMutation = useOpenDmMutation();
+
+  const clearCountdownTimer = React.useCallback(() => {
+    if (countdownTimerRef.current != null) {
+      window.clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+  }, []);
 
   // On unmount (window/dialog closed) while a recording is still running, stop
   // it in the sandbox so no orphaned ffmpeg keeps capturing. Best-effort and
@@ -96,6 +131,7 @@ export function useTeachTask({
   // life of the webview.
   React.useEffect(() => {
     return () => {
+      clearCountdownTimer();
       micRef.current?.stop();
       micRef.current = null;
       if (recordingActiveRef.current) {
@@ -109,11 +145,12 @@ export function useTeachTask({
         previewUrlRef.current = null;
       }
     };
-  }, [sandboxId]);
+  }, [sandboxId, clearCountdownTimer]);
 
   /** Reset all teaching state — call alongside a host surface's own
    *  session-reset (e.g. a freshly reopened dialog's `open` effect). */
   const resetTeaching = React.useCallback(() => {
+    clearCountdownTimer();
     micRef.current?.stop();
     micRef.current = null;
     // If a reset lands mid-recording (e.g. the dialog reopened onto a new
@@ -131,28 +168,23 @@ export function useTeachTask({
     }
     setTeaching(false);
     setListening(false);
+    setCountdown(null);
+    setProcessing(false);
     setPreview(null);
-  }, [sandboxId]);
+  }, [sandboxId, clearCountdownTimer]);
 
   async function startTeaching(startMode: TeachTaskMode) {
     setUserInControl(true);
     setTeaching(true);
-    try {
-      await startSandboxRecording(sandboxId);
-      recordingActiveRef.current = true;
-    } catch (err) {
-      console.error("[useTeachTask] recording start failed:", err);
-      toast.error(
-        err instanceof Error
-          ? err.message
-          : "Could not start recording. Try again.",
-      );
-      setTeaching(false);
-      return;
-    }
+    setCountdown(COUNTDOWN_SECONDS);
+
     if (startMode === "audio-video") {
-      // Mic capture is best-effort: a denied/unavailable mic shouldn't block
-      // the screen recording the human explicitly asked for — they just
+      // Warm the mic up DURING the countdown, not after the sandbox recording
+      // has already started — `getUserMedia` + `AudioContext.resume` + the
+      // worklet module load take close to a second to go live, and starting
+      // ffmpeg first meant that second of narration was silently dropped from
+      // every recording. Best-effort: a denied/unavailable mic shouldn't
+      // block the screen recording the human explicitly asked for — they just
       // won't get a transcript alongside it.
       try {
         micRef.current = await startTeachingMic();
@@ -163,28 +195,70 @@ export function useTeachTask({
           "Could not access the microphone — recording video only, no narration.",
         );
       }
-      toast.info(
-        "Recording — narrate the task out loud, click again when done.",
-      );
-    } else {
-      toast.info("Recording video — click again when done.");
     }
+
+    // A cancel (or unmount/reset) during the countdown clears `teaching` and
+    // the timer, so the tick below is a no-op the next time it fires — it
+    // never resurrects a cancelled countdown into a recording start.
+    countdownTimerRef.current = window.setInterval(() => {
+      setCountdown((current) => {
+        if (current == null) return current;
+        const next = current - 1;
+        if (next > 0) return next;
+
+        // Countdown reached zero — stop ticking and start the real recording.
+        clearCountdownTimer();
+        void (async () => {
+          try {
+            await startSandboxRecording(sandboxId);
+            recordingActiveRef.current = true;
+            setCountdown(null);
+            if (startMode === "audio-video") {
+              toast.info(
+                "Recording — narrate the task out loud, click again when done.",
+              );
+            } else {
+              toast.info("Recording video — click again when done.");
+            }
+          } catch (err) {
+            console.error("[useTeachTask] recording start failed:", err);
+            toast.error(
+              err instanceof Error
+                ? err.message
+                : "Could not start recording. Try again.",
+            );
+            micRef.current?.stop();
+            micRef.current = null;
+            setListening(false);
+            setCountdown(null);
+            setTeaching(false);
+          }
+        })();
+        return next;
+      });
+    }, COUNTDOWN_TICK_MS);
   }
 
   function cancelTeaching() {
     // Discard is instant: exit the recording UI at once, then stop the sandbox
-    // ffmpeg in the background. The human doesn't care about the result — they
-    // asked to throw it away — so there's no reason to hold the button while
-    // the broker waits for ffmpeg to flush.
+    // ffmpeg in the background (if it had actually started — a cancel during
+    // the countdown means it never did, since `startSandboxRecording` only
+    // runs once the countdown hits zero). The human doesn't care about the
+    // result — they asked to throw it away — so there's no reason to hold the
+    // button while the broker waits for ffmpeg to flush.
+    clearCountdownTimer();
     micRef.current?.stop();
     micRef.current = null;
-    recordingActiveRef.current = false;
     setListening(false);
     setTeaching(false);
-    void stopSandboxRecording(sandboxId).catch((err) => {
-      // Nothing to surface — the recording is being discarded regardless.
-      console.warn("[useTeachTask] recording stop on cancel:", err);
-    });
+    setCountdown(null);
+    if (recordingActiveRef.current) {
+      recordingActiveRef.current = false;
+      void stopSandboxRecording(sandboxId).catch((err) => {
+        // Nothing to surface — the recording is being discarded regardless.
+        console.warn("[useTeachTask] recording stop on cancel:", err);
+      });
+    }
   }
 
   function doneTeaching() {
@@ -192,13 +266,21 @@ export function useTeachTask({
       toast.error("This agent has no known pubkey to message.");
       return;
     }
+    // Done clicked mid-countdown, before the sandbox recording ever started —
+    // nothing was captured, so there's nothing to finish. Fall back to the
+    // same instant-exit path `cancelTeaching` uses.
+    if (!recordingActiveRef.current) {
+      cancelTeaching();
+      return;
+    }
     // Grab the mic buffers, then EXIT the recording UI immediately. Stopping
     // the sandbox recording and transcribing are both multi-second server
     // round-trips; holding the button in "Finishing…" until they complete
     // made the UI feel frozen and, if either step hung, left it stuck
-    // forever. Instead the button returns to idle at once and a toast tracks
-    // the background work, then the preview dialog opens once the bytes are
-    // ready — nothing is uploaded or sent until the human confirms it there.
+    // forever. Instead the button returns to idle at once and the new
+    // `processing` overlay tracks the background work, then the preview
+    // dialog opens once the bytes are ready — nothing is uploaded or sent
+    // until the human confirms it there.
     const mic = micRef.current;
     micRef.current = null;
     const { pcmBytes, wavBytes } = mic?.stop() ?? {
@@ -208,6 +290,7 @@ export function useTeachTask({
     recordingActiveRef.current = false;
     setListening(false);
     setTeaching(false);
+    setProcessing(true);
 
     const process = async () => {
       // Transcribe first — stopping the recording below hands the same WAV
@@ -233,6 +316,7 @@ export function useTeachTask({
         new Blob([bytes.buffer as ArrayBuffer], { type: "video/mp4" }),
       );
       previewUrlRef.current = videoUrl;
+      setProcessing(false);
       setPreview({ videoUrl, bytes, transcript, wavBytes });
     };
 
@@ -243,6 +327,7 @@ export function useTeachTask({
           ? err.message
           : "Could not finish the recording. Try again.",
       );
+      setProcessing(false);
     });
   }
 
@@ -312,6 +397,8 @@ export function useTeachTask({
   return {
     teaching,
     listening,
+    countdown,
+    processing,
     preview,
     mode,
     setMode: setTeachTaskMode,

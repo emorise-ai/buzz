@@ -12,6 +12,7 @@ import { readComputerWindowHandoff } from "./computerWindow";
 import { SandboxStage } from "./SandboxStage";
 import { SandboxControlToggle } from "./SandboxControlToggle";
 import { TeachTaskButton } from "./TeachTaskButton";
+import { TeachTaskOverlay } from "./TeachTaskOverlay";
 import { TeachTaskPreviewDialog } from "./TeachTaskPreviewDialog";
 import { useTeachTask } from "./useTeachTask";
 
@@ -68,6 +69,8 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
   // shared rather than forked so the pop-out doesn't drift from the dialog.
   const {
     teaching,
+    countdown,
+    processing,
     preview,
     mode,
     setMode,
@@ -202,6 +205,11 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
             expired={expired}
             userInControl={userInControl}
             onUserInControlChange={setUserInControl}
+          />
+          <TeachTaskOverlay
+            countdown={countdown}
+            recording={teaching && countdown == null}
+            processing={processing}
           />
         </div>
       </div>

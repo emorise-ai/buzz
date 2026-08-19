@@ -15,6 +15,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { SandboxControlToggle } from "./SandboxControlToggle";
 import { SandboxStage, type SandboxStageHandle } from "./SandboxStage";
 import { TeachTaskButton } from "./TeachTaskButton";
+import { TeachTaskOverlay } from "./TeachTaskOverlay";
 import { TeachTaskPreviewDialog } from "./TeachTaskPreviewDialog";
 import { openComputerWindow } from "./openComputerWindow";
 import { useTeachTask } from "./useTeachTask";
@@ -75,6 +76,8 @@ export function SandboxViewerDialog({
   // window so the two surfaces don't drift.
   const {
     teaching,
+    countdown,
+    processing,
     preview,
     mode,
     setMode,
@@ -212,6 +215,11 @@ export function SandboxViewerDialog({
               active={open}
               userInControl={userInControl}
               onUserInControlChange={setUserInControl}
+            />
+            <TeachTaskOverlay
+              countdown={countdown}
+              recording={teaching && countdown == null}
+              processing={processing}
             />
           </div>
         </DialogContent>
