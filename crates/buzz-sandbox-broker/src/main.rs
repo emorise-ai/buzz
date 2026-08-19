@@ -18,7 +18,7 @@ mod identity;
 mod proxy;
 mod sandbox;
 
-use axum::extract::{Path, Query, RawQuery, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, RawQuery, Request, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
@@ -330,8 +330,21 @@ fn build_router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/sandboxes", get(list_sandboxes).post(create_sandbox))
         .merge(sandbox_scoped)
+        // Raise the request-body cap above axum's 2 MB default. File uploads
+        // (`fs/file`) and teach-a-task recording audio (`recording/stop`) both
+        // legitimately send tens of MB, and both already enforce their own
+        // 50 MB caps with clear errors — but axum's default rejected anything
+        // over 2 MB first with a terse 413 before those checks ran, so a
+        // recording of more than a few seconds failed to save. Sized just
+        // above the app-level caps so those remain the real limit.
+        .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
         .with_state(state)
 }
+
+/// Router-wide request-body cap. Above the 50 MB `fs/file` and recording-audio
+/// caps so the handlers' own size checks (with actionable messages) are what a
+/// caller hits, not axum's default 2 MB limit.
+const BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Unauthenticated: it reports only that the process is up, so a health probe
 /// does not need a credential.
