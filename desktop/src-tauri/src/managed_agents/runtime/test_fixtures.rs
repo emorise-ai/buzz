@@ -39,6 +39,7 @@ pub(super) fn fixture(
         pubkey: "p".into(),
         name: "n".into(),
         persona_id: None,
+        job_title: None,
         private_key_nsec: "nsec1fake".into(),
         auth_tag,
         sandbox_id: None,

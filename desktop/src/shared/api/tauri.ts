@@ -109,12 +109,12 @@ type RawRelayAgent = {
   respond_to?: RelayAgent["respondTo"];
   respond_to_allowlist?: string[];
 };
-
 import type { RestartDiffEntry as RawRestartDiffEntry } from "./restartDiff";
 export type RawManagedAgent = {
   pubkey: string;
   name: string;
   persona_id: string | null;
+  job_title?: string | null;
   // Optional: pre-feature fixtures may omit it. The record's harness/runtime id.
   runtime?: string | null;
   team_id?: string | null;
@@ -666,12 +666,12 @@ function fromRawRelayAgent(agent: RawRelayAgent): RelayAgent {
     respondToAllowlist: agent.respond_to_allowlist ?? [],
   };
 }
-
 export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
   return {
     pubkey: agent.pubkey,
     name: agent.name,
     personaId: agent.persona_id,
+    jobTitle: agent.job_title ?? null,
     runtime: agent.runtime ?? null,
     teamId: agent.team_id ?? null,
     relayUrl: agent.relay_url,

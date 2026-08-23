@@ -9,6 +9,7 @@ import type {
 export type RawPersona = {
   id: string;
   display_name: string;
+  job_title?: string | null;
   avatar_url: string | null;
   system_prompt: string;
   runtime?: string | null;
@@ -39,6 +40,7 @@ export function fromRawPersona(persona: RawPersona): AgentPersona {
   return {
     id: persona.id,
     displayName: persona.display_name,
+    jobTitle: persona.job_title ?? null,
     avatarUrl: persona.avatar_url,
     systemPrompt: persona.system_prompt,
     runtime: persona.runtime ?? null,
@@ -75,6 +77,7 @@ export async function createPersona(
     await invokeTauri<RawPersona>("create_persona", {
       input: {
         displayName: input.displayName,
+        jobTitle: input.jobTitle,
         avatarUrl: input.avatarUrl,
         systemPrompt: input.systemPrompt,
         runtime: input.runtime,
@@ -94,6 +97,7 @@ function updatePersonaPayload(input: UpdatePersonaInput) {
   return {
     id: input.id,
     displayName: input.displayName,
+    jobTitle: input.jobTitle,
     avatarUrl: input.avatarUrl,
     systemPrompt: input.systemPrompt,
     runtime: input.runtime,
@@ -368,6 +372,7 @@ export async function loadAgentCard(storedFileName: string): Promise<string> {
 /** Preview returned by `preview_agent_snapshot_import` before any write. */
 export type AgentSnapshotImportPreview = {
   displayName: string;
+  jobTitle: string | null;
   /** Source classification shown in the preview; imports remain custom. */
   isBuiltIn: boolean;
   model: string | null;

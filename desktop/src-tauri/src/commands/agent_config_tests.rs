@@ -69,6 +69,7 @@ fn agent_record() -> ManagedAgentRecord {
         pubkey: "agent".to_string(),
         name: "Agent".to_string(),
         persona_id: Some("persona-1".to_string()),
+        job_title: None,
         private_key_nsec: "".to_string(),
         auth_tag: None,
         sandbox_id: None,
@@ -127,6 +128,7 @@ fn persona_with_model(model: &str) -> AgentDefinition {
     AgentDefinition {
         id: "persona-1".to_string(),
         display_name: "Persona".to_string(),
+        job_title: None,
         avatar_url: None,
         system_prompt: "You are a persona.".to_string(),
         runtime: None,

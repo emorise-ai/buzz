@@ -18,8 +18,8 @@ use crate::{
             decrypt_envelope, parse_chunk_payload, resolve_unlock_secret, ChunkPayload,
             LOCKED_CARD_REFUSAL,
         },
-        load_managed_agents, load_personas, save_managed_agents, save_personas, AgentDefinition,
-        ManagedAgentRecord, RespondTo,
+        load_managed_agents, load_personas, normalize_optional_job_title, save_managed_agents,
+        save_personas, validate_optional_job_title, AgentDefinition, ManagedAgentRecord, RespondTo,
     },
     relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
     util::now_iso,
@@ -54,6 +54,7 @@ pub(super) fn reject_legacy_persona_filename(file_name: &str) -> Result<(), Stri
 pub struct AgentSnapshotImportPreview {
     /// Agent display name from the snapshot.
     pub display_name: String,
+    pub job_title: Option<String>,
     /// Whether the exported source definition was built in. This is display
     /// metadata only; confirmed imports are always independent custom agents.
     pub is_builtin: bool,
@@ -87,7 +88,6 @@ pub struct AgentSnapshotImportPreview {
     /// reach a preview — they fail closed with the locked-card refusal.
     pub locked: bool,
 }
-
 /// The confirmation request sent from the UI after the user reviews the preview.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,7 +98,6 @@ pub struct AgentSnapshotImportConfirm {
     /// When false (the safe default), the allowlist is cleared.
     pub keep_allowlist: bool,
 }
-
 /// Structured result returned after a confirmed import.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -163,7 +162,6 @@ pub(crate) fn resolve_snapshot_import_behavior(
 
     // Step 1: normalize allowlist; reject malformed pubkeys immediately.
     let normalized_allowlist = validate_respond_to_allowlist(raw_allowlist)?;
-
     // Step 2: detect source mode and whether a list was present.
     let source_mode: Option<RespondTo> = match raw_respond_to {
         Some(wire) => Some(RespondTo::parse_wire(wire)?),
@@ -406,13 +404,12 @@ pub(crate) fn build_agent_snapshot_import_preview(
         MemoryLevel::Everything => "everything",
     }
     .to_string();
-
     let manifest_json = serde_json::to_string_pretty(snapshot)
         .map_err(|e| format!("failed to render snapshot manifest: {e}"))?;
     let source_allowlist = snapshot.definition.respond_to_allowlist.clone();
-
     Ok(AgentSnapshotImportPreview {
         display_name: snapshot.profile.display_name.clone(),
+        job_title: snapshot.definition.job_title.clone(),
         is_builtin: snapshot.definition.source_is_builtin,
         model: snapshot.definition.model.clone(),
         runtime: snapshot.definition.runtime.clone(),
@@ -477,6 +474,8 @@ pub async fn confirm_agent_snapshot_import(
     if display_name.is_empty() {
         return Err("Snapshot display name is empty.".to_string());
     }
+    let job_title = normalize_optional_job_title(snapshot.definition.job_title.clone());
+    validate_optional_job_title(job_title.as_deref())?;
 
     // ── Resolve behavioral defaults ──────────────────────────────────────────
     let minted = resolve_snapshot_import_behavior(
@@ -562,6 +561,7 @@ pub async fn confirm_agent_snapshot_import(
         let persona = AgentDefinition {
             id: persona_id.clone(),
             display_name: display_name.clone(),
+            job_title: job_title.clone(),
             avatar_url: effective_avatar.clone(),
             system_prompt: snapshot
                 .definition
@@ -598,6 +598,7 @@ pub async fn confirm_agent_snapshot_import(
             pubkey: pubkey.clone(),
             name: display_name.clone(),
             display_name: None,
+            job_title,
             slug: None,
             persona_id: Some(persona_id.clone()),
             private_key_nsec: private_key_nsec.clone(),

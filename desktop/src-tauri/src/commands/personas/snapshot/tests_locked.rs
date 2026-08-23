@@ -19,6 +19,7 @@ fn record_for(agent: &nostr::Keys) -> ManagedAgentRecord {
         pubkey: agent.public_key().to_hex(),
         slug: None,
         persona_id: Some("locked-test".to_string()),
+        job_title: None,
         private_key_nsec: nostr::ToBech32::to_bech32(agent.secret_key()).unwrap(),
         ..make_definition("")
     }

@@ -13,6 +13,7 @@ fn member(name: &str) -> AgentSnapshot {
         version: crate::managed_agents::agent_snapshot::FORMAT_VERSION,
         definition: AgentSnapshotDefinition {
             name: name.to_string(),
+            job_title: None,
             source_is_builtin: false,
             system_prompt: Some(format!("{name} prompt")),
             runtime: Some("goose".to_string()),
@@ -57,6 +58,7 @@ fn team_export_round_trip_preserves_team_and_excludes_member_memory() {
         AgentDefinition {
             id: "alice".to_string(),
             display_name: "Alice".to_string(),
+            job_title: None,
             avatar_url: None,
             system_prompt: "Alice prompt".to_string(),
             runtime: Some("goose".to_string()),
@@ -79,6 +81,7 @@ fn team_export_round_trip_preserves_team_and_excludes_member_memory() {
         AgentDefinition {
             id: "bob".to_string(),
             display_name: "Bob".to_string(),
+            job_title: None,
             avatar_url: None,
             system_prompt: "Bob prompt".to_string(),
             runtime: Some("goose".to_string()),
@@ -142,6 +145,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
     let definitions = vec![AgentDefinition {
         id: "alice".to_string(),
         display_name: "Alice".to_string(),
+        job_title: None,
         avatar_url: None,
         system_prompt: "Alice prompt".to_string(),
         runtime: Some("goose".to_string()),
@@ -183,6 +187,7 @@ fn team_export_with_instance_and_memory_level_uses_supplied_entries() {
         display_name: None,
         slug: None,
         persona_id: Some("alice".to_string()),
+        job_title: None,
         private_key_nsec: String::new(),
         auth_tag: None,
         sandbox_id: None,

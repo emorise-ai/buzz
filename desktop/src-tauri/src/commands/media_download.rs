@@ -613,6 +613,7 @@ mod tests {
             version: FORMAT_VERSION,
             definition: AgentSnapshotDefinition {
                 name: "test".to_string(),
+                job_title: None,
                 source_is_builtin: false,
                 system_prompt: None,
                 runtime: None,
@@ -663,6 +664,7 @@ mod tests {
             version: FORMAT_VERSION,
             definition: AgentSnapshotDefinition {
                 name: "test".to_string(),
+                job_title: None,
                 source_is_builtin: false,
                 system_prompt: None,
                 runtime: None,
@@ -709,6 +711,7 @@ mod tests {
             version: FORMAT_VERSION,
             definition: AgentSnapshotDefinition {
                 name: "test".to_string(),
+                job_title: None,
                 source_is_builtin: false,
                 system_prompt: None,
                 runtime: None,

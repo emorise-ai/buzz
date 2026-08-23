@@ -16,6 +16,7 @@ fn make_definition(slug: &str) -> ManagedAgentRecord {
         name: slug.to_string(),
         display_name: None,
         persona_id: None,
+        job_title: None,
         private_key_nsec: String::new(),
         auth_tag: None,
         sandbox_id: None,
@@ -78,6 +79,7 @@ fn make_snapshot(
         version: FORMAT_VERSION,
         definition: AgentSnapshotDefinition {
             name: "Test Agent".to_string(),
+            job_title: None,
             source_is_builtin: false,
             system_prompt: Some("You are helpful.".to_string()),
             runtime: None,

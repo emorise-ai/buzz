@@ -19,7 +19,7 @@ pub(in crate::managed_agents) use path::build_augmented_path;
 pub(crate) use path::{compose_path_entries, should_skip_claude_executable, should_use_inherited};
 
 pub(crate) use super::access_policy::{build_respond_to_env_with_policy, RespondToEnv};
-
+mod job_title;
 mod metadata;
 pub(crate) use metadata::{
     apply_agent_display_env, resolve_session_title, runtime_metadata_env_vars,
@@ -29,10 +29,8 @@ pub(crate) use metadata::{
 mod stop;
 pub(crate) use stop::managed_agent_runtime_keys;
 pub use stop::{stop_managed_agent_process, stop_managed_agent_workspace_pair};
-
 mod sweep;
 pub(crate) use sweep::sweep_untracked_bundle_harnesses;
-
 mod process;
 #[cfg(test)]
 use process::{
@@ -295,11 +293,13 @@ pub fn build_managed_agent_summary(
         .and_then(|r| r.mcp_command)
         .unwrap_or("")
         .to_string();
+    let job_title = job_title::resolve_job_title(record, personas);
 
     Ok(ManagedAgentSummary {
         pubkey: record.pubkey.clone(),
         name: record.name.clone(),
         persona_id: record.persona_id.clone(),
+        job_title,
         runtime: record.runtime.clone(),
         team_id: record.team_id.clone(),
         relay_url: record.relay_url.clone(),

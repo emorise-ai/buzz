@@ -48,6 +48,10 @@ pub struct PersonaEventContent {
     pub respond_to_allowlist: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallelism: Option<u32>,
+    /// Optional display-only title. Appended to preserve legacy event bytes
+    /// when no title is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_title: Option<String>,
 }
 
 /// Derive the d-tag (persona slug) from a `AgentDefinition`.
@@ -180,10 +184,12 @@ pub fn persona_from_event(event: &nostr::Event) -> Result<AgentDefinition, Strin
         .map_err(|e| format!("failed to parse persona event content: {e}"))?;
 
     let created_at = event.created_at.to_human_datetime();
+    let job_title = crate::managed_agents::normalize_optional_job_title(content.job_title);
 
     Ok(AgentDefinition {
         id: d_tag.clone(),
         display_name: content.display_name,
+        job_title,
         avatar_url: content.avatar_url,
         system_prompt: content.system_prompt.unwrap_or_default(),
         runtime: content.runtime,
@@ -396,6 +402,7 @@ pub fn persona_event_content(record: &AgentDefinition) -> PersonaEventContent {
         respond_to: record.respond_to.clone(),
         respond_to_allowlist: record.respond_to_allowlist.clone(),
         parallelism: record.parallelism,
+        job_title: record.job_title.clone(),
     }
 }
 

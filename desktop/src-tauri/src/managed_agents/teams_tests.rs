@@ -166,6 +166,7 @@ fn managed_agent(name: &str) -> ManagedAgentRecord {
         pubkey: name.to_string(),
         name: name.to_string(),
         persona_id: None,
+        job_title: None,
         team_id: None,
         private_key_nsec: String::new(),
         auth_tag: None,

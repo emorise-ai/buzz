@@ -313,6 +313,7 @@ function AgentPersonaCard({
         agent ? <AgentSandboxCardIndicator agentPubkey={agent.pubkey} /> : null
       }
       dataTestId={`persona-agent-row-${persona.id}`}
+      jobTitle={persona.jobTitle}
       label={title}
       modelLabel={modelLabel}
       onClick={() => {
@@ -394,6 +395,7 @@ function StandaloneAgentCard({
       avatarUrl={profileQuery.data?.avatarUrl}
       cornerBadge={<AgentSandboxCardIndicator agentPubkey={agent.pubkey} />}
       dataTestId={`managed-agent-${agent.pubkey}`}
+      jobTitle={agent.jobTitle}
       label={title}
       modelLabel={resolveAgentCardModelLabel({
         agent,

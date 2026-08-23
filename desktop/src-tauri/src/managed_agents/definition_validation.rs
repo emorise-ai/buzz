@@ -9,6 +9,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 const MAX_DISPLAY_NAME_CHARS: usize = 128;
+const MAX_JOB_TITLE_CHARS: usize = 128;
 const MAX_SYSTEM_PROMPT_BYTES: usize = 64 * 1024;
 const EMOJI_VARIATION_SELECTOR: char = '\u{FE0F}';
 const ZERO_WIDTH_JOINER: char = '\u{200D}';
@@ -39,6 +40,30 @@ pub(crate) fn validate_agent_definition_text(
 
     validate_visible_text(display_name, "Display name", false)?;
     validate_visible_text(system_prompt, "Agent instructions", true)
+}
+
+/// Normalize an optional job title before it crosses a persistence or event
+/// boundary. Blank and whitespace-only values are represented as absent.
+pub(crate) fn normalize_optional_job_title(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+/// Validate the optional, display-only job title using the same visible-text
+/// boundary as other human-reviewed agent definition fields.
+pub(crate) fn validate_optional_job_title(job_title: Option<&str>) -> Result<(), String> {
+    let Some(job_title) = job_title else {
+        return Ok(());
+    };
+    let characters = job_title.chars().count();
+    if characters > MAX_JOB_TITLE_CHARS {
+        return Err(format!(
+            "Job title is too long ({characters} characters, max {MAX_JOB_TITLE_CHARS})"
+        ));
+    }
+    validate_visible_text(job_title, "Job title", false)
 }
 
 /// Validate the human-reviewed definition text carried by a managed agent.
@@ -234,6 +259,19 @@ mod tests {
     fn enforces_display_name_and_prompt_bounds() {
         assert!(validate_agent_definition_text(&"a".repeat(129), "prompt").is_err());
         assert!(validate_agent_definition_text("Reviewer", &"a".repeat(64 * 1024 + 1)).is_err());
+    }
+
+    #[test]
+    fn normalizes_and_validates_optional_job_titles() {
+        assert_eq!(normalize_optional_job_title(None), None);
+        assert_eq!(
+            normalize_optional_job_title(Some("  Lead Researcher  ".into())),
+            Some("Lead Researcher".into())
+        );
+        assert_eq!(normalize_optional_job_title(Some("   ".into())), None);
+        assert!(validate_optional_job_title(Some("Lead Researcher")).is_ok());
+        assert!(validate_optional_job_title(Some(&"a".repeat(129))).is_err());
+        assert!(validate_optional_job_title(Some("Lead\u{200B}Researcher")).is_err());
     }
 
     #[test]

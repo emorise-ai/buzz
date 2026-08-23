@@ -186,11 +186,11 @@ fn classifies_cli_missing_when_adapter_found_but_cli_absent() {
     assert_eq!(cmd.as_deref(), Some("codex-acp"));
     assert_eq!(path.as_deref(), Some("/opt/homebrew/bin/codex-acp"));
 }
-
 fn persona_with_runtime(id: &str, runtime: Option<&str>) -> crate::managed_agents::AgentDefinition {
     crate::managed_agents::AgentDefinition {
         id: id.to_string(),
         display_name: id.to_string(),
+        job_title: None,
         avatar_url: None,
         system_prompt: String::new(),
         runtime: runtime.map(str::to_string),
@@ -211,7 +211,6 @@ fn persona_with_runtime(id: &str, runtime: Option<&str>) -> crate::managed_agent
         updated_at: "2026-06-09T00:00:00Z".to_string(),
     }
 }
-
 #[test]
 fn effective_agent_command_explicit_override_wins() {
     // An explicit pin beats the persona's runtime.
@@ -233,6 +232,7 @@ fn record_with(
         pubkey: String::new(),
         name: "r".to_string(),
         persona_id: persona_id.map(str::to_string),
+        job_title: None,
         private_key_nsec: String::new(),
         auth_tag: None,
         sandbox_id: None,

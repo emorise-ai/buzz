@@ -12,6 +12,7 @@ type AgentIdentityCardProps = {
   /** Optional badge pinned to the top-left corner (e.g. a "has a computer" glyph). */
   cornerBadge?: ReactNode;
   dataTestId: string;
+  jobTitle?: string | null;
   label: string;
   modelLabel?: string | null;
   onClick: () => void;
@@ -26,12 +27,14 @@ export function AgentIdentityCard({
   avatarUrl,
   cornerBadge,
   dataTestId,
+  jobTitle,
   label,
   modelLabel,
   onClick,
   statusBadge,
 }: AgentIdentityCardProps) {
   const trimmedAvatarUrl = avatarUrl?.trim() || null;
+  const trimmedJobTitle = jobTitle?.trim() || null;
 
   return (
     <div
@@ -81,7 +84,14 @@ export function AgentIdentityCard({
         <span className="min-w-0 truncate font-semibold text-foreground tracking-normal">
           {label}
         </span>
-        {modelLabel ? (
+        {trimmedJobTitle ? (
+          <span
+            className="min-w-0 truncate text-xs font-normal text-secondary-foreground/75"
+            data-testid={`${dataTestId}-job-title`}
+          >
+            {trimmedJobTitle}
+          </span>
+        ) : modelLabel ? (
           <span className="min-w-0 truncate text-xs font-normal text-secondary-foreground/75">
             {modelLabel}
           </span>

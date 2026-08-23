@@ -250,6 +250,16 @@ pub(crate) async fn materialize_snapshot_bytes(
         let (def_record, is_definition) = resolve_from_lists(&id, &instances, &definitions)
             .map(|(r, is_def)| (r.clone(), is_def))?;
         let mut def_record = def_record;
+        if !is_definition {
+            if let Some(persona_id) = def_record.persona_id.as_deref() {
+                if let Some(persona) = definitions
+                    .iter()
+                    .find(|definition| definition.slug.as_deref() == Some(persona_id))
+                {
+                    def_record.job_title = persona.job_title.clone();
+                }
+            }
+        }
         // A snapshot is a verbatim portable copy of the effective runtime,
         // provider, and model configuration, not a pointer to the sender's
         // machine-wide defaults. This does not translate or substitute values
@@ -479,6 +489,7 @@ mod png_body_tests {
             version: crate::managed_agents::agent_snapshot::FORMAT_VERSION,
             definition: crate::managed_agents::agent_snapshot::AgentSnapshotDefinition {
                 name: "Agent".to_string(),
+                job_title: None,
                 source_is_builtin: false,
                 system_prompt: None,
                 runtime: None,

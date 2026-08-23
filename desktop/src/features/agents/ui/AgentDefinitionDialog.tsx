@@ -70,6 +70,7 @@ import { useBakedBuildEnvKeysQuery, useRuntimeFileConfigQuery } from "../hooks";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { AgentHarnessField } from "./AgentHarnessField";
+import { PersonaJobTitleField } from "./PersonaJobTitleField";
 import {
   AgentAiConfigurationModeField,
   AgentCreateAiDefaultsSummary,
@@ -139,6 +140,7 @@ export function AgentDefinitionDialog({
 }: AgentDefinitionDialogProps) {
   const runtimesLoading = runtimeCatalogStatus === "loading";
   const [displayName, setDisplayName] = React.useState("");
+  const [jobTitle, setJobTitle] = React.useState("");
   const [aiDefaultsOpen, setAiDefaultsOpen] = React.useState(false);
   const aiDefaultsTriggerRef = React.useRef<HTMLButtonElement>(null);
   const [avatarUrl, setAvatarUrl] = React.useState("");
@@ -194,17 +196,15 @@ export function AgentDefinitionDialog({
       !hasText(initialValues.runtime) &&
       (hasText(initialValues.model) || hasText(initialValues.provider)),
   );
-
   React.useEffect(() => {
     onDirtyChange?.(hasUserChanges);
   }, [hasUserChanges, onDirtyChange]);
-
   React.useEffect(() => {
     if (!open || !initialValues) {
       return;
     }
-
     setDisplayName(initialValues.displayName);
+    setJobTitle(initialValues.jobTitle ?? "");
     setAvatarUrl(initialValues.avatarUrl ?? "");
     setSystemPrompt(initialValues.systemPrompt);
     setRuntime(initialValues.runtime ?? "");
@@ -236,7 +236,6 @@ export function AgentDefinitionDialog({
     isRuntimeAutoSeededRef.current = false;
     hasSeededForOpenRef.current = false;
   }, [initialValues, open]);
-
   React.useEffect(() => {
     if (
       !open ||
@@ -260,7 +259,6 @@ export function AgentDefinitionDialog({
       isRuntimeAutoSeededRef.current = true;
     }
   }, [defaultRuntime, initialValues, open, runtime, runtimesLoading]);
-
   // Keep an inherited Create runtime synced with defaults saved in-place.
   React.useEffect(() => {
     if (
@@ -287,7 +285,6 @@ export function AgentDefinitionDialog({
     runtime,
     runtimesLoading,
   ]);
-
   // Keep setup guidance reachable when no available runtime can be inherited.
   React.useEffect(() => {
     if (
@@ -300,11 +297,11 @@ export function AgentDefinitionDialog({
       setAiConfigurationMode("custom");
     }
   }, [defaultRuntime, isCreateMode, open, runtime, runtimesLoading]);
-
   function handleOpenChange(next: boolean) {
     // The catalog may veto embedded close requests; preserve the draft until unmount.
     if (!next && !embedded) {
       setDisplayName("");
+      setJobTitle("");
       setAvatarUrl("");
       setSystemPrompt("");
       setRuntime("");
@@ -357,6 +354,7 @@ export function AgentDefinitionDialog({
           : undefined;
     const baseInput = {
       displayName: displayName.trim(),
+      jobTitle: isCreateMode ? jobTitle.trim() || undefined : jobTitle.trim(),
       avatarUrl: avatarUrl.trim() || undefined,
       systemPrompt: systemPrompt,
       runtime: runtimeForSubmit,
@@ -629,7 +627,6 @@ export function AgentDefinitionDialog({
   const advancedFieldsTransition = shouldReduceMotion
     ? { duration: 0 }
     : ADVANCED_FIELDS_MOTION_TRANSITION;
-
   React.useEffect(() => {
     if (
       !open ||
@@ -654,7 +651,6 @@ export function AgentDefinitionDialog({
     effectiveProvider,
     runtime,
   ]);
-
   const selection: RuntimeModelProviderSelection = {
     provider,
     model,
@@ -670,7 +666,6 @@ export function AgentDefinitionDialog({
     setIsCustomModelEditing(next.isCustomModelEditing);
     setEnvVars(next.envVars);
   }
-
   function handleRuntimeDropdownChange(nextValue: string) {
     const action = runtimeDropdownAction(nextValue);
     if (action.kind === "add-custom-harness") {
@@ -702,7 +697,6 @@ export function AgentDefinitionDialog({
     handleRuntimeDropdownChange,
     open,
   );
-
   function handleProviderDropdownChange(nextValue: string) {
     setHasUserChanges(true);
     const nextProvider =
@@ -793,6 +787,12 @@ export function AgentDefinitionDialog({
             />
           </div>
         </div>
+
+        <PersonaJobTitleField
+          disabled={isPending}
+          onChange={(event) => setJobTitle(event.target.value)}
+          value={jobTitle}
+        />
 
         <div className="space-y-1.5">
           <label

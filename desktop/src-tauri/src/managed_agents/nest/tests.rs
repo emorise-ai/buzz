@@ -426,6 +426,7 @@ fn make_persona(id: &str, display_name: &str) -> AgentDefinition {
     AgentDefinition {
         id: id.to_string(),
         display_name: display_name.to_string(),
+        job_title: None,
         avatar_url: None,
         system_prompt: String::new(),
         runtime: None,
@@ -452,6 +453,7 @@ fn make_agent(name: &str, persona_id: Option<&str>) -> ManagedAgentRecord {
         pubkey: String::new(),
         name: name.to_string(),
         persona_id: persona_id.map(|s| s.to_string()),
+        job_title: None,
         private_key_nsec: String::new(),
         auth_tag: None,
         sandbox_id: None,

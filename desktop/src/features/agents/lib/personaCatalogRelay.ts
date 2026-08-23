@@ -12,6 +12,7 @@ export type CatalogPersonaShareLevel = "not-shared" | "none";
 
 type CatalogAgentProjection = {
   displayName: string;
+  jobTitle: string | null;
   avatarUrl: string | null;
   systemPrompt: string;
   runtime: string | null;
@@ -271,6 +272,10 @@ function parsePersonaContent(event: RelayEvent): CatalogAgentProjection | null {
   ) {
     return null;
   }
+  const jobTitle = optionalString(parsed.job_title)?.trim() ?? null;
+  if (jobTitle && !isSafeAgentDefinitionText(jobTitle, "")) {
+    return null;
+  }
 
   const avatarUrl =
     isSafeHttpUrl(parsed.avatar_url) ||
@@ -299,6 +304,7 @@ function parsePersonaContent(event: RelayEvent): CatalogAgentProjection | null {
 
   return {
     displayName,
+    jobTitle,
     avatarUrl,
     systemPrompt,
     runtime: optionalString(parsed.runtime),
@@ -437,6 +443,7 @@ function publicationToPersona(
       localPersona?.id ??
       `catalog:${publication.ownerPubkey}:${publication.sourcePersonaId}`,
     displayName: publication.agent.displayName,
+    jobTitle: publication.agent.jobTitle,
     avatarUrl: publication.agent.avatarUrl,
     systemPrompt: publication.agent.systemPrompt,
     runtime: publication.agent.runtime,

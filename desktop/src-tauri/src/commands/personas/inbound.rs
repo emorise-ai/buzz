@@ -195,6 +195,7 @@ fn validate_inbound_persona_definition(persona: &AgentDefinition) -> Result<(), 
         &persona.display_name,
         &persona.system_prompt,
     )
+    .and_then(|_| crate::managed_agents::validate_optional_job_title(persona.job_title.as_deref()))
     .map_err(|error| format!("Inbound persona definition is unsafe: {error}"))
 }
 
@@ -374,6 +375,7 @@ fn apply_inbound_persona(personas: &mut Vec<AgentDefinition>, inbound: AgentDefi
     {
         Some(local) => {
             local.display_name = inbound.display_name;
+            local.job_title = inbound.job_title;
             local.avatar_url = inbound.avatar_url;
             local.system_prompt = inbound.system_prompt;
             local.runtime = inbound.runtime;

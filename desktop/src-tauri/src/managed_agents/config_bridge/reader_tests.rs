@@ -68,6 +68,7 @@ fn test_record() -> ManagedAgentRecord {
         pubkey: "test".to_string(),
         name: "Test Agent".to_string(),
         persona_id: None,
+        job_title: None,
         private_key_nsec: "".to_string(),
         auth_tag: None,
         sandbox_id: None,

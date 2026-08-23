@@ -15,9 +15,10 @@ fn minimal_record() -> ManagedAgentRecord {
         name: "Test Agent".to_string(),
         display_name: Some("Test Agent Display".to_string()),
         persona_id: Some("SENTINEL_PERSONA_ID".to_string()), // MUST NOT appear in snapshot
-        team_id: Some("SENTINEL_TEAM_ID".to_string()),       // MUST NOT appear in snapshot
-        private_key_nsec: "nsec1secret".to_string(),         // MUST NOT appear in snapshot
-        auth_tag: Some("auth-tag-secret".to_string()),       // MUST NOT appear in snapshot
+        job_title: None,
+        team_id: Some("SENTINEL_TEAM_ID".to_string()), // MUST NOT appear in snapshot
+        private_key_nsec: "nsec1secret".to_string(),   // MUST NOT appear in snapshot
+        auth_tag: Some("auth-tag-secret".to_string()), // MUST NOT appear in snapshot
         sandbox_id: None,
         relay_url: "wss://relay.example.com".to_string(), // MUST NOT appear in snapshot
         avatar_url: Some("https://example.com/avatar.png".to_string()),

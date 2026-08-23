@@ -32,6 +32,7 @@ function personaEvent({
   shared = true,
   avatarUrl = null,
   displayName = "Relay Reviewer",
+  jobTitle,
   respondTo = null,
   systemPrompt = "Review changes.",
   sharedTag,
@@ -54,6 +55,7 @@ function personaEvent({
         contentOverride ??
         JSON.stringify({
           display_name: displayName,
+          ...(jobTitle === undefined ? {} : { job_title: jobTitle }),
           system_prompt: systemPrompt,
           avatar_url: avatarUrl,
           runtime: "goose",
@@ -77,10 +79,28 @@ test("a shared kind 30175 persona from Alice is discoverable by Bob", () => {
 
   assert.equal(personas.length, 1);
   assert.equal(personas[0].displayName, "Relay Reviewer");
+  assert.equal(personas[0].jobTitle, null);
   assert.equal(personas[0].isActive, false);
   assert.equal(personas[0].shared, true);
   assert.equal(personas[0].catalogSource.ownerPubkey, ALICE);
   assert.equal(personas[0].catalogSource.isOwn, false);
+});
+
+test("a shared persona carries its optional job title", () => {
+  const publications = catalogPublicationsFromEvents([
+    personaEvent({
+      createdAt: 1,
+      id: "alice-researcher",
+      displayName: "Avery",
+      jobTitle: "Principal Researcher",
+    }),
+  ]);
+
+  assert.equal(publications[0].agent.jobTitle, "Principal Researcher");
+  assert.equal(
+    catalogPersonasFromPublications(publications, [], BOB)[0].jobTitle,
+    "Principal Researcher",
+  );
 });
 
 test("a newer unshared head hides the older shared head", () => {

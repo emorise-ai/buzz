@@ -145,6 +145,7 @@ mod tests {
         AgentDefinition {
             id: "catalog-reviewer".to_string(),
             display_name: "Catalog Reviewer".to_string(),
+            job_title: None,
             avatar_url: None,
             system_prompt: "Review the catalog.".to_string(),
             runtime: None,
