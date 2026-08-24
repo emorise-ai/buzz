@@ -105,7 +105,10 @@ fn equal_second_heads_use_lowest_event_id_and_authors_are_independent() {
 fn parser_projects_types_and_foreign_allowlists_exactly() {
     let projection = parse_agent(&valid_content("Reviewer").to_string()).unwrap();
     assert_eq!(projection.display_name, "Reviewer");
-    assert_eq!(projection.job_title.as_deref(), Some("Principal Researcher"));
+    assert_eq!(
+        projection.job_title.as_deref(),
+        Some("Principal Researcher")
+    );
     assert_eq!(projection.runtime.as_deref(), Some(" goose "));
     assert_eq!(projection.provider, None);
     assert_eq!(projection.name_pool, vec!["Reviewer"]);

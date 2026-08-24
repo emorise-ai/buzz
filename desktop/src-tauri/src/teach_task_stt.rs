@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use crate::huddle::{models, stt::SttPipeline};
+use crate::huddle::{models, stt::SttPipeline, HumanFloor};
 
 /// Batch size matching the AudioWorklet's push cadence (100 ms at 48 kHz mono
 /// f32). `SttPipeline`'s internal queue is sized around this same cadence, so
@@ -66,7 +66,7 @@ fn transcribe_blocking(
     model_dir: std::path::PathBuf,
     pcm_bytes: Vec<u8>,
 ) -> Result<String, String> {
-    let (stt, mut text_rx) = SttPipeline::new(model_dir, None, None)?;
+    let (stt, mut text_rx) = SttPipeline::new(model_dir, None, None, HumanFloor::new(), None)?;
 
     // Feed the clip in fixed-size batches. The bounded audio queue (`try_send`,
     // drops on full) must not overflow, but pacing to *real time* meant a 30 s

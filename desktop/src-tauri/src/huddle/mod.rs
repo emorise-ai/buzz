@@ -30,6 +30,7 @@ pub mod agents;
 pub mod audio_output;
 mod commands;
 mod human_floor;
+pub(crate) use human_floor::HumanFloor;
 pub mod jitter;
 #[cfg(test)]
 mod latency_bench;
