@@ -1,5 +1,5 @@
 import * as React from "react";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, KeyRound } from "lucide-react";
 
 import {
   requestOpenEditAgent,
@@ -10,6 +10,7 @@ import { useAppShell } from "@/app/AppShellContext";
 import type { ConfigNudgePayload } from "@/shared/lib/configNudge";
 import { cn } from "@/shared/lib/cn";
 import { useProfilePanel } from "@/shared/context/ProfilePanelContext";
+import { Button } from "@/shared/ui/button";
 import {
   Attachment,
   AttachmentActions,
@@ -201,6 +202,12 @@ export function ConfigNudgeCard({
     nudge.requirements.every(
       (requirement) => requirement.surface === "env_key",
     );
+  const singleCredential =
+    allEnvKeys &&
+    nudge.requirements.length === 1 &&
+    firstCredential?.surface === "env_key"
+      ? firstCredential
+      : null;
   // Any card that is purely informational (auth-only or all-config-invalid)
   // has no clickable destination — treat them the same for affordance/routing.
   const informationalOnly = authOnly || allConfigInvalid;
@@ -260,31 +267,56 @@ export function ConfigNudgeCard({
         "max-w-[min(100%,32rem)] shrink-0 shadow-none",
         // Affordance: cursor-pointer + subtle hover lift — omitted for
         // informational-only cards which have no click destination.
-        !informationalOnly && "cursor-pointer hover:shadow-sm",
+        !informationalOnly &&
+          !singleCredential &&
+          "cursor-pointer hover:shadow-sm",
         className,
       )}
       orientation="horizontal"
-      state="error"
+      state={allEnvKeys ? "idle" : "error"}
     >
-      <AttachmentMedia className="text-destructive">
-        <AlertTriangle aria-hidden="true" className="h-4 w-4" />
+      <AttachmentMedia
+        className={allEnvKeys ? "text-primary" : "text-destructive"}
+      >
+        {allEnvKeys ? (
+          <KeyRound aria-hidden="true" className="h-4 w-4" />
+        ) : (
+          <AlertTriangle aria-hidden="true" className="h-4 w-4" />
+        )}
       </AttachmentMedia>
       <AttachmentContent>
-        <AttachmentTitle className="whitespace-normal text-destructive line-clamp-2">
-          {nudge.agent_name} needs configuration
+        <AttachmentTitle
+          className={cn(
+            "whitespace-normal line-clamp-2",
+            !allEnvKeys && "text-destructive",
+          )}
+        >
+          {allEnvKeys
+            ? "Secure credential requested"
+            : `${nudge.agent_name} needs configuration`}
         </AttachmentTitle>
-        <div className="mt-1 flex flex-col gap-0.5">
-          {nudge.requirements.map((req, i) => (
-            <RequirementRow
-              key={requirementKey(req, i)}
-              allCliLogin={allCliLogin}
-              onOpenDoctor={handleOpenDoctor}
-              onOpenCredential={handleOpenCredential}
-              onOpenEditAgent={handleOpenEditAgent}
-              requirement={req}
-            />
-          ))}
-        </div>
+        {singleCredential ? (
+          <div className="mt-0.5 text-xs leading-4 text-muted-foreground">
+            <span>{nudge.agent_name} needs </span>
+            <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs text-foreground">
+              {singleCredential.key}
+            </code>
+            <span>. It stays out of chat.</span>
+          </div>
+        ) : (
+          <div className="mt-1 flex flex-col gap-0.5">
+            {nudge.requirements.map((req, i) => (
+              <RequirementRow
+                key={requirementKey(req, i)}
+                allCliLogin={allCliLogin}
+                onOpenDoctor={handleOpenDoctor}
+                onOpenCredential={handleOpenCredential}
+                onOpenEditAgent={handleOpenEditAgent}
+                requirement={req}
+              />
+            ))}
+          </div>
+        )}
       </AttachmentContent>
       {/* (A) Agent-runtime-routed cards have one card-level CTA. Informational-only
           cards have none; other mixed cards render their own row CTAs. */}
@@ -295,13 +327,19 @@ export function ConfigNudgeCard({
           </span>
         </AttachmentActions>
       )}
-      {allEnvKeys && (
-        <AttachmentActions className="items-end self-end">
-          <span className="text-xs text-muted-foreground">Add securely →</span>
+      {singleCredential && (
+        <AttachmentActions>
+          <Button
+            onClick={() => setCredentialKey(singleCredential.key)}
+            size="sm"
+            variant="secondary"
+          >
+            Add securely
+          </Button>
         </AttachmentActions>
       )}
       {/* Informational-only cards are purely informational — no trigger, no routing. */}
-      {!informationalOnly && (
+      {!informationalOnly && !singleCredential && (
         <AttachmentTrigger
           aria-label={
             opensDoctor

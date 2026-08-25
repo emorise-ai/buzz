@@ -267,6 +267,9 @@ with a TypeScript lookup table or an id comparison in a component.
     request a credential during an ordinary conversation. Do not infer requests
     from natural-language phrases, and do not promise the secure control to
     independently operated relay agents that Desktop cannot restart.
+    A credential-only nudge is a neutral request, not a destructive runtime
+    error: render one concise key/agent summary and exactly one explicit secure
+    action. Mixed setup failures may retain row-level routing and error styling.
 
 ## The tests that enforce this
 

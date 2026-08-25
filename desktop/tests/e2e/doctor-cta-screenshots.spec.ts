@@ -120,6 +120,45 @@ test.describe("doctor CTA nudge card screenshots", () => {
   });
 
   /**
+   * 00 — a credential-only request is a neutral handoff, not a runtime error.
+   * It names the key and agent once and exposes exactly one secure action.
+   */
+  test("00-secure-credential-request", async ({ page }) => {
+    await page.addInitScript(() => {
+      window.localStorage.setItem("buzz-theme", "dark");
+    });
+    await installMockBridge(page, {
+      managedAgents: [
+        {
+          pubkey: AGENT_PUBKEY,
+          name: AGENT_NAME,
+          status: "running" as const,
+          channelNames: ["general"],
+        },
+      ],
+    });
+
+    await page.goto("/", { waitUntil: "domcontentloaded" });
+    const content = makeNudgeSentinel(AGENT_NAME, AGENT_PUBKEY, [
+      { surface: "env_key", key: "ODOO_API_KEY" },
+    ]);
+    await injectNudgeAndNavigate(page, content);
+
+    const card = page.locator("[data-config-nudge]").last();
+    await expect(card).toContainText("Secure credential requested");
+    await expect(card).toContainText("Tyler Agent needs ODOO_API_KEY");
+    await expect(
+      card.getByRole("button", { name: "Add securely" }),
+    ).toHaveCount(1);
+
+    await card.scrollIntoViewIfNeeded();
+    await settleAnimations(page);
+    await card.screenshot({
+      path: `${SHOTS}/00-secure-credential-request.png`,
+    });
+  });
+
+  /**
    * 01 — pure cli_login card (all requirements are cli_login, availability=available):
    * Tooling is installed but needs login — Doctor has no auth functionality
    * and would be a misleading dead-end. The card is purely informational:

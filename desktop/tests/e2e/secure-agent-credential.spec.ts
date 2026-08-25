@@ -54,7 +54,11 @@ async function openCredentialDialog(page: Page): Promise<void> {
   await page.getByTestId("channel-general").click();
 
   const card = page.locator("[data-config-nudge]").last();
-  await expect(card).toContainText("Do not paste this into chat");
+  await expect(card).toContainText("Secure credential requested");
+  await expect(card).toContainText(`${AGENT_NAME} needs ${ENV_KEY}`);
+  await expect(card.getByRole("button", { name: "Add securely" })).toHaveCount(
+    1,
+  );
   await card.getByRole("button", { name: "Add securely" }).click();
   await expect(
     page.getByTestId("secure-agent-credential-dialog"),
