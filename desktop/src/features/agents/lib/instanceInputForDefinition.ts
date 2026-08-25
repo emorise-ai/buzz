@@ -20,20 +20,30 @@ type RuntimesQueryLike = {
   refetch: () => Promise<{
     data?: readonly AcpRuntimeCatalogEntry[] | undefined;
   }>;
+  forceRefresh?: () => Promise<readonly AcpRuntimeCatalogEntry[] | undefined>;
 };
 
 /**
  * Acquire the available-runtime list for a start action (Phase 1B.3.5
  * row 6). Refetch-aware: an unfetched query is fetched instead of being
- * treated as an empty list (which would spuriously refuse every start).
+ * treated as an empty list (which would spuriously refuse every start). If a
+ * cold cache reports no available runtimes, force one live discovery before
+ * refusing; the bundled buzz-agent is resolved by that live path.
  */
 export async function availableRuntimesForStart(
   query: RuntimesQueryLike,
 ): Promise<AcpRuntime[]> {
-  const entries = query.isFetched ? query.data : (await query.refetch()).data;
-  return (entries ?? []).filter(
+  let entries = query.isFetched ? query.data : (await query.refetch()).data;
+  let available = (entries ?? []).filter(
     (runtime): runtime is AcpRuntime => runtime.availability === "available",
   );
+  if (available.length === 0 && query.forceRefresh) {
+    entries = await query.forceRefresh();
+    available = (entries ?? []).filter(
+      (runtime): runtime is AcpRuntime => runtime.availability === "available",
+    );
+  }
+  return available;
 }
 
 /**

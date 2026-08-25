@@ -298,6 +298,24 @@ test("row 6: unfetched query refetches instead of resolving empty", async () => 
   );
 });
 
+test("row 6: cold cache forces live discovery before refusing start", async () => {
+  let forced = false;
+  const runtimes = await availableRuntimesForStart({
+    isFetched: true,
+    data: [{ ...buzzAgentRuntime, availability: "missing" }],
+    refetch: async () => ({ data: [] }),
+    forceRefresh: async () => {
+      forced = true;
+      return [buzzAgentRuntime];
+    },
+  });
+  assert.equal(forced, true);
+  assert.deepEqual(
+    runtimes.map((runtime) => runtime.id),
+    ["buzz-agent"],
+  );
+});
+
 // ── item-13 regression: buzz-agent-first default runtime ─────────────────────
 //
 // Before this fix, resolveStartRuntimeForDefinition used runtimes[0] (catalog
