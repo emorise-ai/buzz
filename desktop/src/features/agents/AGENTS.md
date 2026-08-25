@@ -262,6 +262,11 @@ with a TypeScript lookup table or an id comparison in a component.
     the input value, tell the user the credential remains saved, and offer a
     restart retry that does not request the secret again. Do not broaden this
     into provider redeployment or a new relay event without a plan ruling.
+    Desktop-managed ACP harnesses also append the signed agent's public identity
+    and this existing control-block protocol to the base prompt so an agent can
+    request a credential during an ordinary conversation. Do not infer requests
+    from natural-language phrases, and do not promise the secure control to
+    independently operated relay agents that Desktop cannot restart.
 
 ## The tests that enforce this
 

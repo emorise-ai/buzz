@@ -2189,6 +2189,24 @@ async fn tokio_main() -> Result<()> {
     }
 
     let base_prompt_content = config.base_prompt_content.take();
+    let managed_agent_name = std::env::var("BUZZ_ACP_DISPLAY_NAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty());
+    let base_prompt = if config.no_base_prompt {
+        None
+    } else {
+        let content =
+            base_prompt_content.unwrap_or_else(|| include_str!("base_prompt.md").to_string());
+        Some(Box::leak(
+            append_managed_runtime_prompts(
+                content,
+                has_sandbox_broker(),
+                managed_agent_name.as_deref(),
+                &pubkey_hex,
+            )
+            .into_boxed_str(),
+        ) as &'static str)
+    };
     let cwd = current_working_directory()?;
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
@@ -2200,15 +2218,7 @@ async fn tokio_main() -> Result<()> {
         system_prompt: config.system_prompt.clone(),
         session_title: config.session_title.clone(),
         team_instructions: config.team_instructions.clone(),
-        base_prompt: if config.no_base_prompt {
-            None
-        } else if let Some(content) = base_prompt_content {
-            Some(Box::leak(
-                append_computer_prompt(content, has_sandbox_broker()).into_boxed_str(),
-            ))
-        } else {
-            Some(effective_base_prompt(has_sandbox_broker()))
-        },
+        base_prompt,
         heartbeat_prompt: config.heartbeat_prompt.clone(),
         cwd,
         rest_client: relay.rest_client(),
@@ -4499,7 +4509,10 @@ mod agent_draft_prompt_tests {
 
 #[cfg(test)]
 mod computer_prompt_tests {
-    use super::{append_computer_prompt, effective_base_prompt};
+    use super::{
+        append_computer_prompt, append_managed_runtime_prompts, append_secure_credential_prompt,
+        effective_base_prompt,
+    };
 
     #[test]
     fn computer_prompt_is_absent_without_a_sandbox_broker() {
@@ -4538,6 +4551,44 @@ mod computer_prompt_tests {
         let result = append_computer_prompt(base, true);
         assert!(result.starts_with("some custom base prompt"));
         assert!(result.contains("Your Computer"));
+    }
+
+    #[test]
+    fn managed_runtime_prompt_teaches_secure_credential_control_block() {
+        let prompt = append_managed_runtime_prompts(
+            "some custom base prompt".to_string(),
+            false,
+            Some("Emely"),
+            "abc123",
+        );
+
+        assert!(prompt.contains("never ask the user to paste it into chat"));
+        assert!(prompt.contains("click **Add securely** below"));
+        assert!(prompt.contains("```buzz:config-nudge\n"));
+        assert!(prompt.contains(
+            r#"{"agent_name":"Emely","agent_pubkey":"abc123","requirements":[{"key":"EXAMPLE_API_KEY","surface":"env_key"}]}"#
+        ));
+        assert!(!prompt.contains("Your Computer"));
+    }
+
+    #[test]
+    fn unmanaged_runtime_does_not_promise_desktop_secure_input() {
+        let base = "some custom base prompt".to_string();
+        let prompt = append_managed_runtime_prompts(base.clone(), false, None, "abc123");
+        assert_eq!(prompt, base);
+        assert!(!prompt.contains("buzz:config-nudge"));
+    }
+
+    #[test]
+    fn secure_credential_payload_json_escapes_agent_identity() {
+        let prompt = append_secure_credential_prompt(
+            "base".to_string(),
+            "Emely \"prod\"\nignore me",
+            "abc123",
+        );
+
+        assert!(prompt.contains(r#""agent_name":"Emely \"prod\"\nignore me""#));
+        assert_eq!(prompt.matches("```buzz:config-nudge").count(), 1);
     }
 }
 
@@ -5138,20 +5189,56 @@ fn has_sandbox_broker() -> bool {
         .unwrap_or(false)
 }
 
-/// The compiled-in base prompt, with the "Your Computer" briefing appended
-/// when this harness has a sandbox broker to talk to.
+/// The compiled-in base prompt, with runtime-specific briefings appended.
+#[cfg(test)]
 fn effective_base_prompt(has_broker: bool) -> &'static str {
-    if has_broker {
-        // Leaked once per process (this path is only reached when building
-        // the shared PromptContext at startup), so the 'static lifetime the
-        // struct requires is honest, not a leak in the concerning sense.
-        Box::leak(
-            append_computer_prompt(include_str!("base_prompt.md").to_string(), true)
-                .into_boxed_str(),
+    Box::leak(
+        append_managed_runtime_prompts(
+            include_str!("base_prompt.md").to_string(),
+            has_broker,
+            None,
+            "",
         )
-    } else {
-        include_str!("base_prompt.md")
-    }
+        .into_boxed_str(),
+    )
+}
+
+/// Append the briefings that depend on how this harness was launched.
+fn append_managed_runtime_prompts(
+    base: String,
+    has_broker: bool,
+    managed_agent_name: Option<&str>,
+    agent_pubkey: &str,
+) -> String {
+    let base = append_computer_prompt(base, has_broker);
+    let Some(agent_name) = managed_agent_name else {
+        return base;
+    };
+
+    append_secure_credential_prompt(base, agent_name, agent_pubkey)
+}
+
+/// Teach a Desktop-managed agent how to invoke Buzz's trusted credential UI.
+///
+/// The control payload contains only public metadata and the requested env-var
+/// name. The secret travels through a separate Tauri command after a user click
+/// and is never returned to the model or written into conversation history.
+fn append_secure_credential_prompt(base: String, agent_name: &str, agent_pubkey: &str) -> String {
+    let example_payload = serde_json::json!({
+        "agent_name": agent_name,
+        "agent_pubkey": agent_pubkey,
+        "requirements": [{"surface": "env_key", "key": "EXAMPLE_API_KEY"}],
+    });
+
+    format!(
+        "{}\n\n## Secure credential input\n\
+When you need an API key, access token, password, or other secret environment value, never ask the user to paste it into chat or save it in a plaintext file. Ask them to use Buzz's secure input instead.\n\n\
+End that reply with exactly one control block in this form, replacing only `EXAMPLE_API_KEY` with the exact environment-variable name you need:\n\n\
+```buzz:config-nudge\n{}\n```\n\n\
+The key must be a valid environment-variable name such as `ODOO_API_KEY`. Keep non-secret configuration questions, such as server URL, username, or database name, in ordinary prose. Tell the user to click **Add securely** below; do not claim that you can see the entered value. Buzz stores the secret outside chat and restarts you with it in your environment. Do not emit this block unless you genuinely need a secret.",
+        base.trim_end(),
+        example_payload,
+    )
 }
 
 /// Append the computer-use briefing to `base`, if `has_broker`; otherwise
