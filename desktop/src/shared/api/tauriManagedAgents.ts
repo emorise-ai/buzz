@@ -107,6 +107,27 @@ export async function restartManagedAgentRuntime(
   return invokeTauri("restart_managed_agent_runtime", { pubkey, relayUrl });
 }
 
+export type SetManagedAgentCredentialResult = {
+  /** Non-null means the credential was saved but the runtime did not restart. */
+  restartError: string | null;
+};
+
+/**
+ * Save one credential without reading or replacing the agent's other
+ * environment values in the frontend. The backend persists first, then
+ * restarts only the requested community pair.
+ */
+export async function setManagedAgentCredential(input: {
+  pubkey: string;
+  key: string;
+  value: string;
+}): Promise<SetManagedAgentCredentialResult> {
+  return invokeTauri<SetManagedAgentCredentialResult>(
+    "set_managed_agent_credential",
+    { input },
+  );
+}
+
 export async function putManagedAgentRuntimeLifecycle(
   outerPubkey: string,
   payload: unknown,

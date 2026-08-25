@@ -125,7 +125,10 @@ impl RequirementPayload {
                 format!("set the **{}** field in Edit Agent dropdowns", field)
             }
             RequirementPayload::EnvKey { key } => {
-                format!("set `{}` in Edit Agent → Environment variables", key)
+                format!(
+                    "choose **Add securely** for `{}` in Buzz — do not paste the credential into chat",
+                    key
+                )
             }
             RequirementPayload::CliLogin {
                 setup_copy,
@@ -265,6 +268,14 @@ impl SetupPayload {
                 .requirements
                 .iter()
                 .any(|r| matches!(r, RequirementPayload::CliConfigInvalid { .. }));
+            let has_env_key = self
+                .requirements
+                .iter()
+                .any(|r| matches!(r, RequirementPayload::EnvKey { .. }));
+            let all_env_keys = self
+                .requirements
+                .iter()
+                .all(|r| matches!(r, RequirementPayload::EnvKey { .. }));
 
             let footer = if has_doctor_requirement {
                 "Open Agent runtimes in Settings, install Git for Windows, then re-check and restart the agent.".to_string()
@@ -272,9 +283,15 @@ impl SetupPayload {
                 // All requirements are external config files — Edit Agent cannot
                 // help. Don't send the user there.
                 "Fix the config file(s) and restart the agent.".to_string()
+            } else if any_external && has_env_key {
+                "Use Add securely in the Buzz app for credentials; use Open Edit Agent for other Buzz-managed fields; fix the external CLI config files manually. Never paste credentials into chat.".to_string()
             } else if any_external {
                 // Mixed: some Buzz-managed fields, some external config.
                 "Open Edit Agent in the Buzz app for the Buzz-managed fields; fix the external CLI config files manually and restart the agent.".to_string()
+            } else if all_env_keys {
+                "Use Add securely in the Buzz app. Never paste credentials into chat. Buzz saves the credential and restarts the agent.".to_string()
+            } else if has_env_key {
+                "Use Add securely in the Buzz app for credentials, and Open Edit Agent for the other fields. Never paste credentials into chat.".to_string()
             } else {
                 // All Buzz-managed — original footer unchanged.
                 "Open Edit Agent in the Buzz app to set these.".to_string()
@@ -723,6 +740,27 @@ mod tests {
             "nudge body should mention the missing env key"
         );
         assert!(body.contains("Fizz"), "nudge body should name the agent");
+        assert!(
+            body.contains("do not paste the credential into chat"),
+            "credential nudge must keep secrets out of message history"
+        );
+    }
+
+    #[test]
+    fn env_only_nudge_routes_to_secure_entry_and_promises_restart() {
+        let payload = SetupPayload {
+            agent_name: "Fizz".to_string(),
+            agent_pubkey: "ab".repeat(32),
+            requirements: vec![RequirementPayload::EnvKey {
+                key: "ANTHROPIC_API_KEY".to_string(),
+            }],
+        };
+
+        let body = payload.nudge_body();
+        assert!(body.contains("Add securely"));
+        assert!(body.contains("Never paste credentials into chat"));
+        assert!(body.contains("restarts the agent"));
+        assert!(!body.contains("Edit Agent → Environment variables"));
     }
 
     #[test]
@@ -863,8 +901,8 @@ mod tests {
         };
         let body = payload.nudge_body();
         assert!(
-            body.contains("Open Edit Agent"),
-            "mixed nudge must mention Open Edit Agent for managed fields; got: {body:?}"
+            body.contains("Add securely"),
+            "mixed nudge must route credentials to secure entry; got: {body:?}"
         );
         assert!(
             body.contains("fix the external CLI config"),
@@ -874,12 +912,12 @@ mod tests {
 
     #[test]
     fn nudge_body_all_buzz_managed_retains_original_footer() {
-        // Pure Buzz-managed requirements → original "Open Edit Agent" footer unchanged.
+        // Pure non-secret Buzz-managed requirements keep the Edit Agent route.
         let payload = SetupPayload {
             agent_name: "Fizz".to_string(),
             agent_pubkey: "test".to_string(),
-            requirements: vec![RequirementPayload::EnvKey {
-                key: "ANTHROPIC_API_KEY".to_string(),
+            requirements: vec![RequirementPayload::NormalizedField {
+                field: "provider".to_string(),
             }],
         };
         let body = payload.nudge_body();

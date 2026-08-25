@@ -250,6 +250,19 @@ with a TypeScript lookup table or an id comparison in a component.
     refresh only local persona/team/managed-agent caches; they must never
     invalidate the remote relay directory.
 
+15. **Credential nudges use a one-secret save-and-restart boundary.** A trusted
+    `buzz:config-nudge` whose signer matches `agent_pubkey` may offer **Add
+    securely** for an `env_key` requirement. It must open only after a user
+    click, keep the value out of chat, URLs, logs, errors, toasts, and rendered
+    labels, and send one key/value pair to `set_managed_agent_credential`.
+    That Rust command owns the read-merge-validate-save operation so the
+    frontend never replaces sibling environment values from a stale snapshot.
+    It supports local agents only and restarts only the active community's
+    runtime pair after the save. A restart failure is partial success: clear
+    the input value, tell the user the credential remains saved, and offer a
+    restart retry that does not request the secret again. Do not broaden this
+    into provider redeployment or a new relay event without a plan ruling.
+
 ## The tests that enforce this
 
 - `lib/agentConfigCore.test.mjs` — field model per harness × scope, clearing

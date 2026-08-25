@@ -45,6 +45,17 @@ test("extractConfigNudge parses env_key requirement", () => {
   assert.deepEqual(extractConfigNudge(content), payload);
 });
 
+test("extractConfigNudge rejects malformed env_key requirements", () => {
+  for (const key of ["", "   ", "1_API_KEY", "API-KEY"]) {
+    const payload = {
+      agent_name: "Fizz",
+      agent_pubkey: "ab".repeat(32),
+      requirements: [{ surface: "env_key", key }],
+    };
+    assert.equal(extractConfigNudge(withSentinel("prose", payload)), null);
+  }
+});
+
 test("extractConfigNudge parses normalized_field requirement", () => {
   const payload = {
     agent_name: "Atlas",

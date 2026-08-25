@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use nostr::Keys;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
 use super::agent_model_process::run_agent_models_command;
@@ -699,8 +699,8 @@ use databricks::{discover_databricks_models, DatabricksAuthIntent};
 
 #[path = "agent_models_update.rs"]
 mod update;
-pub use update::update_managed_agent;
 pub(super) use update::{flush_managed_agent_policy, managed_agent_access_policy_changed};
+pub use update::{set_managed_agent_credential, update_managed_agent};
 
 // ── Model normalization ───────────────────────────────────────────────────────
 

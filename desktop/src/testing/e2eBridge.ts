@@ -288,6 +288,12 @@ type E2eConfig = {
       mcp?: MockCommandAvailability;
     };
     managedAgents?: MockManagedAgentSeed[];
+    /** Reject successive secure credential saves before mutating the agent. */
+    setManagedAgentCredentialErrors?: string[];
+    /** Return a partial-success restart error after securely saving. */
+    setManagedAgentCredentialRestartErrors?: string[];
+    /** Reject successive explicit pair-runtime restart retries. */
+    restartManagedAgentRuntimeErrors?: string[];
     /** Result returned by the mocked `add_agent_to_huddle` command. */
     addAgentToHuddleResult?: {
       ephemeral_added: boolean;
@@ -9136,10 +9142,16 @@ function upsertMockManagedAgentRuntime(
 function handleManagedAgentRuntimeAction(
   action: "start" | "stop" | "restart",
   args: { pubkey: string; relayUrl: string },
+  config?: E2eConfig,
 ): MockManagedAgentRuntimeRow {
   const agent = getMockManagedAgent(args.pubkey);
   if (agent.backend.type !== "local") {
     throw new Error("managed runtime pairs require a local agent");
+  }
+  if (action === "restart") {
+    const restartError =
+      config?.mock?.restartManagedAgentRuntimeErrors?.shift();
+    if (restartError) throw new Error(restartError);
   }
   return {
     ...upsertMockManagedAgentRuntime(
@@ -9331,6 +9343,44 @@ async function handleUpdateManagedAgent(args: {
   }
   agent.updated_at = new Date().toISOString();
   return { agent: cloneManagedAgent(agent), profile_sync_error: null };
+}
+
+function handleSetManagedAgentCredential(
+  args: {
+    input: {
+      pubkey: string;
+      key: string;
+      value: string;
+    };
+  },
+  config?: E2eConfig,
+): { restartError: string | null } {
+  const saveError = config?.mock?.setManagedAgentCredentialErrors?.shift();
+  if (saveError) throw new Error(saveError);
+
+  const agent = getMockManagedAgent(args.input.pubkey);
+  if (agent.backend.type !== "local") {
+    throw new Error(
+      "secure credential entry currently supports local agents only",
+    );
+  }
+
+  agent.env_vars = {
+    ...agent.env_vars,
+    [args.input.key]: args.input.value,
+  };
+  agent.updated_at = new Date().toISOString();
+
+  const restartError =
+    config?.mock?.setManagedAgentCredentialRestartErrors?.shift() ?? null;
+  if (!restartError) {
+    upsertMockManagedAgentRuntime(
+      args.input.pubkey,
+      getRelayWsUrl(config),
+      "ready",
+    );
+  }
+  return { restartError };
 }
 
 /**
@@ -13167,16 +13217,19 @@ export function maybeInstallE2eTauriMocks() {
         return handleManagedAgentRuntimeAction(
           "start",
           payload as { pubkey: string; relayUrl: string },
+          activeConfig,
         );
       case "stop_managed_agent_runtime":
         return handleManagedAgentRuntimeAction(
           "stop",
           payload as { pubkey: string; relayUrl: string },
+          activeConfig,
         );
       case "restart_managed_agent_runtime":
         return handleManagedAgentRuntimeAction(
           "restart",
           payload as { pubkey: string; relayUrl: string },
+          activeConfig,
         );
       case "reconcile_managed_agent_runtimes":
         // Post-create bootstrap reconcile: no new pairs in the mock world.
@@ -13395,6 +13448,11 @@ export function maybeInstallE2eTauriMocks() {
       case "update_managed_agent":
         return handleUpdateManagedAgent(
           payload as Parameters<typeof handleUpdateManagedAgent>[0],
+        );
+      case "set_managed_agent_credential":
+        return handleSetManagedAgentCredential(
+          payload as Parameters<typeof handleSetManagedAgentCredential>[0],
+          activeConfig,
         );
       case "create_channel":
         return handleCreateChannel(

@@ -220,6 +220,12 @@ type MockBridgeOptions = {
     mcp?: MockCommandAvailability;
   };
   managedAgents?: MockManagedAgentSeed[];
+  /** Reject successive secure credential saves before mutating the agent. */
+  setManagedAgentCredentialErrors?: string[];
+  /** Return a partial-success restart error after securely saving. */
+  setManagedAgentCredentialRestartErrors?: string[];
+  /** Reject successive explicit pair-runtime restart retries. */
+  restartManagedAgentRuntimeErrors?: string[];
   /** Result returned by the mocked `add_agent_to_huddle` command. */
   addAgentToHuddleResult?: {
     ephemeral_added: boolean;
