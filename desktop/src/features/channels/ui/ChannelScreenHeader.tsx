@@ -80,6 +80,10 @@ export function ChannelScreenHeader({
     activeChannel?.channelType === "dm" &&
     activeDmHeaderParticipants.length > 1;
   const activeDmParticipant = activeDmHeaderParticipants[0] ?? null;
+  const activeDmJobTitle =
+    !isGroupDm && activeDmParticipant?.jobTitle
+      ? activeDmParticipant.jobTitle
+      : undefined;
   const showJoinButton =
     activeChannel !== null &&
     !activeChannel.isMember &&
@@ -250,6 +254,7 @@ export function ChannelScreenHeader({
           ephemeralDisplay={activeChannelEphemeralDisplay}
         />
       }
+      subtitle={activeDmJobTitle}
       title={activeChannelTitle}
       transparentChrome={transparentChrome}
       visibility={activeChannel?.visibility}

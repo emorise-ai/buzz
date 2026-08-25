@@ -5,18 +5,20 @@ import { usePresenceQuery } from "@/features/presence/hooks";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { resolveChannelDisplayLabel } from "@/features/sidebar/lib/channelLabels";
-import type { Channel, PresenceStatus } from "@/shared/api/types";
+import type { Channel, ManagedAgent, PresenceStatus } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export type ActiveDmHeaderParticipant = {
   pubkey: string;
   displayName: string;
   avatarUrl: string | null;
+  jobTitle: string | null;
 };
 
 export function useActiveChannelHeader(
   activeChannel: Channel | null,
   currentPubkey?: string,
+  managedAgents: readonly Pick<ManagedAgent, "pubkey" | "jobTitle">[] = [],
 ) {
   const activeDmParticipants = React.useMemo(() => {
     if (activeChannel?.channelType !== "dm") {
@@ -61,6 +63,16 @@ export function useActiveChannelHeader(
           normalizePubkey(activeDmParticipantPubkeys[0] ?? "")
         ]?.avatarUrl ?? null)
       : null;
+  const managedAgentJobTitles = React.useMemo(
+    () =>
+      new Map(
+        managedAgents.map((agent) => [
+          normalizePubkey(agent.pubkey),
+          agent.jobTitle?.trim() || null,
+        ]),
+      ),
+    [managedAgents],
+  );
   const activeDmHeaderParticipants = React.useMemo(
     () =>
       activeDmParticipants.map((participant) => {
@@ -71,6 +83,9 @@ export function useActiveChannelHeader(
 
         return {
           pubkey: participant.pubkey,
+          jobTitle:
+            managedAgentJobTitles.get(normalizePubkey(participant.pubkey)) ??
+            null,
           displayName: resolveUserLabel({
             currentPubkey,
             fallbackName: participant.fallbackName,
@@ -80,7 +95,12 @@ export function useActiveChannelHeader(
           avatarUrl: profile?.avatarUrl ?? null,
         };
       }),
-    [activeDmParticipants, activeDmProfilesQuery.data?.profiles, currentPubkey],
+    [
+      activeDmParticipants,
+      activeDmProfilesQuery.data?.profiles,
+      currentPubkey,
+      managedAgentJobTitles,
+    ],
   );
 
   return {

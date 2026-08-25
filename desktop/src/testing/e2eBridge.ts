@@ -91,6 +91,7 @@ type MockCommandAvailability = {
 export type MockManagedAgentSeed = {
   pubkey: string;
   name: string;
+  jobTitle?: string | null;
   avatarUrl?: string | null;
   personaId?: string | null;
   /** Harness/runtime id pin; `null` = inherit from persona (native default). */
@@ -890,6 +891,7 @@ type RawRelayAgent = {
 type RawManagedAgent = {
   pubkey: string;
   name: string;
+  job_title?: string | null;
   persona_id: string | null;
   /** Record-level harness/runtime pin (`null` when inheriting from the persona). */
   runtime: string | null;
@@ -1758,6 +1760,7 @@ function cloneManagedAgent(agent: MockManagedAgent): RawManagedAgent {
   return {
     pubkey: agent.pubkey,
     name: agent.name,
+    job_title: agent.job_title ?? null,
     persona_id: agent.persona_id,
     runtime: agent.runtime ?? null,
     relay_url: agent.relay_url,
@@ -2318,6 +2321,7 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     pubkey: seed.pubkey,
     name: seed.name,
     persona_id: seed.personaId ?? null,
+    job_title: seed.jobTitle ?? null,
     // Native serde always emits this key (`null` when unpinned) — the bridge
     // must mirror the wire shape, not omit the key.
     runtime: seed.runtime ?? null,
@@ -9012,6 +9016,7 @@ async function handleCreateManagedAgent(
   const managedAgent: MockManagedAgent = {
     pubkey,
     name,
+    job_title: null,
     persona_id: args.input.personaId ?? null,
     // Create never pins a harness id — the record inherits from the persona.
     runtime: null,
