@@ -27,6 +27,7 @@ USER root
 # The Claude installer writes to ~/.local/bin and expects a real HOME. Running
 # it as the agent user means the binary lands where that user can execute it
 # without a second copy step.
+RUN install -d -o agent -g agent -m 0755 /home/agent/.local/share
 USER agent
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
