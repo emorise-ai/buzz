@@ -267,6 +267,17 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_MCP_COMMAND", default_value = "")]
     pub mcp_command: String,
 
+    /// URL of a remote tool server, e.g. `http://127.0.0.1:9320/mcp`.
+    ///
+    /// Set this to drive tools that run on another machine — a sandbox with a
+    /// shell, a filesystem, and a browser — while the model and its credential
+    /// stay here. Takes precedence over `--mcp-command`, which spawns a local
+    /// tool server instead.
+    ///
+    /// Requires an agent advertising `mcpCapabilities.http`.
+    #[arg(long, env = "BUZZ_ACP_MCP_URL")]
+    pub mcp_url: Option<String>,
+
     /// Idle timeout: max seconds of silence before killing a turn.
     /// Resets on any agent stdout activity.
     #[arg(long, env = "BUZZ_ACP_IDLE_TIMEOUT")]
@@ -521,6 +532,9 @@ pub struct Config {
     pub agent_command: String,
     pub agent_args: Vec<String>,
     pub mcp_command: String,
+    /// Remote tool server URL. When set, tools are driven over authenticated
+    /// HTTP on another machine instead of a locally spawned child process.
+    pub mcp_url: Option<String>,
     pub idle_timeout_secs: u64,
     pub max_turn_duration_secs: u64,
     pub agents: u32,
@@ -1097,6 +1111,7 @@ impl Config {
             agent_command,
             agent_args,
             mcp_command: args.mcp_command,
+            mcp_url: args.mcp_url,
             idle_timeout_secs,
             max_turn_duration_secs,
             agents: args.agents,
@@ -1478,6 +1493,7 @@ mod tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "".into(),
+            mcp_url: None,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,

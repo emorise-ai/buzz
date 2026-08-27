@@ -39,8 +39,10 @@ mod ptt_shortcut;
 mod relay;
 mod relay_admission;
 mod reset;
+mod sandbox_viewer;
 mod secret_store;
 mod shutdown;
+mod teach_task_stt;
 mod templates;
 mod terminal_runtime;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -452,44 +454,8 @@ pub fn run() {
                     .store(true, Ordering::Release);
             }
 
-            // Periodic sweep: reap orphaned agents from dead instances every 60s.
-            // Catches agents that escaped both the Justfile trap and boot-time
-            // reaping (e.g. a `just staging` Ctrl+C leak that only gets collected
-            // by a different instance's periodic sweep).
-            let sweep_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                use std::collections::HashSet;
-                use std::time::Duration;
-                use tauri::Manager;
-                let instance_id = managed_agents::current_instance_id(&sweep_handle);
-                let state = sweep_handle.state::<AppState>();
-                // Two-tick grace: only reap same-instance orphans seen on two
-                // consecutive sweeps. Prevents killing a legitimately-starting
-                // agent that spawned between the skip-list snapshot and the scan.
-                let mut prev_orphans: HashSet<u32> = HashSet::new();
-                loop {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    // Collect PIDs of our own live agents to avoid killing them.
-                    let skip_pids: Vec<u32> = state
-                        .managed_agent_processes
-                        .lock()
-                        .map(|runtimes| runtimes.values().map(|rt| rt.child.id()).collect())
-                        .unwrap_or_default();
-                    let prev = prev_orphans.clone();
-                    let inst = instance_id.clone();
-                    // Run the blocking syscall work off the async executor.
-                    let new_orphans = tauri::async_runtime::spawn_blocking(move || {
-                        let orphans = managed_agents::sweep_system_agent_processes_with_grace(
-                            &inst, &skip_pids, &prev,
-                        );
-                        managed_agents::reap_dead_instance_agents(&inst, &skip_pids);
-                        orphans
-                    })
-                    .await
-                    .unwrap_or_default();
-                    prev_orphans = new_orphans;
-                }
-            });
+            // Periodic orphaned-agent sweep — see `spawn_periodic_orphan_sweep`.
+            managed_agents::spawn_periodic_orphan_sweep(app.handle().clone());
 
             // Drain events the retention store flagged `pending_sync` (UI
             // create/edit, delete tombstones, launch reconcile) to the relay.
@@ -529,6 +495,20 @@ pub fn run() {
             terminal_runtime::terminal_ack,
             terminal_runtime::terminal_viewport_ready,
             terminal_runtime::terminal_focus,
+            sandbox_viewer::mint_sandbox_viewer_url,
+            sandbox_viewer::create_agent_sandbox,
+            sandbox_viewer::destroy_agent_sandbox,
+            sandbox_viewer::sandbox_heartbeat,
+            sandbox_viewer::sandbox_recording_start,
+            sandbox_viewer::sandbox_recording_stop,
+            teach_task_stt::transcribe_teaching_audio,
+            sandbox_viewer::sandbox_fs_list,
+            sandbox_viewer::sandbox_fs_download,
+            sandbox_viewer::sandbox_fs_upload,
+            sandbox_viewer::sandbox_fs_rename,
+            sandbox_viewer::sandbox_fs_delete,
+            sandbox_viewer::sandbox_launch_app,
+            sandbox_viewer::open_computer_window,
             take_pending_community_deep_link,
             acknowledge_pending_community_deep_link,
             take_pending_navigation_deep_link,
@@ -712,6 +692,7 @@ pub fn run() {
             get_baked_build_env,
             put_agent_session_config,
             persist_agent_effort_level,
+            set_managed_agent_credential,
             get_global_agent_config,
             set_global_agent_config,
             mesh_start_node,
@@ -909,6 +890,44 @@ pub fn run() {
                     eprintln!("buzz-desktop: failed to restore huddle drawer: {error}");
                 }
             }
+        }
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::CloseRequested { .. },
+            ..
+        } if label.starts_with(sandbox_viewer::COMPUTER_WINDOW_LABEL_PREFIX) => {
+            // The computer pop-out is a native window: its webview (and any
+            // React unmount effects `useTeachTask` relies on for its own
+            // cleanup) is destroyed outright on close, not given a chance to
+            // run first. If a "Teach a task" recording is in progress in the
+            // sandbox this window was showing, best-effort stop it here as a
+            // second defense layer — fire-and-forget, since the window must
+            // not be held open waiting on a broker round-trip. A third layer
+            // (the broker's own `-t` cap on the ffmpeg command, see
+            // `buzz-sandbox-broker`'s `recording_start_argv`) bounds a
+            // recording even if this also fails to run (force-quit, crash).
+            if let Some(sandbox_id) =
+                label.strip_prefix(sandbox_viewer::COMPUTER_WINDOW_LABEL_PREFIX)
+            {
+                let sandbox_id = sandbox_id.to_string();
+                let app_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = app_handle.state::<AppState>();
+                    // A 409 here just means no recording was in progress —
+                    // the common case — so it is not worth distinguishing
+                    // from any other error; either way there is nothing left
+                    // to do once the window is gone.
+                    if let Err(error) =
+                        sandbox_viewer::stop_recording_best_effort(&sandbox_id, &state).await
+                    {
+                        eprintln!(
+                            "buzz-desktop: best-effort recording stop for closed computer window (sandbox {sandbox_id}) failed (may simply mean no recording was running): {error}"
+                        );
+                    }
+                });
+            }
+            // Let the close proceed — never api.prevent_close() here. The
+            // stop request above races the window teardown by design.
         }
         RunEvent::ExitRequested { code, .. } => {
             if is_restart_request(code) {

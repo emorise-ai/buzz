@@ -1355,7 +1355,15 @@ fn mcp_servers_with_git_origin(
     };
     if let Some(origin) = origin {
         for server in &mut servers {
-            server.env.push(origin.clone());
+            match server {
+                McpServer::Stdio { env, .. } => env.push(origin.clone()),
+                // A remote tool server's environment is fixed when the sandbox
+                // starts — the agent cannot reach into another machine's process
+                // to add a variable. Git origin is instead supplied to the
+                // sandbox at deploy time, so skipping here is correct rather
+                // than a gap.
+                McpServer::Http { .. } => {}
+            }
         }
     }
     servers
@@ -4887,7 +4895,7 @@ mod tests {
     use serde_json::json;
 
     fn test_mcp_server() -> McpServer {
-        McpServer {
+        McpServer::Stdio {
             name: "dev".into(),
             command: "buzz-dev-mcp".into(),
             args: vec![],
@@ -4949,11 +4957,11 @@ mod tests {
             Some("stream"),
             None,
         );
-        assert!(servers[0].env.iter().any(|entry| {
+        assert!(servers[0].env().iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID" && entry.value == channel_id.to_string()
         }));
         assert!(!servers[0]
-            .env
+            .env()
             .iter()
             .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME"));
     }
@@ -4966,11 +4974,11 @@ mod tests {
             Some("dm"),
             Some("Builder"),
         );
-        assert!(servers[0].env.iter().any(|entry| {
+        assert!(servers[0].env().iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME" && entry.value == "Builder"
         }));
         assert!(!servers[0]
-            .env
+            .env()
             .iter()
             .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID"));
     }

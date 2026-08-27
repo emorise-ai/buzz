@@ -17,8 +17,9 @@ use crate::{
     },
     managed_agents::{
         agent_snapshot::{build_snapshot, AgentSnapshot, AgentSnapshotMemoryEntry, MemoryLevel},
-        load_managed_agents, load_personas, load_teams, load_teams_readonly, save_managed_agents,
-        save_personas, save_teams, AgentDefinition, ManagedAgentRecord, TeamRecord,
+        load_managed_agents, load_personas, load_teams, load_teams_readonly,
+        normalize_optional_job_title, save_managed_agents, save_personas, save_teams,
+        validate_optional_job_title, AgentDefinition, ManagedAgentRecord, TeamRecord,
     },
     relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
     util::now_iso,
@@ -117,10 +118,13 @@ fn definition_from_snapshot(
     )?;
     let respond_to = (behavior.respond_to != crate::managed_agents::RespondTo::default())
         .then(|| behavior.respond_to.as_str().to_string());
+    let job_title = normalize_optional_job_title(member.definition.job_title.clone());
+    validate_optional_job_title(job_title.as_deref())?;
 
     Ok(AgentDefinition {
         id: Uuid::new_v4().to_string(),
         display_name: member.profile.display_name.trim().to_string(),
+        job_title,
         avatar_url: effective_avatar(member),
         system_prompt: member.definition.system_prompt.clone().unwrap_or_default(),
         runtime: member.definition.runtime.clone(),
@@ -184,6 +188,7 @@ pub(crate) fn build_import_team(
 fn member_preview(member: &AgentSnapshot) -> TeamSnapshotMemberPreview {
     TeamSnapshotMemberPreview {
         display_name: member.profile.display_name.clone(),
+        job_title: member.definition.job_title.clone(),
         system_prompt: member.definition.system_prompt.clone(),
         avatar_url: effective_avatar(member),
         has_source_allowlist: !member.definition.respond_to_allowlist.is_empty(),
@@ -196,6 +201,7 @@ fn member_preview(member: &AgentSnapshot) -> TeamSnapshotMemberPreview {
 #[serde(rename_all = "camelCase")]
 pub struct TeamSnapshotMemberPreview {
     pub display_name: String,
+    pub job_title: Option<String>,
     pub system_prompt: Option<String>,
     pub avatar_url: Option<String>,
     pub has_source_allowlist: bool,
@@ -553,10 +559,12 @@ pub async fn confirm_team_snapshot_import(
             pubkey: pubkey.clone(),
             name: display_name.clone(),
             display_name: None,
+            job_title: definition.job_title.clone(),
             slug: None,
             persona_id: Some(definition.id.clone()),
             private_key_nsec: private_key_nsec.clone(),
             auth_tag: auth_tag.clone(),
+            sandbox_id: None,
             relay_url: String::new(),
             avatar_url: effective_avatar_url.clone(),
             acp_command: crate::managed_agents::DEFAULT_ACP_COMMAND.to_string(),

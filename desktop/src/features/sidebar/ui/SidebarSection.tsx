@@ -152,6 +152,7 @@ function ChannelWorkingBadge({
 
 export type SidebarDmParticipant = {
   avatarUrl: string | null;
+  jobTitle: string | null;
   label: string;
   pubkey: string;
 };
@@ -262,6 +263,10 @@ export function ChannelMenuButton({
   onSelectChannel: (channelId: string) => void;
 }) {
   const resolvedLabel = label ?? channel.name;
+  const dmJobTitle =
+    channel.channelType === "dm" && dmParticipants?.length === 1
+      ? dmParticipants[0].jobTitle?.trim() || null
+      : null;
   const ephemeralDisplay = getEphemeralChannelDisplay(channel);
   const {
     hasSidebarUnreadProjections,
@@ -300,6 +305,7 @@ export function ChannelMenuButton({
     <SidebarMenuButton
       className={cn(
         "data-[active=true]:font-normal",
+        dmJobTitle && "py-1.5",
         isActive
           ? "group-hover/menu-item:bg-sidebar-active group-hover/menu-item:text-sidebar-active-foreground"
           : "group-hover/menu-item:bg-sidebar-accent group-hover/menu-item:text-sidebar-foreground",
@@ -310,6 +316,7 @@ export function ChannelMenuButton({
       data-testid={`channel-${channel.name}`}
       isActive={isActive}
       onClick={() => onSelectChannel(channel.id)}
+      size={dmJobTitle ? "lg" : "default"}
       tooltip={resolvedLabel}
       type="button"
     >
@@ -321,12 +328,26 @@ export function ChannelMenuButton({
         dmParticipants={dmParticipants}
         presenceStatus={presenceStatus}
       />
-      <span
-        className={cn("min-w-0 flex-1 truncate", inactiveContentOpacity)}
+      <div
+        className={cn("min-w-0 flex-1", inactiveContentOpacity)}
         data-sidebar-row-label
       >
-        {resolvedLabel}
-      </span>
+        <span className="block truncate leading-5">{resolvedLabel}</span>
+        {dmJobTitle ? (
+          <span
+            className={cn(
+              "block truncate text-xs font-normal leading-4",
+              isActive
+                ? "text-sidebar-active-foreground/65"
+                : "text-sidebar-foreground/55",
+            )}
+            data-testid={`channel-job-title-${channel.name}`}
+            title={dmJobTitle}
+          >
+            {dmJobTitle}
+          </span>
+        ) : null}
+      </div>
       {showsEphemeralBadge && ephemeralDisplay ? (
         <EphemeralChannelBadge
           display={ephemeralDisplay}

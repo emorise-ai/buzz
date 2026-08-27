@@ -14,7 +14,7 @@ use tokio::sync::watch;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::{Config, HookServers};
-use crate::types::{clamp, AgentError, McpServerStdio, ToolDef, ToolResult, ToolResultContent};
+use crate::types::{clamp, AgentError, McpServer, ToolDef, ToolResult, ToolResultContent};
 
 const SEP: &str = "__";
 const MAX_NAME_LEN: usize = 128;
@@ -115,10 +115,27 @@ type Client = RunningService<RoleClient, ()>;
 #[derive(Clone)]
 struct ServerSpec {
     name: String,
-    command: String,
-    args: Vec<String>,
-    env: Vec<(String, String)>,
-    cwd: String,
+    transport: SpecTransport,
+}
+
+/// How to reach one tool server.
+///
+/// Kept on the spec rather than resolved once at startup because a server is
+/// re-established on this same spec when it dies, and a remote server must be
+/// reconnected rather than respawned.
+#[derive(Clone)]
+enum SpecTransport {
+    /// Spawned as a child process; the pipe is the trust boundary.
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: String,
+    },
+    /// Reached over the network. Every request is signed with the agent's own
+    /// key, so the tools can live on a machine that holds no credential — see
+    /// `mcp_http`.
+    Http { url: String, nsec: String },
 }
 
 enum ClientState {
@@ -201,7 +218,7 @@ pub struct McpRegistry {
 impl McpRegistry {
     pub async fn spawn_all(
         cfg: &Config,
-        servers: &[McpServerStdio],
+        servers: &[McpServer],
         cwd: &str,
     ) -> Result<Self, AgentError> {
         if servers.len() > MAX_MCP_SERVERS {
@@ -224,25 +241,41 @@ impl McpRegistry {
 
         let mut seen_names = HashSet::new();
         for s in servers {
-            if !valid_name(&s.name) || s.name.contains("__") {
-                return Err(AgentError::Mcp(format!("invalid server name: {}", s.name)));
+            let name = s.name();
+            if !valid_name(name) || name.contains("__") {
+                return Err(AgentError::Mcp(format!("invalid server name: {name}")));
             }
-            if !seen_names.insert(s.name.clone()) {
-                return Err(AgentError::Mcp(format!(
-                    "duplicate server name: {}",
-                    s.name
-                )));
+            if !seen_names.insert(name.to_string()) {
+                return Err(AgentError::Mcp(format!("duplicate server name: {name}")));
             }
             let spec = ServerSpec {
-                name: s.name.clone(),
-                command: s.command.clone(),
-                args: s.args.clone(),
-                env: s
-                    .env
-                    .iter()
-                    .map(|e| (e.name.clone(), e.value.clone()))
-                    .collect(),
-                cwd: cwd.to_owned(),
+                name: name.to_string(),
+                transport: match s {
+                    McpServer::Stdio(s) => SpecTransport::Stdio {
+                        command: s.command.clone(),
+                        args: s.args.clone(),
+                        env: s
+                            .env
+                            .iter()
+                            .map(|e| (e.name.clone(), e.value.clone()))
+                            .collect(),
+                        cwd: cwd.to_owned(),
+                    },
+                    McpServer::Http(h) => SpecTransport::Http {
+                        url: h.url.clone(),
+                        // The agent signs tool requests with the same key it
+                        // uses on the relay, which is what the sandbox was told
+                        // to accept as its owner. Without it there is no way to
+                        // authenticate, so this is a refusal rather than an
+                        // unauthenticated attempt.
+                        nsec: cfg.private_key.clone().ok_or_else(|| {
+                            AgentError::Mcp(format!(
+                                "remote tool server {name} needs the agent's key to sign \
+                                 its requests, but no private key is configured"
+                            ))
+                        })?,
+                    },
+                },
             };
             let (client, pgid, tool_names, raw_tools) = spawn_one(&spec, reg.init_timeout).await?;
             let server_idx = reg.servers.len();
@@ -268,7 +301,7 @@ impl McpRegistry {
                 if !valid_name(&bare) || bare.contains("__") {
                     return Err(AgentError::Mcp(format!("invalid tool name: {bare}")));
                 }
-                let qname = format!("{}{SEP}{}", s.name, bare);
+                let qname = format!("{}{SEP}{}", s.name(), bare);
                 if qname.len() > MAX_QNAME_LEN {
                     return Err(AgentError::Mcp(format!(
                         "qualified tool name too long: {} ({} > {MAX_QNAME_LEN})",
@@ -727,12 +760,76 @@ impl McpRegistry {
     }
 }
 
+/// Establish one tool server, by whichever transport its spec names.
+///
+/// Remote servers have no child process, so they carry no pgid: there is
+/// nothing local to kill, and teardown is closing the connection.
 async fn spawn_one(
     spec: &ServerSpec,
     timeout: Duration,
 ) -> Result<(Client, Option<u32>, Vec<String>, Vec<rmcp::model::Tool>), AgentError> {
-    let mut cmd = Command::new(&spec.command);
-    cmd.args(&spec.args);
+    match &spec.transport {
+        SpecTransport::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+        } => spawn_stdio(&spec.name, command, args, env, cwd, timeout).await,
+        SpecTransport::Http { url, nsec } => connect_http(&spec.name, url, nsec, timeout).await,
+    }
+}
+
+/// Connect to a tool server running on another machine.
+async fn connect_http(
+    name: &str,
+    url: &str,
+    nsec: &str,
+    timeout: Duration,
+) -> Result<(Client, Option<u32>, Vec<String>, Vec<rmcp::model::Tool>), AgentError> {
+    use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+    use rmcp::transport::StreamableHttpClientTransport;
+
+    let signer = crate::mcp_http::NostrSigningClient::new(nsec)?;
+    let transport = StreamableHttpClientTransport::with_client(
+        signer,
+        StreamableHttpClientTransportConfig::with_uri(url.to_string()),
+    );
+
+    let client: Client = match tokio::time::timeout(timeout, ().serve(transport)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            return Err(AgentError::Mcp(format!(
+                "could not reach the remote tool server {name} at {url}: {e}"
+            )))
+        }
+        Err(_) => {
+            return Err(AgentError::Mcp(format!(
+                "remote tool server {name} at {url} did not respond within {timeout:?}"
+            )))
+        }
+    };
+
+    let (tool_names, raw_tools) = list_tools(&client, name).await?;
+    Ok((client, None, tool_names, raw_tools))
+}
+
+async fn spawn_stdio(
+    name: &str,
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+    cwd: &str,
+    timeout: Duration,
+) -> Result<(Client, Option<u32>, Vec<String>, Vec<rmcp::model::Tool>), AgentError> {
+    let spec = StdioSpec {
+        name,
+        command,
+        args,
+        env,
+        cwd,
+    };
+    let mut cmd = Command::new(spec.command);
+    cmd.args(spec.args);
     cmd.env_clear();
     for k in PASSTHROUGH_ENV {
         if let Ok(v) = std::env::var(k) {
@@ -745,10 +842,10 @@ async fn spawn_one(
             cmd.env(k, v);
         }
     }
-    for (k, v) in &spec.env {
+    for (k, v) in spec.env {
         cmd.env(k, v);
     }
-    cmd.current_dir(&spec.cwd);
+    cmd.current_dir(spec.cwd);
     cmd.stderr(std::process::Stdio::inherit());
 
     #[cfg(unix)]
@@ -773,7 +870,7 @@ async fn spawn_one(
     }
     let mut guard = PgidGuard {
         pgid,
-        name: spec.name.clone(),
+        name: spec.name.to_string(),
     };
 
     let client: Client = match tokio::time::timeout(timeout, ().serve(transport)).await {
@@ -782,26 +879,49 @@ async fn spawn_one(
             return Err(AgentError::Mcp(format!("init {}: {e}", spec.name)));
         }
         Err(_) => {
-            return Err(AgentError::Mcp(timeout_msg("init", &spec.name, timeout)));
+            return Err(AgentError::Mcp(timeout_msg("init", spec.name, timeout)));
         }
     };
 
-    let tools = match tokio::time::timeout(timeout, client.peer().list_all_tools()).await {
-        Ok(Ok(t)) => t,
-        Ok(Err(e)) => {
-            return Err(AgentError::Mcp(format!("list_tools {}: {e}", spec.name)));
-        }
-        Err(_) => {
-            return Err(AgentError::Mcp(timeout_msg(
-                "list_tools",
-                &spec.name,
-                timeout,
-            )));
-        }
-    };
-    let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
+    let (names, tools) = list_tools_with_timeout(&client, spec.name, timeout).await?;
     guard.pgid = None;
     Ok((client, pgid, names, tools))
+}
+
+/// Borrowed form of a stdio spec, so the spawn path reads the same as before
+/// without cloning every field out of the enum.
+struct StdioSpec<'a> {
+    name: &'a str,
+    command: &'a str,
+    args: &'a [String],
+    env: &'a [(String, String)],
+    cwd: &'a str,
+}
+
+/// Ask a connected server for its tools. Shared by both transports: once a
+/// client exists, nothing below depends on how it was established.
+async fn list_tools(
+    client: &Client,
+    name: &str,
+) -> Result<(Vec<String>, Vec<rmcp::model::Tool>), AgentError> {
+    let tools = client
+        .peer()
+        .list_all_tools()
+        .await
+        .map_err(|e| AgentError::Mcp(format!("list_tools {name}: {e}")))?;
+    let names = tools.iter().map(|t| t.name.to_string()).collect();
+    Ok((names, tools))
+}
+
+async fn list_tools_with_timeout(
+    client: &Client,
+    name: &str,
+    timeout: Duration,
+) -> Result<(Vec<String>, Vec<rmcp::model::Tool>), AgentError> {
+    match tokio::time::timeout(timeout, list_tools(client, name)).await {
+        Ok(r) => r,
+        Err(_) => Err(AgentError::Mcp(timeout_msg("list_tools", name, timeout))),
+    }
 }
 
 /// Validate that tool-call arguments are a shape the MCP transport can carry:

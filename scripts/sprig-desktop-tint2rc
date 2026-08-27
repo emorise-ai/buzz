@@ -1,0 +1,237 @@
+# tint2 config for the agent's desktop — a real, native, in-screen dock.
+#
+# This replaces the app-level (React) floating dock: the dock now lives
+# INSIDE the streamed desktop, drawn by the X server at the sandbox's native
+# resolution, so it is proportional in a 300px sidebar preview exactly the
+# way it is in a fullscreen viewer — no more hardcoded pixel sizing fighting
+# an iframe's scale factor. It also means "any installed app" (not just the
+# 3 the old React dock knew about) shows up with its real icon, because
+# tint2's launcher reads real .desktop files and icon theme, and its taskbar
+# reads the window manager's own EWMH state directly (no broker round trip).
+#
+# STRUT / POSITIONING — the constraint that shaped every other choice here:
+# supervise.sh centers Chromium at 1700x950 on a 1920x1080 screen
+# (position 110,65), which leaves a 65px strip of bare wallpaper below it
+# (y=1015..1080) and above it (y=0..65) by construction — see the comment
+# above the buzz-browser invocation in sprig-desktop-supervise.sh for the
+# exact math. Thunar and xfce4-terminal's spawn positions (openbox-rc.xml)
+# stay well inside that same window band, so none of that hand-placed
+# geometry is affected by the strut below.
+#
+# `strut_policy = follow_size` makes tint2 report its real panel height
+# (panel_size's 60px + panel_margin's 6px top/bottom ≈ the same ~65px strip
+# above) as a _NET_WM_STRUT_PARTIAL, so openbox shrinks _NET_WORKAREA to
+# match. Without this, maximize/fullscreen filled the whole 1920x1080 screen
+# and Chromium's content ran underneath the dock instead of stopping above
+# it — the dock is drawn panel_layer = top so it stayed visually on top, but
+# nothing told openbox the space was spoken for. `follow_size` (not
+# `minimum`) ties the strut to the panel's actual rendered height instead of
+# a fixed value, so it stays correct if panel_size/panel_margin ever change.
+#
+# Visual goal: read as a real OS dock (macOS/GNOME-style) — a small rounded,
+# softly translucent pill centered at the bottom, shrunk to its own content
+# (launcher icons + taskbar, no dead space) rather than stretched across a
+# fixed-width bar — themed with the same neutral dark greys as openbox's
+# BuzzDark titlebar (see ../scripts/sprig-desktop-theme/openbox-3/themerc)
+# so it reads as part of the same desktop, not a second, differently-themed
+# dock bolted on.
+#
+# SYNTAX NOTE — verified against the real Debian bookworm tint2 17.0.1
+# package (there is no `background_id = N` declarator key; it errors as
+# "invalid option" if used). Background definitions are POSITIONAL: each
+# `# Background N: ...` comment below starts a new block purely by
+# appearing after the previous block's last key, and *_background_id keys
+# elsewhere (e.g. `panel_background_id = 1`) reference blocks by their
+# 1-based position in this file, top to bottom. Confirmed by running the
+# actual binary with `-c` against this file and checking for "invalid
+# option" / "Could not open file" lines — zero parse errors.
+
+#-------------------------------------
+# Backgrounds
+# Background 1: Panel — rounded, softly translucent pill in the same
+# neutral greys as BuzzDark's menu chrome (#232323 fill, #3a3a3a border —
+# see openbox-3/themerc) so the dock doesn't clash with the rest of the
+# desktop's window chrome.
+rounded = 16
+border_width = 1
+border_sides = TBLR
+background_color = #232323 82
+border_color = #3a3a3a 90
+background_color_hover = #232323 82
+border_color_hover = #3a3a3a 90
+background_color_pressed = #232323 82
+border_color_pressed = #3a3a3a 90
+
+# Background 2: Default task, iconified task — near-invisible until
+# hovered. A taskbar entry isn't a button-like tile the way a launcher is,
+# it's a live window indicator, so it stays flush with the panel except on
+# interaction.
+rounded = 10
+border_width = 0
+border_sides = TBLR
+background_color = #ffffff 0
+border_color = #ffffff 0
+background_color_hover = #ffffff 14
+border_color_hover = #ffffff 0
+background_color_pressed = #ffffff 22
+border_color_pressed = #ffffff 0
+
+# Background 3: Active task, urgent task — a soft highlight pill, the same
+# visual language macOS/GNOME use for "this window is focused."
+rounded = 10
+border_width = 0
+border_sides = TBLR
+background_color = #ffffff 20
+border_color = #ffffff 0
+background_color_hover = #ffffff 26
+border_color_hover = #ffffff 0
+background_color_pressed = #ffffff 32
+border_color_pressed = #ffffff 0
+
+# Background 4: Tooltip
+rounded = 8
+border_width = 1
+border_sides = TBLR
+background_color = #1a1a1a 92
+border_color = #3a3a3a 90
+background_color_hover = #1a1a1a 92
+border_color_hover = #3a3a3a 90
+background_color_pressed = #1a1a1a 92
+border_color_pressed = #3a3a3a 90
+
+#-------------------------------------
+# Panel
+panel_items = LT
+panel_size = 62% 60
+panel_margin = 0 6
+panel_padding = 10 6 10
+panel_background_id = 1
+panel_position = bottom center horizontal
+# tint2's stacking-order layer — always drawn above normal windows so the
+# dock is never hidden behind Chromium. This is a separate mechanism from
+# the strut/space reservation; strut_policy (below) is what controls that.
+panel_layer = top
+panel_dock = 0
+panel_monitor = all
+# THE fix for a dock that reads as a full-width bar with dead space between
+# clusters: panel_size above is a MAXIMUM/available width (like max-width in
+# CSS), not the panel's actual width — panel_shrink is what makes tint2
+# size the panel down to its actual content (launcher + taskbar, no wasted
+# space) instead of stretching to fill panel_size. Every stock tint2 theme
+# ships panel_shrink = 1 for exactly this reason; this file originally had
+# it backwards (0), which is what produced the launcher-icons-left,
+# taskbar-stranded-in-the-middle layout.
+panel_shrink = 1
+autohide = 0
+strut_policy = follow_size
+font_shadow = 0
+mouse_effects = 1
+disable_transparency = 0
+mouse_hover_icon_asb = 100 0 10
+mouse_pressed_icon_asb = 100 0 -10
+
+#-------------------------------------
+# Taskbar
+# Window switching, fed straight from the X server's own EWMH state — this
+# is what used to require polling the broker's /windows endpoint from React.
+# Single desktop (openbox-rc.xml sets <number>1</number>), so no pager/
+# desktop-name clutter applies here.
+taskbar_mode = single_desktop
+taskbar_padding = 6 2 4
+taskbar_background_id = 0
+taskbar_active_background_id = 0
+taskbar_name = 0
+taskbar_hide_if_empty = 1
+taskbar_distribute_size = 0
+taskbar_sort_order = lru
+task_align = center
+
+#-------------------------------------
+# Task
+task_icon = 1
+# Icon + window title, like a real OS taskbar entry — not icon-only.
+# task_maximum_size's width is widened to fit a title (tint2 truncates with
+# an ellipsis past this, so a long title never breaks layout); height stays
+# tall enough for icon + single-line text without stretching the panel
+# beyond the 60px it's sized for.
+task_text = 1
+task_thumbnail = 0
+# Fixed, non-expanding tile size — with taskbar_distribute_size off this is
+# also what keeps a single open window from being stretched to fill the
+# panel (the earlier bug: one taskbar item alone in a wide bar). The
+# taskbar's total width is however many of these fit its tasks, not a
+# fraction of panel_size.
+task_maximum_size = 220 34
+task_padding = 4 4 4
+task_tooltip = 1
+task_centered = 1
+task_background_id = 2
+task_active_background_id = 3
+task_urgent_background_id = 3
+task_iconified_background_id = 2
+task_font = Inter 9
+task_font_color = #e8e8e8 100
+task_active_font_color = #ffffff 100
+mouse_left = toggle_iconify
+mouse_middle = none
+mouse_right = close
+mouse_scroll_up = none
+mouse_scroll_down = none
+
+#-------------------------------------
+# Launcher
+# Points at the real .desktop files already shipped in this image (Debian's
+# chromium/thunar/xfce4-terminal packages install these to
+# /usr/share/applications/ — nothing here needs a new icon package; the Yaru
+# icon theme installed via yaru-theme-icon covers all three) so each
+# launcher tile gets its actual app icon, not a hand-drawn stand-in — the
+# point of moving off the React dock's 3 hardcoded SVGs onto a real desktop
+# launcher that would show any future .desktop file dropped into the image
+# too.
+launcher_padding = 6 4 8
+launcher_background_id = 0
+launcher_icon_background_id = 0
+launcher_icon_size = 40
+launcher_icon_asb = 100 0 0
+launcher_icon_theme = Yaru
+launcher_icon_theme_override = 0
+startup_notifications = 1
+launcher_tooltip = 1
+launcher_item_app = /usr/share/applications/chromium.desktop
+# Files uses a local override (see sprig-desktop-thunar.desktop), not the
+# system thunar.desktop directly — thunar.desktop's own Icon= says
+# "org.xfce.thunar", which Yaru does not ship (it only exists under
+# hicolor, Thunar's own upstream fallback icon), so a Yaru-themed lookup
+# renders it inconsistently with Chromium/Terminal's Yaru-styled tiles.
+# The override points Icon= at "system-file-manager" instead — the
+# freedesktop-standard generic name, which Yaru DOES ship real themed
+# artwork for. See that file's header comment for the full investigation.
+launcher_item_app = /home/agent/.local/share/applications/sprig-thunar.desktop
+launcher_item_app = /usr/share/applications/xfce4-terminal.desktop
+
+#-------------------------------------
+# Separator — a thin divider between the launcher cluster and the taskbar
+# cluster (macOS-style), not the large dead-space gap the un-shrunk panel
+# produced. `separator = new` is required syntax (tint2 warns and ignores
+# the block without it) — confirmed against the real binary.
+separator = new
+separator_background_id = 0
+separator_color = #ffffff 30
+separator_style = dots
+separator_size = 1
+separator_padding = 4 0
+
+#-------------------------------------
+# Clock (skipped)
+# No clock — this is an agent's computer, not a human's daily-driver
+# desktop, and the taskbar/launcher already fill the panel's intended role.
+time1_format =
+
+#-------------------------------------
+# Tooltip
+tooltip_show_timeout = 0.4
+tooltip_hide_timeout = 0.1
+tooltip_padding = 6 4
+tooltip_font = Inter 9
+tooltip_font_color = #e8e8e8 100
+tooltip_background_id = 4

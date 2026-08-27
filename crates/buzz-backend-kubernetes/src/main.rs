@@ -12,7 +12,6 @@ mod classify;
 mod client;
 mod cluster;
 mod config;
-mod env;
 mod gc;
 mod image;
 mod intent;
@@ -20,10 +19,20 @@ mod naming;
 mod observe;
 mod pod;
 mod reconcile;
-mod wire;
 
 use std::io::Read;
+// The wire protocol and environment rules are the spec's, not Kubernetes',
+// so they live in buzz-backend-common and are shared with every other binding
+// rather than copied per substrate.
+use buzz_backend_common::{env, wire};
 use wire::{Request, Response};
+
+/// Why the shared environment rules fail on this substrate specifically.
+const DIAGNOSTICS: env::SubstrateDiagnostics = env::SubstrateDiagnostics {
+    non_posix_key_reason: "Kubernetes would treat it inconsistently across \
+                           cluster versions",
+    env_too_large_reason: "Kubernetes caps Secret data at that size",
+};
 
 /// The provider a shared-compute agent resolves to. Refused here as the
 /// spec's backstop: a mesh agent runs on the relay's compute, so deploying it
@@ -77,7 +86,11 @@ fn respond(input: &str) -> Response {
     };
 
     match request {
-        Request::Info => Response::info(),
+        Request::Info => Response::info(
+            "kubernetes",
+            "Runs agents as pods in a Kubernetes cluster",
+            config::config_schema(),
+        ),
         Request::Deploy(deploy) => {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -127,6 +140,7 @@ async fn deploy_agent(request: &wire::DeployRequest) -> Result<String, String> {
             generation: &naming::new_generation(),
             inactivity_seconds: cfg.inactivity_seconds,
         },
+        DIAGNOSTICS,
     )?;
 
     let client = client::connect(cfg.context.as_deref()).await?;

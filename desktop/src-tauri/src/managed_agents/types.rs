@@ -16,6 +16,9 @@ pub enum BackendKind {
 pub struct AgentDefinition {
     pub id: String,
     pub display_name: String,
+    /// Optional display-only job title.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_title: Option<String>,
     pub avatar_url: Option<String>,
     pub system_prompt: String,
     /// Preferred ACP runtime ID (e.g., 'goose', 'claude', 'codex'). Determines which agent binary
@@ -91,7 +94,6 @@ pub struct AgentDefinition {
     pub created_at: String,
     pub updated_at: String,
 }
-
 impl AgentDefinition {
     /// Project this persona onto a key-less unified [`ManagedAgentRecord`]
     /// (Phase 1A store fold). Identity fields stay empty — keys are minted on
@@ -102,8 +104,10 @@ impl AgentDefinition {
             pubkey: String::new(),
             name: self.display_name.clone(),
             persona_id: None,
+            job_title: self.job_title,
             private_key_nsec: String::new(),
             auth_tag: None,
+            sandbox_id: None,
             relay_url: String::new(),
             avatar_url: self.avatar_url,
             acp_command: DEFAULT_ACP_COMMAND.to_string(),
@@ -158,7 +162,6 @@ impl AgentDefinition {
         }
     }
 }
-
 impl ManagedAgentRecord {
     /// Present a key-less definition record back in the legacy
     /// [`AgentDefinition`] shape — the compatibility view the persona command
@@ -172,6 +175,7 @@ impl ManagedAgentRecord {
                 .display_name
                 .clone()
                 .unwrap_or_else(|| self.name.clone()),
+            job_title: self.job_title.clone(),
             avatar_url: self.avatar_url.clone(),
             system_prompt: self.system_prompt.clone().unwrap_or_default(),
             runtime: self.runtime.clone(),
@@ -194,7 +198,6 @@ impl ManagedAgentRecord {
         })
     }
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayAgentInfo {
     pub pubkey: String,
@@ -218,6 +221,9 @@ pub struct ManagedAgentRecord {
     pub name: String,
     #[serde(default)]
     pub persona_id: Option<String>,
+    /// Materialized display-only job title for linked records and snapshots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_title: Option<String>,
     /// Team this instance was deployed from. Resolves runtime team instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
@@ -239,6 +245,8 @@ pub struct ManagedAgentRecord {
     /// Re-attestation requires agent recreation (v2 migration scope).
     #[serde(default)]
     pub auth_tag: Option<String>,
+    #[serde(default)]
+    pub sandbox_id: Option<String>,
     pub relay_url: String,
     /// Avatar URL resolved at creation time (user-supplied input, else the
     /// command-based fallback). Persisted so startup reconciliation compares
@@ -445,7 +453,6 @@ pub struct ManagedAgentRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<String>,
 }
-
 #[derive(Debug)]
 pub struct ManagedAgentProcess {
     pub child: Child,
@@ -477,12 +484,13 @@ pub struct ManagedAgentProcess {
     #[cfg(windows)]
     pub job: Option<crate::managed_agents::JobHandle>,
 }
-
 #[derive(Debug, Clone, Serialize)]
 pub struct ManagedAgentSummary {
     pub pubkey: String,
     pub name: String,
     pub persona_id: Option<String>,
+    /// Definition-level job title when configured.
+    pub job_title: Option<String>,
     /// The record's harness/runtime id (mirror of `ManagedAgentRecord.runtime`).
     /// Lets the UI count agents referencing a harness definition (e.g. in the
     /// delete-confirmation flow). `None` = inherit from the linked persona.
@@ -555,7 +563,6 @@ pub struct ManagedAgentSummary {
     pub respond_to: RespondTo,
     pub respond_to_allowlist: Vec<String>,
 }
-
 #[derive(Debug, Serialize)]
 pub struct CreateManagedAgentResponse {
     pub agent: ManagedAgentSummary,
@@ -563,13 +570,11 @@ pub struct CreateManagedAgentResponse {
     pub profile_sync_error: Option<String>,
     pub spawn_error: Option<String>,
 }
-
 #[derive(Debug, Serialize)]
 pub struct ManagedAgentLogResponse {
     pub content: String,
     pub log_path: String,
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AcpAvailabilityStatus {
@@ -581,7 +586,6 @@ pub enum AcpAvailabilityStatus {
     CliMissing,
     NotInstalled,
 }
-
 /// Authentication/login status for a CLI-based ACP runtime. Serializes as a tagged union
 /// `{ status: "...", diagnostic?: "..." }` so the TypeScript side can exhaustively switch on `status`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -949,9 +953,8 @@ pub fn resolve_mint_behavioral_defaults(
     }
 
     let parallelism = match input_parallelism {
-        // Explicit input is validated here too (not just at the command
-        // call sites) so the "validated when present" contract on
-        // `MintBehavioralDefaults.parallelism` is unskippable.
+        // Explicit input is validated here too (not just at the command call
+        // sites) so the "validated when present" contract is unskippable.
         Some(count) if (1..=32).contains(&count) => Some(count),
         Some(count) => {
             return Err(format!(

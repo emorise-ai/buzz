@@ -2191,6 +2191,24 @@ async fn tokio_main() -> Result<()> {
     }
 
     let base_prompt_content = config.base_prompt_content.take();
+    let managed_agent_name = std::env::var("BUZZ_ACP_DISPLAY_NAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty());
+    let base_prompt = if config.no_base_prompt {
+        None
+    } else {
+        let content =
+            base_prompt_content.unwrap_or_else(|| include_str!("base_prompt.md").to_string());
+        Some(Box::leak(
+            append_managed_runtime_prompts(
+                content,
+                has_sandbox_broker(),
+                managed_agent_name.as_deref(),
+                &pubkey_hex,
+            )
+            .into_boxed_str(),
+        ) as &'static str)
+    };
     let cwd = current_working_directory()?;
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
@@ -2202,13 +2220,7 @@ async fn tokio_main() -> Result<()> {
         system_prompt: config.system_prompt.clone(),
         session_title: config.session_title.clone(),
         team_instructions: config.team_instructions.clone(),
-        base_prompt: if config.no_base_prompt {
-            None
-        } else if let Some(content) = base_prompt_content {
-            Some(Box::leak(content.into_boxed_str()))
-        } else {
-            Some(include_str!("base_prompt.md"))
-        },
+        base_prompt,
         heartbeat_prompt: config.heartbeat_prompt.clone(),
         cwd,
         rest_client: relay.rest_client(),
@@ -4531,6 +4543,91 @@ mod agent_draft_prompt_tests {
     }
 }
 
+#[cfg(test)]
+mod computer_prompt_tests {
+    use super::{
+        append_computer_prompt, append_managed_runtime_prompts, append_secure_credential_prompt,
+        effective_base_prompt,
+    };
+
+    #[test]
+    fn computer_prompt_is_absent_without_a_sandbox_broker() {
+        let prompt = effective_base_prompt(false);
+        assert!(!prompt.contains("Your Computer"));
+        assert!(!prompt.contains("buzz sandbox exec"));
+    }
+
+    #[test]
+    fn computer_prompt_is_appended_with_a_sandbox_broker() {
+        let prompt = effective_base_prompt(true);
+        assert!(prompt.contains("Your Computer"));
+        // Commands target the running sandbox by default — BUZZ_SANDBOX_ID is
+        // an override, not a guaranteed env var, so the prompt must not
+        // promise it is always set.
+        assert!(prompt.contains("automatically target the computer you are running inside"));
+        assert!(prompt.contains("BUZZ_SANDBOX_ID"));
+        assert!(prompt.contains("overrides the default target"));
+        assert!(prompt.contains("buzz sandbox exec"));
+        assert!(prompt.contains("buzz sandbox screenshot"));
+        assert!(prompt.contains("take over the mouse and keyboard"));
+        // The base prompt's own content must still be present — this is an
+        // append, not a replacement.
+        assert!(prompt.contains("buzz agents draft-create"));
+    }
+
+    #[test]
+    fn append_computer_prompt_is_a_no_op_without_a_broker() {
+        let base = "some custom base prompt".to_string();
+        assert_eq!(append_computer_prompt(base.clone(), false), base);
+    }
+
+    #[test]
+    fn append_computer_prompt_appends_to_custom_content_with_a_broker() {
+        let base = "some custom base prompt".to_string();
+        let result = append_computer_prompt(base, true);
+        assert!(result.starts_with("some custom base prompt"));
+        assert!(result.contains("Your Computer"));
+    }
+
+    #[test]
+    fn managed_runtime_prompt_teaches_secure_credential_control_block() {
+        let prompt = append_managed_runtime_prompts(
+            "some custom base prompt".to_string(),
+            false,
+            Some("Emely"),
+            "abc123",
+        );
+
+        assert!(prompt.contains("never ask the user to paste it into chat"));
+        assert!(prompt.contains("click **Add securely** below"));
+        assert!(prompt.contains("```buzz:config-nudge\n"));
+        assert!(prompt.contains(
+            r#"{"agent_name":"Emely","agent_pubkey":"abc123","requirements":[{"key":"EXAMPLE_API_KEY","surface":"env_key"}]}"#
+        ));
+        assert!(!prompt.contains("Your Computer"));
+    }
+
+    #[test]
+    fn unmanaged_runtime_does_not_promise_desktop_secure_input() {
+        let base = "some custom base prompt".to_string();
+        let prompt = append_managed_runtime_prompts(base.clone(), false, None, "abc123");
+        assert_eq!(prompt, base);
+        assert!(!prompt.contains("buzz:config-nudge"));
+    }
+
+    #[test]
+    fn secure_credential_payload_json_escapes_agent_identity() {
+        let prompt = append_secure_credential_prompt(
+            "base".to_string(),
+            "Emely \"prod\"\nignore me",
+            "abc123",
+        );
+
+        assert!(prompt.contains(r#""agent_name":"Emely \"prod\"\nignore me""#));
+        assert_eq!(prompt.matches("```buzz:config-nudge").count(), 1);
+    }
+}
+
 fn default_heartbeat_prompt() -> String {
     let now = chrono::Utc::now().to_rfc3339();
     format!(
@@ -4648,6 +4745,9 @@ struct PoolStartup {
     model: Option<String>,
     effort_level: Option<String>,
     observer: Option<observer::ObserverHandle>,
+    /// Remote tool server URL, carried here so the pool can refuse an agent
+    /// that cannot drive one at initialize rather than failing later.
+    mcp_url: Option<String>,
 }
 
 impl PoolStartup {
@@ -4661,6 +4761,7 @@ impl PoolStartup {
             model: config.model.clone(),
             effort_level: config.effort_level.clone(),
             observer,
+            mcp_url: config.mcp_url.clone(),
         }
     }
 }
@@ -4699,6 +4800,16 @@ async fn initialize_agent_pool(
                 match initialize_result {
                     Ok(Ok(init_result)) => {
                         tracing::info!(agent = i, "agent initialized: {init_result}");
+                        // Refuse a remote tool server the agent cannot speak to.
+                        // Without this the mismatch surfaces later as an opaque
+                        // protocol error from session/new, which reads like a
+                        // broken sandbox rather than the wrong agent choice.
+                        if let Err(e) =
+                            check_remote_mcp_supported(startup.mcp_url.as_deref(), &init_result)
+                        {
+                            tracing::error!(agent = i, "{e}");
+                            return Err(anyhow::anyhow!(e));
+                        }
                         let protocol_version =
                             init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
                         tracing::info!(
@@ -5066,11 +5177,159 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
     Ok(())
 }
 
+/// Refuse `--mcp-url` when the agent cannot drive a remote tool server.
+///
+/// The ACP schema gates the HTTP `McpServer` variant on the agent advertising
+/// `agentCapabilities.mcpCapabilities.http`. Sending it regardless is a
+/// protocol violation, and the resulting failure appears at `session/new` as a
+/// generic rejection — far from the actual cause. Checking at initialize turns
+/// that into one sentence naming the fix.
+fn check_remote_mcp_supported(
+    mcp_url: Option<&str>,
+    init_result: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(url) = mcp_url.filter(|u| !u.trim().is_empty()) else {
+        return Ok(());
+    };
+    let supported = init_result
+        .get("agentCapabilities")
+        .and_then(|c| c.get("mcpCapabilities"))
+        .and_then(|m| m.get("http"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if supported {
+        return Ok(());
+    }
+    let name = init_result
+        .get("agentInfo")
+        .or_else(|| init_result.get("serverInfo"))
+        .and_then(|info| info.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("this agent");
+    Err(format!(
+        "remote tools were requested (--mcp-url {url}) but {name} does not support \
+         them: it did not advertise mcpCapabilities.http. Use an agent that does \
+         (claude-agent-acp), or drop --mcp-url to run tools locally."
+    ))
+}
+
+/// Whether this harness process is wired to a sandbox broker.
+///
+/// `BUZZ_SANDBOX_BROKER_URL` is injected by the deploy path
+/// (`buzz-backend-docker`) into managed sandboxes only, so its presence in
+/// the harness's own process env — not any per-agent config — is what
+/// distinguishes a sandboxed agent from one running elsewhere.
+fn has_sandbox_broker() -> bool {
+    std::env::var("BUZZ_SANDBOX_BROKER_URL")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// The compiled-in base prompt, with runtime-specific briefings appended.
+#[cfg(test)]
+fn effective_base_prompt(has_broker: bool) -> &'static str {
+    Box::leak(
+        append_managed_runtime_prompts(
+            include_str!("base_prompt.md").to_string(),
+            has_broker,
+            None,
+            "",
+        )
+        .into_boxed_str(),
+    )
+}
+
+/// Append the briefings that depend on how this harness was launched.
+fn append_managed_runtime_prompts(
+    base: String,
+    has_broker: bool,
+    managed_agent_name: Option<&str>,
+    agent_pubkey: &str,
+) -> String {
+    let base = append_computer_prompt(base, has_broker);
+    let Some(agent_name) = managed_agent_name else {
+        return base;
+    };
+
+    append_secure_credential_prompt(base, agent_name, agent_pubkey)
+}
+
+/// Teach a Desktop-managed agent how to invoke Buzz's trusted credential UI.
+///
+/// The control payload contains only public metadata and the requested env-var
+/// name. The secret travels through a separate Tauri command after a user click
+/// and is never returned to the model or written into conversation history.
+fn append_secure_credential_prompt(base: String, agent_name: &str, agent_pubkey: &str) -> String {
+    let example_payload = serde_json::json!({
+        "agent_name": agent_name,
+        "agent_pubkey": agent_pubkey,
+        "requirements": [{"surface": "env_key", "key": "EXAMPLE_API_KEY"}],
+    });
+
+    format!(
+        "{}\n\n## Secure credential input\n\
+When you need an API key, access token, password, or other secret environment value, never ask the user to paste it into chat or save it in a plaintext file. Ask them to use Buzz's secure input instead.\n\n\
+End that reply with exactly one control block in this form, replacing only `EXAMPLE_API_KEY` with the exact environment-variable name you need:\n\n\
+```buzz:config-nudge\n{}\n```\n\n\
+The key must be a valid environment-variable name such as `ODOO_API_KEY`. Keep non-secret configuration questions, such as server URL, username, or database name, in ordinary prose. Tell the user to click **Add securely** below; do not claim that you can see the entered value. Buzz stores the secret outside chat and restarts you with it in your environment. Do not emit this block unless you genuinely need a secret.",
+        base.trim_end(),
+        example_payload,
+    )
+}
+
+/// Append the computer-use briefing to `base`, if `has_broker`; otherwise
+/// return `base` unchanged.
+fn append_computer_prompt(base: String, has_broker: bool) -> String {
+    if !has_broker {
+        return base;
+    }
+    format!(
+        "{}\n\n{}",
+        base.trim_end(),
+        include_str!("computer_prompt.md").trim_end()
+    )
+}
+
 fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
+    // A remote tool server wins over spawning a local one: the operator has
+    // said the tools live on another machine, which is the whole point of
+    // running the model here and the hands there.
+    //
+    // Nothing is passed as env — the sandbox already holds its own identity and
+    // configuration, and its environment is fixed at deploy time. The only
+    // per-request material is the NIP-98 signature, which the agent's HTTP
+    // client attaches per call rather than carrying in static headers.
+    if let Some(url) = config.mcp_url.as_deref().filter(|u| !u.trim().is_empty()) {
+        // The sandbox's bearer token, when the launcher was given one.
+        //
+        // This is what lets *any* MCP client drive the sandbox: the
+        // authorization spec expects `Authorization: Bearer`, and every client
+        // implements it. An agent that can sign NIP-98 (buzz-agent) does not
+        // need this and authenticates per request instead, so the token is
+        // optional rather than required.
+        let headers = std::env::var("BUZZ_ACP_MCP_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| {
+                vec![acp::HttpHeader {
+                    name: "Authorization".to_string(),
+                    value: format!("Bearer {}", t.trim()),
+                }]
+            })
+            .unwrap_or_default();
+
+        return vec![McpServer::Http {
+            transport: acp::HttpTransportTag::Http,
+            name: "buzz-dev-mcp".to_string(),
+            url: url.trim().to_string(),
+            headers,
+        }];
+    }
+
     if config.mcp_command.is_empty() {
         return vec![];
     }
-    vec![McpServer {
+    vec![McpServer::Stdio {
         name: std::path::Path::new(&config.mcp_command)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -5121,6 +5380,89 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
             env
         },
     }]
+}
+
+#[cfg(test)]
+mod remote_mcp_tests {
+    use super::*;
+
+    fn init_with_http(supported: bool) -> serde_json::Value {
+        serde_json::json!({
+            "protocolVersion": 1,
+            "agentInfo": {"name": "test-agent"},
+            "agentCapabilities": {"mcpCapabilities": {"http": supported, "sse": supported}}
+        })
+    }
+
+    #[test]
+    fn allows_remote_tools_when_the_agent_advertises_http() {
+        assert!(check_remote_mcp_supported(Some("http://h/mcp"), &init_with_http(true)).is_ok());
+    }
+
+    /// The mismatch this guard exists for: without it the failure surfaces at
+    /// session/new as an opaque rejection.
+    #[test]
+    fn refuses_remote_tools_when_the_agent_cannot_speak_http() {
+        let err = check_remote_mcp_supported(Some("http://h/mcp"), &init_with_http(false))
+            .expect_err("must refuse");
+        assert!(err.contains("test-agent"), "should name the agent: {err}");
+        assert!(err.contains("--mcp-url"), "should name the flag: {err}");
+    }
+
+    /// An agent that omits the capability block entirely (older adapters) must
+    /// be treated as not supporting remote tools, not as unknown-so-allow.
+    #[test]
+    fn treats_a_missing_capability_block_as_unsupported() {
+        let init = serde_json::json!({"protocolVersion": 1, "agentCapabilities": {}});
+        assert!(check_remote_mcp_supported(Some("http://h/mcp"), &init).is_err());
+    }
+
+    /// Local (stdio) tools must stay unaffected by the guard.
+    #[test]
+    fn ignores_the_check_when_no_remote_url_is_configured() {
+        assert!(check_remote_mcp_supported(None, &init_with_http(false)).is_ok());
+        assert!(check_remote_mcp_supported(Some("   "), &init_with_http(false)).is_ok());
+    }
+
+    /// The wire shape the ACP schema requires for a remote server: a `type`
+    /// discriminator of "http", a url, and headers — and crucially no
+    /// `command`, which would make it parse as the stdio variant.
+    #[test]
+    fn http_variant_serializes_to_the_schema_shape() {
+        let server = McpServer::Http {
+            transport: acp::HttpTransportTag::Http,
+            name: "buzz-dev-mcp".into(),
+            url: "http://127.0.0.1:9320/mcp".into(),
+            headers: vec![],
+        };
+        let v = serde_json::to_value(&server).expect("serialize");
+        assert_eq!(v["type"], "http");
+        assert_eq!(v["url"], "http://127.0.0.1:9320/mcp");
+        assert_eq!(v["name"], "buzz-dev-mcp");
+        assert!(v.get("command").is_none(), "must not look like stdio: {v}");
+    }
+
+    /// The stdio variant must keep its existing shape — every current agent
+    /// depends on it, and the enum change must not alter the wire format.
+    #[test]
+    fn stdio_variant_keeps_its_existing_shape() {
+        let server = McpServer::Stdio {
+            name: "buzz-dev-mcp".into(),
+            command: "buzz-dev-mcp".into(),
+            args: vec![],
+            env: vec![EnvVar {
+                name: "K".into(),
+                value: "V".into(),
+            }],
+        };
+        let v = serde_json::to_value(&server).expect("serialize");
+        assert_eq!(v["command"], "buzz-dev-mcp");
+        assert_eq!(v["env"][0]["name"], "K");
+        assert!(
+            v.get("type").is_none(),
+            "stdio carries no discriminator: {v}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6796,6 +7138,7 @@ mod build_mcp_servers_tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
+            mcp_url: None,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -6843,9 +7186,9 @@ mod build_mcp_servers_tests {
         let servers = build_mcp_servers(&config);
         assert_eq!(servers.len(), 1);
         let server = &servers[0];
-        assert_eq!(server.name, "test-mcp-server");
+        assert_eq!(server.name(), "test-mcp-server");
 
-        let names: Vec<&str> = server.env.iter().map(|e| e.name.as_str()).collect();
+        let names: Vec<&str> = server.env().iter().map(|e| e.name.as_str()).collect();
         assert!(
             names.contains(&"BUZZ_RELAY_URL"),
             "missing BUZZ_RELAY_URL; got {names:?}"
@@ -6865,7 +7208,7 @@ mod build_mcp_servers_tests {
         std::env::remove_var("BUZZ_AUTH_TAG");
 
         let server = &servers[0];
-        let auth_tag_env = server.env.iter().find(|e| e.name == "BUZZ_AUTH_TAG");
+        let auth_tag_env = server.env().iter().find(|e| e.name == "BUZZ_AUTH_TAG");
         assert!(
             auth_tag_env.is_some(),
             "BUZZ_AUTH_TAG should be forwarded when set"
@@ -6882,7 +7225,7 @@ mod build_mcp_servers_tests {
         std::env::remove_var("BUZZ_AUTH_TAG");
 
         let server = &servers[0];
-        let has_auth_tag = server.env.iter().any(|e| e.name == "BUZZ_AUTH_TAG");
+        let has_auth_tag = server.env().iter().any(|e| e.name == "BUZZ_AUTH_TAG");
         assert!(!has_auth_tag, "empty BUZZ_AUTH_TAG should not be forwarded");
     }
 
@@ -6895,7 +7238,7 @@ mod build_mcp_servers_tests {
         std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
 
         let entry = servers[0]
-            .env
+            .env()
             .iter()
             .find(|e| e.name == "BUZZ_ACP_DISPLAY_NAME");
         assert_eq!(
@@ -6916,7 +7259,7 @@ mod build_mcp_servers_tests {
         // falls back to the npub when the key is missing or blank.
         assert!(
             !servers[0]
-                .env
+                .env()
                 .iter()
                 .any(|e| e.name == "BUZZ_ACP_DISPLAY_NAME"),
             "unset display name should not add the key"
@@ -6933,7 +7276,7 @@ mod build_mcp_servers_tests {
 
         assert!(
             !servers[0]
-                .env
+                .env()
                 .iter()
                 .any(|e| e.name == "BUZZ_ACP_DISPLAY_NAME"),
             "empty display name should not be forwarded"
@@ -6957,7 +7300,7 @@ mod build_mcp_servers_tests {
         config.mcp_command = "/opt/bin/my-mcp-server".into();
         let servers = build_mcp_servers(&config);
         assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].name, "my-mcp-server");
+        assert_eq!(servers[0].name(), "my-mcp-server");
     }
 
     #[test]
@@ -6979,7 +7322,8 @@ mod build_mcp_servers_tests {
         let servers = build_mcp_servers(&config);
         assert_eq!(servers.len(), 1);
         assert_eq!(
-            servers[0].name, "mcp",
+            servers[0].name(),
+            "mcp",
             "Path::new(\".\").file_stem() is None — should fall back to \"mcp\""
         );
     }
@@ -7020,6 +7364,7 @@ mod error_outcome_emission_tests {
             agent_command: "true".into(),
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
+            mcp_url: None,
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,

@@ -1,13 +1,16 @@
-import { AlertTriangle } from "lucide-react";
+import * as React from "react";
+import { AlertTriangle, KeyRound } from "lucide-react";
 
 import {
   requestOpenEditAgent,
   type EditAgentFocusTarget,
 } from "@/features/agents/openEditAgentEvent";
+import { SecureAgentCredentialDialog } from "@/features/agents/ui/SecureAgentCredentialDialog";
 import { useAppShell } from "@/app/AppShellContext";
 import type { ConfigNudgePayload } from "@/shared/lib/configNudge";
 import { cn } from "@/shared/lib/cn";
 import { useProfilePanel } from "@/shared/context/ProfilePanelContext";
+import { Button } from "@/shared/ui/button";
 import {
   Attachment,
   AttachmentActions,
@@ -120,16 +123,13 @@ function cliLoginMessage(
 
 /**
  * Derive a field-focus target from the first actionable requirement.
- * `cli_login` requirements don't map to a focusable Edit Agent field,
- * so they are skipped. Returns `undefined` for cli_login-only nudges.
+ * Secure env-key requirements and `cli_login` requirements don't map to a
+ * focusable Edit Agent field, so they are skipped.
  */
 function firstFocusTarget(
   requirements: ConfigNudgePayload["requirements"],
 ): EditAgentFocusTarget | undefined {
   for (const req of requirements) {
-    if (req.surface === "env_key") {
-      return { type: "env_key", key: req.key };
-    }
     if (req.surface === "normalized_field") {
       return { type: "normalized_field", field: req.field };
     }
@@ -173,7 +173,8 @@ export function focusTargetForRequirement(
  *     already gives the needed command.
  * (B) Other mixed cards open Edit Agent as the card-level fallback. Their rows
  *     carry inline CTAs for the matching destination: install-state `cli_login`
- *     opens Agent runtimes; `env_key` and `normalized_field` open Edit Agent. A
+ *     opens Agent runtimes; `env_key` opens secure credential entry; and
+ *     `normalized_field` opens Edit Agent. A
  *     `git_bash` row is covered by the card-level Agent runtimes route, so it does not
  *     render a redundant row action.
  */
@@ -186,11 +187,27 @@ export function ConfigNudgeCard({
 }) {
   const { openProfilePanel } = useProfilePanel();
   const { onOpenSettings } = useAppShell();
+  const [credentialKey, setCredentialKey] = React.useState<string | null>(null);
 
   const allCliLogin = isAllCliLogin(nudge.requirements);
   const opensDoctor = shouldOpenDoctor(nudge.requirements);
   const authOnly = isAuthOnly(nudge.requirements);
   const allConfigInvalid = isAllConfigInvalid(nudge.requirements);
+  const firstCredential = nudge.requirements.find(
+    (requirement) => requirement.surface === "env_key",
+  );
+  const hasEnvKey = firstCredential?.surface === "env_key";
+  const allEnvKeys =
+    nudge.requirements.length > 0 &&
+    nudge.requirements.every(
+      (requirement) => requirement.surface === "env_key",
+    );
+  const singleCredential =
+    allEnvKeys &&
+    nudge.requirements.length === 1 &&
+    firstCredential?.surface === "env_key"
+      ? firstCredential
+      : null;
   // Any card that is purely informational (auth-only or all-config-invalid)
   // has no clickable destination — treat them the same for affordance/routing.
   const informationalOnly = authOnly || allConfigInvalid;
@@ -214,6 +231,8 @@ export function ConfigNudgeCard({
       // Git Bash and install-state CLI requirements both resolve in Agent runtimes.
       // Informational-only cards never mount this trigger.
       openDoctor();
+    } else if (hasEnvKey) {
+      setCredentialKey(firstCredential.key);
     } else {
       // (B) Mixed card — card-level fallback: focus the first editable field.
       openEditAgent(firstFocusTarget(nudge.requirements));
@@ -237,36 +256,67 @@ export function ConfigNudgeCard({
     openEditAgent(focus);
   };
 
+  const handleOpenCredential = (e: React.MouseEvent, key: string) => {
+    e.stopPropagation();
+    setCredentialKey(key);
+  };
+
   return (
     <Attachment
       className={cn(
         "max-w-[min(100%,32rem)] shrink-0 shadow-none",
         // Affordance: cursor-pointer + subtle hover lift — omitted for
         // informational-only cards which have no click destination.
-        !informationalOnly && "cursor-pointer hover:shadow-sm",
+        !informationalOnly &&
+          !singleCredential &&
+          "cursor-pointer hover:shadow-sm",
         className,
       )}
       orientation="horizontal"
-      state="error"
+      state={allEnvKeys ? "idle" : "error"}
     >
-      <AttachmentMedia className="text-destructive">
-        <AlertTriangle aria-hidden="true" className="h-4 w-4" />
+      <AttachmentMedia
+        className={allEnvKeys ? "text-primary" : "text-destructive"}
+      >
+        {allEnvKeys ? (
+          <KeyRound aria-hidden="true" className="h-4 w-4" />
+        ) : (
+          <AlertTriangle aria-hidden="true" className="h-4 w-4" />
+        )}
       </AttachmentMedia>
       <AttachmentContent>
-        <AttachmentTitle className="whitespace-normal text-destructive line-clamp-2">
-          {nudge.agent_name} needs configuration
+        <AttachmentTitle
+          className={cn(
+            "whitespace-normal line-clamp-2",
+            !allEnvKeys && "text-destructive",
+          )}
+        >
+          {allEnvKeys
+            ? "Secure credential requested"
+            : `${nudge.agent_name} needs configuration`}
         </AttachmentTitle>
-        <div className="mt-1 flex flex-col gap-0.5">
-          {nudge.requirements.map((req, i) => (
-            <RequirementRow
-              key={requirementKey(req, i)}
-              allCliLogin={allCliLogin}
-              onOpenDoctor={handleOpenDoctor}
-              onOpenEditAgent={handleOpenEditAgent}
-              requirement={req}
-            />
-          ))}
-        </div>
+        {singleCredential ? (
+          <div className="mt-0.5 text-xs leading-4 text-muted-foreground">
+            <span>{nudge.agent_name} needs </span>
+            <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs text-foreground">
+              {singleCredential.key}
+            </code>
+            <span>. It stays out of chat.</span>
+          </div>
+        ) : (
+          <div className="mt-1 flex flex-col gap-0.5">
+            {nudge.requirements.map((req, i) => (
+              <RequirementRow
+                key={requirementKey(req, i)}
+                allCliLogin={allCliLogin}
+                onOpenDoctor={handleOpenDoctor}
+                onOpenCredential={handleOpenCredential}
+                onOpenEditAgent={handleOpenEditAgent}
+                requirement={req}
+              />
+            ))}
+          </div>
+        )}
       </AttachmentContent>
       {/* (A) Agent-runtime-routed cards have one card-level CTA. Informational-only
           cards have none; other mixed cards render their own row CTAs. */}
@@ -277,17 +327,41 @@ export function ConfigNudgeCard({
           </span>
         </AttachmentActions>
       )}
+      {singleCredential && (
+        <AttachmentActions>
+          <Button
+            onClick={() => setCredentialKey(singleCredential.key)}
+            size="sm"
+            variant="secondary"
+          >
+            Add securely
+          </Button>
+        </AttachmentActions>
+      )}
       {/* Informational-only cards are purely informational — no trigger, no routing. */}
-      {!informationalOnly && (
+      {!informationalOnly && !singleCredential && (
         <AttachmentTrigger
           aria-label={
             opensDoctor
               ? `Open Agent runtimes for ${nudge.agent_name}`
-              : `Open Edit Agent for ${nudge.agent_name}`
+              : hasEnvKey
+                ? `Add a credential securely for ${nudge.agent_name}`
+                : `Open Edit Agent for ${nudge.agent_name}`
           }
           onClick={handleOpen}
         />
       )}
+      {credentialKey ? (
+        <SecureAgentCredentialDialog
+          agentName={nudge.agent_name}
+          agentPubkey={nudge.agent_pubkey}
+          envKey={credentialKey}
+          onOpenChange={(open) => {
+            if (!open) setCredentialKey(null);
+          }}
+          open
+        />
+      ) : null}
     </Attachment>
   );
 }
@@ -295,11 +369,13 @@ export function ConfigNudgeCard({
 function RequirementRow({
   allCliLogin,
   onOpenDoctor,
+  onOpenCredential,
   onOpenEditAgent,
   requirement,
 }: {
   allCliLogin: boolean;
   onOpenDoctor: (e: React.MouseEvent) => void;
+  onOpenCredential: (e: React.MouseEvent, key: string) => void;
   onOpenEditAgent: (
     e: React.MouseEvent,
     focus: EditAgentFocusTarget | undefined,
@@ -311,21 +387,19 @@ function RequirementRow({
       return (
         <div className="flex items-center gap-2 text-xs leading-4 text-muted-foreground">
           <span className="flex-1 [overflow-wrap:anywhere]">
-            Set{" "}
+            Do not paste this into chat. Add{" "}
             <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs text-foreground">
               {requirement.key}
             </code>{" "}
-            in Edit Agent → Environment variables
+            with Buzz's secure input.
           </span>
           {!allCliLogin && (
             <button
               className="relative z-20 shrink-0 font-medium text-muted-foreground hover:underline"
-              onClick={(e) =>
-                onOpenEditAgent(e, focusTargetForRequirement(requirement))
-              }
+              onClick={(e) => onOpenCredential(e, requirement.key)}
               type="button"
             >
-              Edit Agent →
+              Add securely →
             </button>
           )}
         </div>

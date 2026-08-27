@@ -16,7 +16,8 @@ use std::sync::LazyLock;
 use tauri::State;
 
 use crate::{
-    app_state::AppState, managed_agents::validate_agent_definition_text,
+    app_state::AppState,
+    managed_agents::{validate_agent_definition_text, validate_optional_job_title},
     native_relay_client::NativeRelayClient,
 };
 
@@ -46,6 +47,7 @@ pub(crate) struct PersonaCatalogPublication {
 #[serde(rename_all = "camelCase")]
 struct CatalogAgentProjection {
     display_name: String,
+    job_title: Option<String>,
     avatar_url: Option<String>,
     system_prompt: String,
     runtime: Option<String>,
@@ -223,6 +225,8 @@ fn parse_agent(content: &str) -> Option<CatalogAgentProjection> {
         .unwrap_or_default()
         .to_string();
     validate_agent_definition_text(&display_name, &system_prompt).ok()?;
+    let job_title = optional_string(object.get("job_title")).map(|value| value.trim().to_string());
+    validate_optional_job_title(job_title.as_deref()).ok()?;
 
     let respond_to = match object.get("respond_to").and_then(Value::as_str) {
         Some("allowlist") => Some("owner-only".to_string()),
@@ -247,6 +251,7 @@ fn parse_agent(content: &str) -> Option<CatalogAgentProjection> {
 
     Some(CatalogAgentProjection {
         display_name,
+        job_title,
         avatar_url: object
             .get("avatar_url")
             .and_then(Value::as_str)

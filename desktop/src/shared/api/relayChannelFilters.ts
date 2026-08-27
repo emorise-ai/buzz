@@ -6,9 +6,12 @@ import {
   KIND_DELETION,
   KIND_NIP29_DELETE_EVENT,
   KIND_REACTION,
+  KIND_SANDBOX_CREATED,
+  KIND_SANDBOX_DESTROYED,
   KIND_STREAM_MESSAGE,
   KIND_STREAM_MESSAGE_V2,
   KIND_STREAM_MESSAGE_EDIT,
+  KIND_TYPING_INDICATOR,
 } from "@/shared/constants/kinds";
 import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
 
@@ -173,5 +176,45 @@ export function buildChannelMentionFilter(
     "#p": [pubkey],
     limit,
     since: Math.floor(Date.now() / 1_000),
+  };
+}
+
+/**
+ * Huddle lifecycle events (kinds 48100–48103) for one channel, so
+ * HuddleIndicator detects active huddles without being drowned out by
+ * regular channel messages. Includes the last 10 historical events.
+ */
+export function buildHuddleEventsFilter(
+  channelId: string,
+): RelaySubscriptionFilter {
+  return {
+    kinds: [48100, 48101, 48102, 48103],
+    "#h": [channelId],
+    limit: 100,
+  };
+}
+
+/**
+ * Every sandbox lifecycle event in the community, for the shared
+ * agent-sandbox store to fan out by owner. One community-wide subscription
+ * rather than one per card — a per-card subscription tripped the relay's
+ * per-connection rate limit and the events never arrived.
+ */
+export function buildSandboxLifecycleFilter(): RelaySubscriptionFilter {
+  return {
+    kinds: [KIND_SANDBOX_CREATED, KIND_SANDBOX_DESTROYED],
+    limit: 200,
+  };
+}
+
+/** Live typing indicators for one channel: tiny window, tiny backlog. */
+export function buildTypingIndicatorFilter(
+  channelId: string,
+): RelaySubscriptionFilter {
+  return {
+    kinds: [KIND_TYPING_INDICATOR],
+    "#h": [channelId],
+    limit: 10,
+    since: Math.floor(Date.now() / 1_000) - 10,
   };
 }

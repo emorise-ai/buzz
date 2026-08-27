@@ -1,7 +1,6 @@
 export type ChannelType = "stream" | "forum" | "dm";
 export type ChannelVisibility = "open" | "private";
 export type ChannelRole = "owner" | "admin" | "member" | "guest" | "bot";
-
 export type Channel = {
   id: string;
   name: string;
@@ -33,7 +32,6 @@ export type ChannelDetail = Channel & {
   maxMembers: number | null;
   nip29GroupId: string | null;
 };
-
 export type ChannelMember = {
   pubkey: string;
   role: ChannelRole;
@@ -41,7 +39,6 @@ export type ChannelMember = {
   joinedAt: string;
   displayName: string | null;
 };
-
 export type CreateChannelInput = {
   name: string;
   channelType: Exclude<ChannelType, "dm">;
@@ -49,7 +46,6 @@ export type CreateChannelInput = {
   description?: string;
   ttlSeconds?: number;
 };
-
 export type UpdateChannelInput = {
   channelId: string;
   name?: string;
@@ -306,6 +302,7 @@ export type ManagedAgent = {
   pubkey: string;
   name: string;
   personaId: string | null;
+  jobTitle: string | null;
   /**
    * The record's harness/runtime id (e.g. "goose", "my-custom-harness").
    * `null` means the agent inherits its harness from the linked persona.
@@ -706,6 +703,7 @@ export type UpdateManagedAgentInput = {
 export type AgentPersona = {
   id: string;
   displayName: string;
+  jobTitle: string | null;
   avatarUrl: string | null;
   systemPrompt: string;
   /** Preferred ACP runtime ID (e.g. "goose", "claude"). */
@@ -759,6 +757,7 @@ export type PersonaBehaviorInput = {
 
 export type CreatePersonaInput = {
   displayName: string;
+  jobTitle?: string;
   avatarUrl?: string;
   systemPrompt: string;
   runtime?: string;
@@ -777,6 +776,7 @@ export type CreatePersonaInput = {
 export type UpdatePersonaInput = {
   id: string;
   displayName: string;
+  jobTitle?: string | null;
   avatarUrl?: string;
   systemPrompt: string;
   runtime?: string;

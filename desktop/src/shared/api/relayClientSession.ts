@@ -28,6 +28,9 @@ import {
   buildChannelHistoryFilter,
   buildChannelMentionFilter,
   buildGlobalStreamFilter,
+  buildHuddleEventsFilter,
+  buildSandboxLifecycleFilter,
+  buildTypingIndicatorFilter,
 } from "@/shared/api/relayChannelFilters";
 import {
   clearClosedRetry,
@@ -345,38 +348,24 @@ export class RelayClient {
     );
   }
 
-  /**
-   * Subscribe to huddle lifecycle events (kinds 48100–48103) for a channel,
-   * so HuddleIndicator detects active huddles without being drowned out by
-   * regular channel messages. Includes the last 10 historical events.
-   */
+  /** Huddle lifecycle for one channel — see {@link buildHuddleEventsFilter}. */
   async subscribeToHuddleEvents(
     channelId: string,
     onEvent: (event: RelayEvent) => void,
   ) {
-    return this.subscribe(
-      {
-        kinds: [48100, 48101, 48102, 48103],
-        "#h": [channelId],
-        limit: 100,
-      },
-      onEvent,
-    );
+    return this.subscribe(buildHuddleEventsFilter(channelId), onEvent);
+  }
+
+  /** Community-wide sandbox lifecycle — see {@link buildSandboxLifecycleFilter}. */
+  async subscribeToAllSandboxEvents(onEvent: (event: RelayEvent) => void) {
+    return this.subscribe(buildSandboxLifecycleFilter(), onEvent);
   }
 
   async subscribeToTypingIndicators(
     channelId: string,
     onEvent: (event: RelayEvent) => void,
   ) {
-    return this.subscribe(
-      {
-        kinds: [KIND_TYPING_INDICATOR],
-        "#h": [channelId],
-        limit: 10,
-        since: Math.floor(Date.now() / 1_000) - 10,
-      },
-      onEvent,
-    );
+    return this.subscribe(buildTypingIndicatorFilter(channelId), onEvent);
   }
 
   async publishUserStatus(text: string, emoji: string): Promise<void> {

@@ -17,6 +17,7 @@ fn event(keys: &Keys, created_at: u64, source: &str, shared: bool, content: Valu
 fn valid_content(name: &str) -> Value {
     json!({
         "display_name": name,
+        "job_title": "Principal Researcher",
         "system_prompt": "Review changes.",
         "avatar_url": "https://relay.example/avatar.png",
         "runtime": " goose ",
@@ -104,6 +105,10 @@ fn equal_second_heads_use_lowest_event_id_and_authors_are_independent() {
 fn parser_projects_types_and_foreign_allowlists_exactly() {
     let projection = parse_agent(&valid_content("Reviewer").to_string()).unwrap();
     assert_eq!(projection.display_name, "Reviewer");
+    assert_eq!(
+        projection.job_title.as_deref(),
+        Some("Principal Researcher")
+    );
     assert_eq!(projection.runtime.as_deref(), Some(" goose "));
     assert_eq!(projection.provider, None);
     assert_eq!(projection.name_pool, vec!["Reviewer"]);
@@ -203,6 +208,7 @@ fn serialized_catalog_matches_the_typescript_contract() {
         created_at: 42,
         agent: CatalogAgentProjection {
             display_name: "Ada".into(),
+            job_title: Some("Principal Researcher".into()),
             avatar_url: Some("https://example.com/a.png".into()),
             system_prompt: "be kind".into(),
             runtime: Some("acp".into()),
@@ -221,6 +227,7 @@ fn serialized_catalog_matches_the_typescript_contract() {
         "createdAt": 42,
         "agent": {
             "displayName": "Ada",
+            "jobTitle": "Principal Researcher",
             "avatarUrl": "https://example.com/a.png",
             "systemPrompt": "be kind",
             "runtime": "acp",

@@ -67,8 +67,10 @@ mod tests {
             pubkey: String::new(),
             name: "r".to_string(),
             persona_id: None,
+            job_title: None,
             private_key_nsec: String::new(),
             auth_tag: None,
+            sandbox_id: None,
             relay_url: String::new(),
             avatar_url: None,
             acp_command: String::new(),
@@ -130,6 +132,7 @@ mod tests {
         AgentDefinition {
             id: id.to_string(),
             display_name: String::new(),
+            job_title: None,
             avatar_url: None,
             system_prompt: String::new(),
             runtime: runtime.map(str::to_string),

@@ -333,6 +333,7 @@ mod tests {
             version: FORMAT_VERSION,
             definition: AgentSnapshotDefinition {
                 name: "Locked Test".to_string(),
+                job_title: None,
                 system_prompt: Some("You are a locked test agent.".to_string()),
                 runtime: None,
                 model: None,
@@ -369,8 +370,10 @@ mod tests {
             pubkey,
             name: "Locked Test".to_string(),
             persona_id: None,
+            job_title: None,
             private_key_nsec,
             auth_tag: None,
+            sandbox_id: None,
             relay_url: "ws://localhost:3000".to_string(),
             avatar_url: None,
             acp_command: "buzz-acp".to_string(),

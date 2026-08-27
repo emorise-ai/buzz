@@ -55,7 +55,8 @@ pub(crate) fn lock_path_mutex() -> std::sync::MutexGuard<'static, ()> {
 
 pub use backend::*;
 pub(crate) use definition_validation::{
-    validate_agent_definition_text, validate_managed_agent_definition_text,
+    normalize_optional_job_title, validate_agent_definition_text,
+    validate_managed_agent_definition_text, validate_optional_job_title,
 };
 pub use discovery::*;
 pub use env_vars::*;
@@ -82,6 +83,7 @@ pub use repos::{
     write_persisted_repos_dir,
 };
 pub use restore::*;
+pub(crate) use runtime::sandbox_env::{decide_sandbox_liveness, SandboxLivenessOutcome};
 pub use runtime::*;
 pub use runtime_commands::*;
 pub use runtime_types::*;

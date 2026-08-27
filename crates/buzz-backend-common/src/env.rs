@@ -1,9 +1,14 @@
-//! Building the pod environment (spec §Launch data, §Entrypoint mapping table).
+//! Building the sandbox environment (spec §Launch data, §Entrypoint mapping table).
 //!
-//! The three tiers are resolved *here*, before serialization, because a
-//! Kubernetes Secret's `data` is a flat map with no precedence of its own: if
-//! two tiers supplied the same key, whichever entry landed in the map would
-//! win silently. Resolving in-provider makes later-wins explicit and testable.
+//! Adapted from `buzz-backend-kubernetes/src/env.rs`. The precedence rules are
+//! substrate-independent — they are the spec's, not Kubernetes' — so this file
+//! is kept as close to its sibling as possible on purpose: a divergence here
+//! would be a silent behavior fork between the two remote paths.
+//!
+//! The three tiers are resolved *here*, before serialization, because the
+//! container's `Env` is a flat list with no precedence of its own: if two tiers
+//! supplied the same key, whichever entry landed last would win silently.
+//! Resolving in-provider makes later-wins explicit and testable.
 
 use crate::wire::{AgentPayload, LaunchBlock};
 use std::collections::BTreeMap;
@@ -35,10 +40,9 @@ const AUTHORITATIVE_KEYS: &[&str] = &[
     START_NONCE_KEY,
 ];
 
-/// The attempt's generation, as the harness sees it. Also the Secret's name
-/// suffix — one generation, one identity — so the reconciler restamps this on
-/// every create attempt rather than letting the caller's value persist across
-/// a retry.
+/// The attempt's generation, as the harness sees it. Also the container's name
+/// suffix — one generation, one identity — so a retry restamps this rather
+/// than letting the caller's value persist across attempts.
 pub const START_NONCE_KEY: &str = "BUZZ_MANAGED_AGENT_START_NONCE";
 
 /// Presence is the only remote liveness signal (I3), so a launch that
@@ -46,23 +50,27 @@ pub const START_NONCE_KEY: &str = "BUZZ_MANAGED_AGENT_START_NONCE";
 /// collision, there is no "authoritative value" to overwrite it with. Refuse.
 const FORBIDDEN_KEY: &str = "BUZZ_ACP_NO_PRESENCE";
 
-/// Kubernetes' own cap on the summed value bytes of a Secret
-/// (`MaxSecretSize`, `pkg/apis/core/types.go`). Enforced here so an oversized
-/// env surfaces as a named provider error rather than an apiserver rejection
-/// partway through a deploy.
+/// Cap on the summed environment value bytes.
+///
+/// Docker has no documented hard limit here, but the environment is passed to
+/// `execve` in the container, which is bounded by `ARG_MAX` (typically 2 MB on
+/// Linux, shared with argv). 1 MB is the same ceiling the Kubernetes binding
+/// enforces, kept identical so an agent config that deploys to one substrate
+/// deploys to the other.
 const MAX_SECRET_BYTES: usize = 1024 * 1024;
 
 /// A POSIX-shaped env var name: `[A-Za-z_][A-Za-z0-9_]*`.
 ///
-/// Kubernetes validates Secret *keys* as `IsConfigMapKey`
-/// (`[-._a-zA-Z0-9]+`), which is looser — `foo.bar` is a legal Secret key.
-/// What the kubelet then does with such a key **changed between versions**:
-/// through 1.29 it filtered invalid env names out of `envFrom` and emitted an
-/// `InvalidEnvironmentVariableNames` warning event
-/// (`pkg/kubelet/kubelet_pods.go:646,654` at v1.29.0); from 1.30 that filter
-/// is gone (KEP-4369) and the key is injected verbatim. The same manifest
-/// would silently drop a variable on one cluster and set it on another, so we
-/// fail closed on the provider side and get one deterministic behavior.
+/// Docker accepts an `Env` entry of any shape — it splits on the first `=` and
+/// passes the result to `execve` verbatim. A name like `foo.bar` or `foo-bar`
+/// therefore *reaches* the container but is unreachable from a POSIX shell
+/// (`$foo.bar` does not parse), so an agent would see a variable it cannot
+/// read and the failure would look like a missing value rather than a
+/// malformed name.
+///
+/// Refusing here also keeps this binding aligned with the Kubernetes one,
+/// which must reject the same names for a different reason (kubelet behavior
+/// changed across versions). One rule, both substrates.
 fn is_posix_env_key(key: &str) -> bool {
     let mut chars = key.chars();
     match chars.next() {
@@ -150,22 +158,39 @@ fn validate_respond_to_gate(respond_to: &str, allowlist: Option<&[String]>) -> R
 
 /// Inputs the provider itself supplies to the authoritative tier.
 pub struct AuthoritativeInputs<'a> {
-    /// The attempt's generation token — also the Secret's name suffix, so the
-    /// lifecycle correlator and the Secret generation are one identity.
+    /// The attempt's generation token — also the container's name suffix, so
+    /// the lifecycle correlator and the container generation are one identity.
     pub generation: &'a str,
     /// Resolved from `provider_config.inactivity_seconds`; `None` when the
     /// indefinite opt-in was chosen (which this version refuses elsewhere).
     pub inactivity_seconds: Option<u64>,
 }
 
-/// Resolve the full pod environment.
+/// Resolve the full sandbox environment.
 ///
 /// Order is the spec's, and the function body is deliberately three writes in
 /// that order — tier 1, tier 2, tier 3 — so "later wins" is visible rather
 /// than argued.
+/// Substrate-specific wording for the two validation failures whose *cause*
+/// differs by substrate even though the *rule* does not.
+///
+/// The rules themselves — POSIX key names, the 1 MB environment ceiling — are
+/// the spec's and identical everywhere. Only the explanation of what breaks
+/// differs (a Kubernetes Secret limit versus an `execve` failure), and a wrong
+/// explanation sends the reader to the wrong place. Passing them in keeps one
+/// implementation of the rule with an accurate message on each substrate.
+#[derive(Debug, Clone, Copy)]
+pub struct SubstrateDiagnostics {
+    /// Why a non-POSIX environment variable name is unusable here.
+    pub non_posix_key_reason: &'static str,
+    /// Why exceeding the environment byte ceiling breaks the launch here.
+    pub env_too_large_reason: &'static str,
+}
+
 pub fn build_env(
     agent: &AgentPayload,
     auth: AuthoritativeInputs<'_>,
+    diagnostics: SubstrateDiagnostics,
 ) -> Result<BTreeMap<String, String>, String> {
     let default_launch = LaunchBlock::default();
     let launch = agent.launch.as_ref().unwrap_or(&default_launch);
@@ -196,8 +221,8 @@ pub fn build_env(
         if !is_posix_env_key(key) {
             return Err(format!(
                 "env key {key:?} is not a POSIX environment variable name \
-                 ([A-Za-z_][A-Za-z0-9_]*); Kubernetes would treat it \
-                 inconsistently across cluster versions"
+                 ([A-Za-z_][A-Za-z0-9_]*); {}",
+                diagnostics.non_posix_key_reason
             ));
         }
         if key.eq_ignore_ascii_case(FORBIDDEN_KEY) {
@@ -288,8 +313,9 @@ pub fn build_env(
     let total: usize = env.values().map(String::len).sum();
     if total > MAX_SECRET_BYTES {
         return Err(format!(
-            "agent environment is {total} bytes; Kubernetes caps Secret data \
-             at {MAX_SECRET_BYTES}"
+            "agent environment is {total} bytes, over the {MAX_SECRET_BYTES} \
+             byte cap; {}",
+            diagnostics.env_too_large_reason
         ));
     }
 
@@ -316,6 +342,13 @@ mod tests {
         serde_json::from_value(agent).unwrap()
     }
 
+    /// Wording used only to satisfy the signature; these tests assert the
+    /// shared rules, not any substrate's explanation of them.
+    const TEST_DIAGNOSTICS: SubstrateDiagnostics = SubstrateDiagnostics {
+        non_posix_key_reason: "test substrate would reject it",
+        env_too_large_reason: "test substrate would reject it",
+    };
+
     fn build(agent: &AgentPayload) -> Result<BTreeMap<String, String>, String> {
         build_env(
             agent,
@@ -323,6 +356,7 @@ mod tests {
                 generation: "gen0001",
                 inactivity_seconds: Some(7200),
             },
+            TEST_DIAGNOSTICS,
         )
     }
 
@@ -569,9 +603,9 @@ mod tests {
         assert!(err.contains("BUZZ_ACP_NO_PRESENCE"), "got: {err}");
     }
 
-    /// `foo.bar` is a legal Secret key but not a legal env name: pre-1.30
-    /// kubelets drop it, 1.30+ inject it. Refuse rather than behave
-    /// differently depending on the cluster.
+    /// `foo.bar` reaches the container but cannot be read from a shell, so an
+    /// agent would see a variable it cannot use. Refuse rather than ship a
+    /// value that silently does nothing.
     #[test]
     fn refuses_non_posix_env_keys() {
         for bad in ["foo.bar", "foo-bar", "1LEADING", "", "has space"] {
@@ -637,6 +671,7 @@ mod tests {
                 generation: "g",
                 inactivity_seconds: None,
             },
+            TEST_DIAGNOSTICS,
         )
         .unwrap();
         assert!(!env.contains_key("BUZZ_ACP_EXIT_AFTER_INACTIVITY"));

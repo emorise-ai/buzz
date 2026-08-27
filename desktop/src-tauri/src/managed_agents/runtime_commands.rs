@@ -3,13 +3,13 @@ use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::{
-    agent_readiness, append_log_marker, current_instance_id, find_managed_agent_mut,
-    load_global_agent_config, load_managed_agents, load_personas, managed_agent_runtime_log_path,
-    process_is_running, record_agent_command, resolve_effective_agent_env, save_managed_agents,
-    spawn_agent_child, terminate_process, terminate_untracked_pair_runtime,
-    write_agent_runtime_receipt, AgentReadiness, BackendKind, ManagedAgentPairRuntime,
-    ManagedAgentRuntimeKey, ManagedAgentRuntimeLifecycle, ManagedAgentRuntimeReceipt,
-    ManagedAgentRuntimeStatus,
+    agent_readiness, append_log_marker, current_instance_id, decide_sandbox_liveness,
+    find_managed_agent_mut, load_global_agent_config, load_managed_agents, load_personas,
+    managed_agent_runtime_log_path, process_is_running, record_agent_command,
+    resolve_effective_agent_env, save_managed_agents, spawn_agent_child, terminate_process,
+    terminate_untracked_pair_runtime, write_agent_runtime_receipt, AgentReadiness, BackendKind,
+    ManagedAgentPairRuntime, ManagedAgentRuntimeKey, ManagedAgentRuntimeLifecycle,
+    ManagedAgentRuntimeReceipt, ManagedAgentRuntimeStatus, SandboxLivenessOutcome,
 };
 use crate::app_state::AppState;
 
@@ -224,29 +224,86 @@ pub async fn list_managed_agent_runtimes(
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
 }
 
-pub(crate) fn start_managed_agent_runtime_pair_lazy(
+pub(crate) async fn start_managed_agent_runtime_pair_lazy(
     pubkey: String,
     relay_url: String,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
-    start_pair(pubkey, relay_url, true, None, app)
+    start_pair(pubkey, relay_url, true, None, app).await
 }
 
 #[tauri::command]
-pub fn start_managed_agent_runtime(
+pub async fn start_managed_agent_runtime(
     pubkey: String,
     relay_url: String,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
-    start_managed_agent_runtime_pair_lazy(pubkey, relay_url, app)
+    start_managed_agent_runtime_pair_lazy(pubkey, relay_url, app).await
 }
 
-fn start_pair(
+/// Reconnect-on-restart: read whatever `sandbox_id` is on disk for `pubkey`
+/// right now (unlocked — this is a best-effort snapshot, not the record
+/// `start_pair` will actually mutate) and probe the broker for it.
+///
+/// Split out and run BEFORE `start_pair` takes `managed_agents_store_lock` so
+/// the broker round-trip never happens while holding a `std::sync::Mutex`
+/// guard across an `.await` (that would make the command future `!Send`).
+/// `start_pair` re-reads the record under the lock and only applies this
+/// decision if the id it finds there still matches what was probed here —
+/// otherwise something else (e.g. a fresh "Start computer" attach) changed
+/// it in between, and this stale decision must not clobber that.
+async fn probe_stored_sandbox_liveness(
+    pubkey: &str,
+    app: &AppHandle,
+) -> Option<(String, SandboxLivenessOutcome)> {
+    let sandbox_id = load_managed_agents(app)
+        .ok()?
+        .into_iter()
+        .find(|r| r.pubkey.eq_ignore_ascii_case(pubkey))
+        .and_then(|r| r.sandbox_id)?;
+    let state = app.state::<AppState>();
+    let probe = crate::sandbox_viewer::sandbox_is_alive(&sandbox_id, &state).await;
+    let outcome = decide_sandbox_liveness(Some(&sandbox_id), Some(probe));
+    Some((sandbox_id, outcome))
+}
+
+/// Async front of the start flow: run the reconnect-on-restart liveness
+/// probe (a broker HTTP round-trip), then hand off to the synchronous
+/// lock-and-spawn tail. Kept as a thin wrapper so `reconcile_managed_agent_runtimes`
+/// can run the probe phase concurrently across many agents (via
+/// `buffer_unordered`, same as its existing relay-access probes) and only
+/// isolate the actual blocking spawn work per agent — see that function's
+/// call site for why the two phases can't share one `spawn_blocking`.
+async fn start_pair(
     pubkey: String,
     relay_url: String,
     lazy: bool,
     expected_updated_at: Option<&str>,
     app: AppHandle,
+) -> Result<ManagedAgentRuntimeStatus, String> {
+    let liveness = probe_stored_sandbox_liveness(&pubkey, &app).await;
+    start_pair_sync(pubkey, relay_url, lazy, expected_updated_at, liveness, &app)
+}
+
+/// Synchronous lock-and-spawn tail of the start flow (std mutexes, process
+/// spawn, receipt writes, up-to-2s exit polling in
+/// `terminate_untracked_pair_runtime`) — never holds a lock across an
+/// `.await`, so it can run either inline (called from the async `start_pair`)
+/// or inside `spawn_blocking` (called from `reconcile_managed_agent_runtimes`,
+/// which has already resolved `liveness` for every job up front).
+///
+/// `liveness` is `Some((probed_sandbox_id, outcome))` when a `sandbox_id` was
+/// on record and got probed before this call; applied only if the record's
+/// `sandbox_id` still matches `probed_sandbox_id` under the lock — otherwise
+/// something else (e.g. a fresh "Start computer" attach) changed it in
+/// between, and this stale decision must not clobber that.
+fn start_pair_sync(
+    pubkey: String,
+    relay_url: String,
+    lazy: bool,
+    expected_updated_at: Option<&str>,
+    liveness: Option<(String, SandboxLivenessOutcome)>,
+    app: &AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
     let state = app.state::<AppState>();
     let _transition = state
@@ -260,13 +317,31 @@ fn start_pair(
         .managed_agents_store_lock
         .lock()
         .map_err(|e| e.to_string())?;
-    let mut records = load_managed_agents(&app)?;
+    let mut records = load_managed_agents(app)?;
     let record = find_managed_agent_mut(&mut records, &pubkey)?;
     if record.backend != BackendKind::Local {
         return Err("managed runtime pairs require a local agent".into());
     }
     if expected_updated_at.is_some_and(|expected| record.updated_at != expected) {
         return Err("managed agent changed while runtime reconciliation was in flight".into());
+    }
+    if let Some((probed_id, outcome)) = &liveness {
+        if record.sandbox_id.as_deref() == Some(probed_id.as_str()) {
+            match outcome {
+                SandboxLivenessOutcome::Gone => {
+                    eprintln!(
+                        "buzz-desktop: agent {pubkey}'s sandbox {probed_id} is gone (404) — clearing before spawn"
+                    );
+                    record.sandbox_id = None;
+                }
+                SandboxLivenessOutcome::Unknown { reason } => {
+                    eprintln!(
+                        "buzz-desktop: could not confirm liveness of agent {pubkey}'s sandbox {probed_id} ({reason}) — keeping it and proceeding"
+                    );
+                }
+                SandboxLivenessOutcome::Alive | SandboxLivenessOutcome::Unattached => {}
+            }
+        }
     }
     let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
     let mut runtimes = state
@@ -277,26 +352,26 @@ fn start_pair(
         .get_mut(&key)
         .is_some_and(|runtime| runtime.child.try_wait().ok().flatten().is_none())
     {
-        let status = status_for(&app, record, &key, runtimes.get(&key), None);
+        let status = status_for(app, record, &key, runtimes.get(&key), None);
         return Ok(status);
     }
     runtimes.remove(&key);
-    terminate_untracked_pair_runtime(&app, &key)?;
+    terminate_untracked_pair_runtime(app, &key)?;
 
     let owner = state
         .keys
         .lock()
         .ok()
         .map(|keys| keys.public_key().to_hex());
-    let mut process = spawn_agent_child(&app, record, &key.relay_url, lazy, owner.as_deref())?;
+    let mut process = spawn_agent_child(app, record, &key.relay_url, lazy, owner.as_deref())?;
     let now = crate::util::now_iso();
     let receipt = ManagedAgentRuntimeReceipt {
         key: key.clone(),
         pid: process.child.id(),
-        desktop_instance_id: current_instance_id(&app),
+        desktop_instance_id: current_instance_id(app),
         started_at: now.clone(),
     };
-    if let Err(error) = write_agent_runtime_receipt(&app, &receipt) {
+    if let Err(error) = write_agent_runtime_receipt(app, &receipt) {
         let _ = terminate_process(process.child.id());
         let _ = process.child.wait();
         return Err(error);
@@ -307,10 +382,10 @@ fn start_pair(
     record.last_stopped_at = None;
     record.last_error = None;
     runtimes.insert(key.clone(), ManagedAgentPairRuntime::starting(process));
-    let status = status_for(&app, record, &key, runtimes.get(&key), None);
+    let status = status_for(app, record, &key, runtimes.get(&key), None);
     drop(runtimes);
-    save_managed_agents(&app, &records)?;
-    emit_status(&app, &status);
+    save_managed_agents(app, &records)?;
+    emit_status(app, &status);
     Ok(status)
 }
 
@@ -382,13 +457,13 @@ pub fn stop_managed_agent_runtime(
 }
 
 #[tauri::command]
-pub fn restart_managed_agent_runtime(
+pub async fn restart_managed_agent_runtime(
     pubkey: String,
     relay_url: String,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
     stop_managed_agent_runtime(pubkey.clone(), relay_url.clone(), app.clone())?;
-    start_pair(pubkey, relay_url, true, None, app)
+    start_pair(pubkey, relay_url, true, None, app).await
 }
 
 /// Probe whether this agent can operate on `requested_relay_url`.
@@ -496,7 +571,19 @@ pub async fn reconcile_managed_agent_runtimes(
         .collect()
         .await;
 
-    // start_pair does blocking work (std mutexes, process spawn, receipt
+    // Reconnect-on-restart liveness, resolved for every job up front —
+    // same reason as `probe_agent_relay_access`: this is a broker HTTP
+    // round-trip, so it must finish before the blocking spawn phase, not
+    // inside it (a `spawn_blocking` closure is synchronous and cannot await).
+    let mut liveness_by_pubkey = std::collections::HashMap::new();
+    for (record, ..) in probes.iter().flatten() {
+        liveness_by_pubkey.insert(
+            record.pubkey.clone(),
+            probe_stored_sandbox_liveness(&record.pubkey, &app).await,
+        );
+    }
+
+    // start_pair_sync does blocking work (std mutexes, process spawn, receipt
     // writes, and up-to-2s exit polling in terminate_untracked_pair_runtime),
     // so run the post-probe start loop off the async workers, matching the
     // restart flows.
@@ -507,12 +594,14 @@ pub async fn reconcile_managed_agent_runtimes(
         for probe in probes {
             match probe {
                 Ok((record, key, requested)) => {
-                    match start_pair(
+                    let liveness = liveness_by_pubkey.get(&record.pubkey).cloned().flatten();
+                    match start_pair_sync(
                         record.pubkey.clone(),
                         key.relay_url.clone(),
                         true,
                         Some(&record.updated_at),
-                        app.clone(),
+                        liveness,
+                        &app,
                     ) {
                         Ok(mut status) => {
                             status.requested_relay_url = Some(requested);

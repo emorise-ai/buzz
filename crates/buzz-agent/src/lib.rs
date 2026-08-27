@@ -8,6 +8,7 @@ mod handoff;
 mod hints;
 mod llm;
 mod mcp;
+mod mcp_http;
 pub mod model_capabilities;
 mod permission;
 pub mod types;
@@ -359,7 +360,7 @@ async fn initialize(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSend
                 "agentCapabilities": {
                     "loadSession": false,
                     "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false },
-                    "mcpCapabilities": { "http": false, "sse": false },
+                    "mcpCapabilities": { "http": true, "sse": false },
                 },
                 "agentInfo": { "name": "buzz-agent", "version": env!("CARGO_PKG_VERSION") },
             }),

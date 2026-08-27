@@ -14,10 +14,8 @@ import { DropZoneOverlay } from "@/features/messages/ui/ComposerAttachments";
 import { MessageThreadPanel } from "@/features/messages/ui/MessageThreadPanel";
 import { MessageThreadPanelSkeleton } from "@/features/messages/ui/MessageThreadPanelSkeleton";
 import { ThreadRepliesErrorCard } from "@/features/messages/ui/MessageThreadReplyState";
-import {
-  MessageTimeline,
-  type MessageTimelineHandle,
-} from "@/features/messages/ui/MessageTimeline";
+import { MessageTimeline } from "@/features/messages/ui/MessageTimeline";
+import type { MessageTimelineHandle } from "@/features/messages/ui/MessageTimeline";
 import { buildDirectMessageIntro } from "@/features/channels/lib/dmParticipantDisplay";
 import {
   getDmHuddleMemberPubkeys,
@@ -27,6 +25,7 @@ import { buildVideoReviewPresentationByMessageId } from "@/features/messages/lib
 import { useComposerHeightPadding } from "@/features/messages/ui/useComposerHeightPadding";
 import { UserProfilePanel } from "@/features/profile/ui/UserProfilePanel";
 import { AgentSessionThreadPanel } from "@/features/channels/ui/AgentSessionThreadPanel";
+import { useChannelComputerPanel } from "@/features/agents/sandbox/useChannelComputerPanel";
 import { ChannelManagementAuxiliaryPanel } from "@/features/channels/ui/ChannelManagementAuxiliaryPanel";
 import { IdleAuxiliaryPanel } from "@/features/channels/ui/IdleAuxiliaryPanel";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
@@ -51,6 +50,8 @@ import {
 } from "@/features/channels/ui/WelcomeComposerBanner";
 import { useWelcomeComposerBanner } from "@/features/channels/ui/useWelcomeComposerBanner";
 import {
+  HUDDLE_TRANSCRIPT_ROOT_STYLE,
+  isWelcomeChannel,
   mentionsKnownAgent,
   shouldPrioritizeIdleAuxiliary,
   shouldUseFocusIdleDrawer,
@@ -66,14 +67,9 @@ import { useChannelPaneMessages } from "@/features/channels/ui/useChannelPaneMes
 import { useRoutedMessageEdit } from "@/features/channels/ui/useRoutedMessageEdit";
 import { Button } from "@/shared/ui/button";
 import { useRenderScopedReactionHydration } from "@/features/messages/lib/useRenderScopedReactionHydration";
-import { isWelcomeExperienceChannel as isWelcomeExperience } from "@/features/onboarding/welcome";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import { channelChrome } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
-const HUDDLE_TRANSCRIPT_ROOT_STYLE = {
-  "--buzz-channel-content-top-padding": "0rem",
-  "--channel-top-chrome-height": "0.25rem",
-} as React.CSSProperties;
 export const ChannelPane = React.memo(function ChannelPane({
   activeChannel,
   agentPubkeys,
@@ -196,8 +192,7 @@ export const ChannelPane = React.memo(function ChannelPane({
     targetSearchMessageId,
     targetSearchQuery,
   );
-  const [isMainDeferredEditPending, setMainDeferredEditPending] =
-    React.useState(false);
+  const [mainEditPending, setMainEditPending] = React.useState(false);
   const isNonMemberView =
     activeChannel !== null &&
     !activeChannel.isMember &&
@@ -227,8 +222,7 @@ export const ChannelPane = React.memo(function ChannelPane({
   );
   const huddleMemberPubkeysPending =
     agentPubkeysPending && hasOtherDmParticipant(activeChannel, currentPubkey);
-  const isActiveWelcomeChannel =
-    activeChannel !== null && isWelcomeExperience(activeChannel);
+  const welcomeChannel = isWelcomeChannel(activeChannel);
   useComposerHeightPadding(
     timelineScrollRef,
     composerWrapperRef,
@@ -242,7 +236,7 @@ export const ChannelPane = React.memo(function ChannelPane({
     dismissBanner: handleDismissWelcomeBanner,
   } = useWelcomeComposerBanner(
     activeChannelId,
-    isActiveWelcomeChannel,
+    welcomeChannel,
     currentPubkey ?? null,
   );
   const isEditInThread = editTarget?.isThreadReply === true;
@@ -288,7 +282,7 @@ export const ChannelPane = React.memo(function ChannelPane({
       forceRest?: boolean,
     ) => {
       const shouldCompleteWelcomeBanner =
-        isActiveWelcomeChannel &&
+        welcomeChannel &&
         (containsWelcomePersonaMention(content) ||
           mentionsKnownAgent(mentionPubkeys, knownAgentPubkeys));
       messageTimelineRef.current?.scrollToBottomOnNextUpdate();
@@ -316,7 +310,7 @@ export const ChannelPane = React.memo(function ChannelPane({
       activeChannelId,
       completeWelcomeComposerBanner,
       goChannel,
-      isActiveWelcomeChannel,
+      welcomeChannel,
       knownAgentPubkeys,
       onSendMessage,
     ],
@@ -324,7 +318,7 @@ export const ChannelPane = React.memo(function ChannelPane({
   const canDropInMainColumn =
     hasMainComposerOverlay &&
     !isComposerDisabled &&
-    !isMainDeferredEditPending &&
+    !mainEditPending &&
     !isSinglePanelView;
   const hasTypingActivity = typingPubkeys.length > 0;
   const composerWorkingBotPubkeys = useChannelWorkingAgentPubkeys(
@@ -437,6 +431,11 @@ export const ChannelPane = React.memo(function ChannelPane({
       }),
     [agentSessionAgents, openAgentSessionPubkey, profilePanelPubkey, profiles],
   );
+  const computerPanel = useChannelComputerPanel(activeChannel, currentPubkey, {
+    isSinglePanelView,
+    split: useSplitAuxiliaryPane,
+    widthPx: threadPanelWidthPx,
+  });
   const hasIdleAuxiliary =
     Boolean(idleAuxiliaryPanel) && Boolean(onCloseIdleAuxiliaryPanel);
   const priorityIdleAuxiliary = shouldPrioritizeIdleAuxiliary(
@@ -501,7 +500,8 @@ export const ChannelPane = React.memo(function ChannelPane({
       Boolean(threadHeadMessage) ||
       shouldShowThreadSkeleton ||
       Boolean(activeChannel && selectedAgent) ||
-      Boolean(profilePanelPubkey));
+      Boolean(profilePanelPubkey) ||
+      computerPanel.open);
   const wrapAux = (
     panel: React.ReactNode,
     testId: string,
@@ -737,7 +737,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                     hasComposerBottomActivity && "composer-dock--with-activity",
                   )}
                 >
-                  {isActiveWelcomeChannel && !timeoutState.active ? (
+                  {welcomeChannel && !timeoutState.active ? (
                     <WelcomeComposerGuidanceLayer
                       onDismiss={handleDismissWelcomeBanner}
                       settingUp={welcomeKickoffSettingUp}
@@ -765,7 +765,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                     onAutoSubmitComplete={handleAutoSubmitComplete}
                     isSending={isSending}
                     mediaController={mainComposerMedia}
-                    onDeferredEditPendingChange={setMainDeferredEditPending}
+                    onDeferredEditPendingChange={setMainEditPending}
                     onCancelEdit={onCancelEdit}
                     onEditLastOwnMessage={handleEditLastOwnMainMessage}
                     onEditSave={onEditSave}
@@ -795,8 +795,6 @@ export const ChannelPane = React.memo(function ChannelPane({
                     }
                     showTopBorder={false}
                   />
-                  {/* The reserved bottom rail keeps accessory fades from moving
-                    the conversation while content remains responsive. */}
                   <ChannelComposerActivityAccessory
                     agents={activityAgents}
                     channel={activeChannel}
@@ -817,7 +815,6 @@ export const ChannelPane = React.memo(function ChannelPane({
           </div>
         </section>
       ) : null}
-      {/* Serialize replacements so focus drawers keep one travel direction. */}
       <AnimatePresence mode="wait" onExitComplete={markExitComplete}>
         {channelManagementOpen && activeChannel ? (
           <ChannelManagementAuxiliaryPanel
@@ -987,6 +984,8 @@ export const ChannelPane = React.memo(function ChannelPane({
             );
             return wrapAux(panel, "user-profile-panel");
           })()
+        ) : computerPanel.surface ? (
+          wrapAux(computerPanel.surface, "computer-preview-panel")
         ) : (
           idleAuxiliarySurface
         )}

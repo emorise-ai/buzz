@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Source for sprig-desktop-wallpaper.png (1920x1080). Same navy-teal glow
+  formula as sprig-desktop-start.html's body background (radial-gradient at
+  86% 12%, rgba(34,122,138,0.35) -> transparent 55%, over #0b1421) so the
+  wallpaper and the browser start page read as one system, plus a large,
+  very-low-opacity Buzz bee-mark watermark placed in the lower-left corner
+  — the one screen region that stays visible outside every window
+  (Chromium/Thunar/terminal are all positioned in the upper-2/3 / center of
+  the 1920x1080 screen; see sprig-desktop-supervise.sh and
+  sprig-desktop-openbox-rc.xml). A centered mark would sit almost entirely
+  behind Chromium and defeat the point. Mark geometry copied verbatim from
+  desktop/src/shared/ui/buzz-logo/BuzzMark.tsx's viewBox (466x309), scaled
+  down and placed here.
+
+  Rasterize with: rsvg-convert -w 1920 -h 1080 sprig-desktop-wallpaper.svg
+    -o sprig-desktop-wallpaper.png
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <defs>
+    <radialGradient id="glow" cx="86%" cy="12%" r="65%">
+      <stop offset="0%" stop-color="#227a8a" stop-opacity="0.35"/>
+      <stop offset="55%" stop-color="#227a8a" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#227a8a" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Base fill + glow, identical formula to the start page. -->
+  <rect x="0" y="0" width="1920" height="1080" fill="#0b1421"/>
+  <rect x="0" y="0" width="1920" height="1080" fill="url(#glow)"/>
+
+  <!-- Bee mark watermark: bottom-left corner, where wallpaper stays
+       visible outside every window. Native mark is 466x309; scaled ~0.75x
+       to 350x232, anchored with generous margin from the corner. Built
+       with plain shape fills (no mask) — a mask combined with a group
+       opacity produced visible concentric ring artifacts in rsvg-convert
+       on the eye/mouth cutout edges, so eyes and mouth are instead drawn
+       as background-colored shapes layered on top, which composites
+       cleanly at any opacity. -->
+  <g transform="translate(-40, 760) scale(0.75)" opacity="0.035">
+    <circle cx="91.7" cy="154.5" r="91.7" fill="#3fb2c4"/>
+    <circle cx="374.3" cy="154.5" r="91.7" fill="#3fb2c4"/>
+    <rect x="128" y="0" width="210" height="309" rx="34" fill="#3fb2c4"/>
+    <ellipse cx="193.3" cy="84.4" rx="27" ry="27" fill="#0b1421"/>
+    <ellipse cx="276" cy="84.4" rx="27" ry="27" fill="#0b1421"/>
+    <rect x="166.3" y="157.2" width="136.9" height="38.3" rx="5" fill="#0b1421"/>
+    <rect x="166.9" y="235.1" width="136.2" height="37.6" rx="5" fill="#0b1421"/>
+  </g>
+</svg>

@@ -1,11 +1,13 @@
 import * as React from "react";
 
+import { useManagedAgentsQuery } from "@/features/agents/hooks";
 import { usePresenceQuery } from "@/features/presence/hooks";
 import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { resolveChannelDisplayLabel } from "@/features/sidebar/lib/channelLabels";
 import type { SidebarDmParticipant } from "@/features/sidebar/ui/SidebarSection";
 import type { Channel, PresenceStatus } from "@/shared/api/types";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export function useDmSidebarMetadata({
   currentPubkey,
@@ -51,6 +53,17 @@ export function useDmSidebarMetadata({
   const dmProfilesQuery = useUsersBatchQuery(dmParticipantPubkeys, {
     enabled: enabled && directMessages.length > 0,
   });
+  const managedAgentsQuery = useManagedAgentsQuery();
+  const managedAgentJobTitles = React.useMemo(
+    () =>
+      new Map(
+        (managedAgentsQuery.data ?? []).map((agent) => [
+          normalizePubkey(agent.pubkey),
+          agent.jobTitle?.trim() || null,
+        ]),
+      ),
+    [managedAgentsQuery.data],
+  );
   const dmProfiles = dmProfilesQuery.data?.profiles;
   const dmPresenceByChannelId = React.useMemo(
     () =>
@@ -130,12 +143,22 @@ export function useDmSidebarMetadata({
                 profiles: dmProfiles,
                 pubkey: participant.pubkey,
               }),
+              jobTitle:
+                managedAgentJobTitles.get(
+                  normalizePubkey(participant.pubkey),
+                ) ?? null,
               pubkey: participant.pubkey,
             })),
           ];
         }),
       ) satisfies Record<string, SidebarDmParticipant[]>,
-    [currentPubkey, directMessages, dmProfiles, selfDmLabels],
+    [
+      currentPubkey,
+      directMessages,
+      dmProfiles,
+      managedAgentJobTitles,
+      selfDmLabels,
+    ],
   );
 
   return {

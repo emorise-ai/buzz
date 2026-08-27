@@ -241,13 +241,15 @@ export function ChannelScreen({
     );
     return () => setContextParentResolver(null);
   }, [activeChannelId, setContextParentResolver]);
+  const managedAgentsQuery = useManagedAgentsQuery();
+  const managedAgents = managedAgentsQuery.data ?? [];
   const {
     activeChannelTitle,
     activeDmAvatarUrl,
     activeDmHeaderParticipants,
     activeDmPresenceStatus,
     activeChannelEphemeralDisplay,
-  } = useActiveChannelHeader(activeChannel, currentPubkey);
+  } = useActiveChannelHeader(activeChannel, currentPubkey, managedAgents);
   const sendMessageMutation = useSendMessageMutation(
     activeChannel,
     currentIdentity,
@@ -309,8 +311,6 @@ export function ChannelScreen({
   );
   const channelMembersQuery = useChannelMembersQuery(activeChannel?.id ?? null);
   const channelMembers = channelMembersQuery.data;
-  const managedAgentsQuery = useManagedAgentsQuery();
-  const managedAgents = managedAgentsQuery.data ?? [];
   const welcomeGuideAgent = React.useMemo(
     () => pickWelcomeGuideAgent(managedAgents),
     [managedAgents],

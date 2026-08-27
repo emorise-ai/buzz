@@ -9,7 +9,10 @@ type AgentIdentityCardProps = {
   ariaLabel: string;
   avatar?: ReactNode;
   avatarUrl?: string | null;
+  /** Optional badge pinned to the top-left corner (e.g. a "has a computer" glyph). */
+  cornerBadge?: ReactNode;
   dataTestId: string;
+  jobTitle?: string | null;
   label: string;
   modelLabel?: string | null;
   onClick: () => void;
@@ -22,13 +25,16 @@ export function AgentIdentityCard({
   ariaLabel,
   avatar,
   avatarUrl,
+  cornerBadge,
   dataTestId,
+  jobTitle,
   label,
   modelLabel,
   onClick,
   statusBadge,
 }: AgentIdentityCardProps) {
   const trimmedAvatarUrl = avatarUrl?.trim() || null;
+  const trimmedJobTitle = jobTitle?.trim() || null;
 
   return (
     <div
@@ -64,6 +70,12 @@ export function AgentIdentityCard({
         </div>
       </div>
 
+      {cornerBadge ? (
+        <div className="pointer-events-auto absolute top-3 left-3 z-40">
+          {cornerBadge}
+        </div>
+      ) : null}
+
       {actions ? (
         <div className="absolute top-3 right-3 z-40">{actions}</div>
       ) : null}
@@ -72,7 +84,14 @@ export function AgentIdentityCard({
         <span className="min-w-0 truncate font-semibold text-foreground tracking-normal">
           {label}
         </span>
-        {modelLabel ? (
+        {trimmedJobTitle ? (
+          <span
+            className="min-w-0 truncate text-xs font-normal text-secondary-foreground/75"
+            data-testid={`${dataTestId}-job-title`}
+          >
+            {trimmedJobTitle}
+          </span>
+        ) : modelLabel ? (
           <span className="min-w-0 truncate text-xs font-normal text-secondary-foreground/75">
             {modelLabel}
           </span>

@@ -8,12 +8,12 @@ use crate::{
     managed_agents::{
         build_managed_agent_summary, current_instance_id, ensure_persona_is_active,
         find_managed_agent_mut, load_managed_agents, load_personas, load_teams,
-        managed_agent_avatar_url, normalize_agent_args, resolve_provider_binary,
-        save_managed_agents, start_managed_agent_process, stop_managed_agent_process,
-        stop_managed_agent_workspace_pair, sync_managed_agent_processes, try_regenerate_nest,
-        validate_provider_config, BackendKind, CreateManagedAgentRequest,
-        CreateManagedAgentResponse, ManagedAgentRecord, ManagedAgentSummary, RelayMeshConfig,
-        DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
+        normalize_agent_args, resolve_provider_binary, save_managed_agents,
+        start_managed_agent_process, stop_managed_agent_process, stop_managed_agent_workspace_pair,
+        sync_managed_agent_processes, try_regenerate_nest, validate_provider_config, BackendKind,
+        CreateManagedAgentRequest, CreateManagedAgentResponse, ManagedAgentRecord,
+        ManagedAgentSummary, RelayMeshConfig, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM,
+        DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
     },
     relay::{relay_ws_url_with_override, sync_managed_agent_profile},
     util::now_iso,
@@ -26,8 +26,11 @@ pub(super) fn workspace_owner_hex(state: &AppState) -> Result<String, String> {
     Ok(keys.public_key().to_hex())
 }
 
+#[path = "agents_avatar.rs"]
+mod avatar;
 #[path = "agents_pending.rs"]
 mod pending;
+use avatar::{resolve_created_avatar_url, trim_to_optional_string};
 #[cfg(test)]
 use pending::build_agent_archive_request;
 pub(crate) use pending::{
@@ -75,30 +78,6 @@ fn normalize_relay_mesh(
     Ok(Some(RelayMeshConfig {
         model_ref: model_ref.to_string(),
     }))
-}
-
-fn trim_to_optional_string(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-fn resolve_created_avatar_url(
-    requested_avatar_url: Option<&str>,
-    persona_avatar_url: Option<String>,
-    agent_command: &str,
-) -> Option<String> {
-    requested_avatar_url
-        .and_then(trim_to_optional_string)
-        .or_else(|| {
-            persona_avatar_url
-                .as_deref()
-                .and_then(trim_to_optional_string)
-        })
-        .or_else(|| managed_agent_avatar_url(agent_command))
 }
 
 #[cfg(feature = "mesh-llm")]
@@ -169,13 +148,11 @@ pub(super) async fn start_local_agent_pairs_with_preflight(
         }
     }
 
+    use crate::managed_agents::start_managed_agent_runtime_pair_lazy as start_pair_lazy;
     let mut errors = Vec::new();
     for relay_url in relay_urls {
-        if let Err(error) = crate::managed_agents::start_managed_agent_runtime_pair_lazy(
-            pubkey.to_string(),
-            relay_url.clone(),
-            app.clone(),
-        ) {
+        let start = start_pair_lazy(pubkey.to_string(), relay_url.clone(), app.clone());
+        if let Err(error) = start.await {
             errors.push(format!("{relay_url}: {error}"));
         }
     }
@@ -639,14 +616,17 @@ pub async fn create_managed_agent(
             input.parallelism,
             linked_persona.as_ref(),
         )?;
-
         let record = ManagedAgentRecord {
             pubkey: pubkey.clone(),
             name: name.clone(),
             persona_id: requested_persona_id.clone(),
+            job_title: linked_persona
+                .as_ref()
+                .and_then(|persona| persona.job_title.clone()),
             team_id,
             private_key_nsec: private_key_nsec.clone(),
             auth_tag: auth_tag.clone(),
+            sandbox_id: None,
             relay_url: resolved_relay_url.clone(),
             avatar_url: resolved_avatar_url.clone(),
             acp_command: input

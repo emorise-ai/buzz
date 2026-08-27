@@ -218,12 +218,18 @@ function invalidateManagedAgentQueriesInBackground(
  * probe pipeline.
  */
 export function useAcpRuntimesQuery(options?: { enabled?: boolean }) {
-  return useQuery({
+  const queryClient = useQueryClient();
+  const query = useQuery({
     enabled: options?.enabled ?? true,
     queryKey: acpRuntimesQueryKey,
     queryFn: () => discoverAcpRuntimes(),
     staleTime: 30 * 60_000,
   });
+  const forceRefresh = React.useCallback(
+    () => refreshAcpRuntimes(queryClient),
+    [queryClient],
+  );
+  return { ...query, forceRefresh };
 }
 
 export function useAvailableAcpRuntimes(options?: { enabled?: boolean }) {

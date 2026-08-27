@@ -8,8 +8,9 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         apply_persona_behavior, effective_agent_command, load_managed_agents, load_personas,
-        managed_agent_avatar_url, save_managed_agents, save_personas, try_regenerate_nest,
-        validate_agent_definition_text, AgentDefinition, ManagedAgentRecord, UpdatePersonaRequest,
+        managed_agent_avatar_url, normalize_optional_job_title, save_managed_agents, save_personas,
+        try_regenerate_nest, validate_agent_definition_text, validate_optional_job_title,
+        AgentDefinition, ManagedAgentRecord, UpdatePersonaRequest,
     },
     util::now_iso,
 };
@@ -93,6 +94,11 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
             let system_prompt = input.system_prompt.clone();
             validate_agent_definition_text(&display_name, &system_prompt)?;
             let avatar_url = trim_optional(input.avatar_url);
+            let job_title_present = input.job_title.is_some();
+            let job_title = input.job_title.and_then(normalize_optional_job_title);
+            if let Some(job_title) = job_title.as_deref() {
+                validate_optional_job_title(Some(job_title))?;
+            }
             let runtime = trim_optional(input.runtime);
             let model = trim_optional(input.model);
             let provider = trim_optional(input.provider);
@@ -114,6 +120,9 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
             let old_display_name = persona.display_name.clone();
 
             persona.display_name = display_name;
+            if job_title_present {
+                persona.job_title = job_title;
+            }
             persona.avatar_url = avatar_url;
             persona.system_prompt = system_prompt;
             persona.runtime = runtime;

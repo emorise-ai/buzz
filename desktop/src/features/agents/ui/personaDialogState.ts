@@ -62,6 +62,7 @@ export function duplicatePersonaDialogState(
     submitLabel: "Create agent",
     initialValues: {
       displayName: `${persona.displayName} copy`,
+      ...jobTitleEntry(persona),
       avatarUrl: persona.avatarUrl ?? "",
       systemPrompt: persona.systemPrompt,
       runtime: persona.runtime ?? undefined,
@@ -77,6 +78,12 @@ export function duplicatePersonaDialogState(
       ...behaviorEntry(persona),
     },
   };
+}
+
+function jobTitleEntry(
+  persona: AgentPersona,
+): { jobTitle: string } | Record<string, never> {
+  return persona.jobTitle?.trim() ? { jobTitle: persona.jobTitle } : {};
 }
 
 /**
@@ -120,6 +127,7 @@ export function editPersonaDialogState(
     initialValues: {
       id: persona.id,
       displayName: persona.displayName,
+      ...jobTitleEntry(persona),
       avatarUrl: persona.avatarUrl ?? "",
       systemPrompt: persona.systemPrompt,
       runtime: persona.runtime ?? undefined,

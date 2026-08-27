@@ -20,7 +20,9 @@ pub(in crate::managed_agents) use path::build_augmented_path;
 pub(crate) use path::{compose_path_entries, should_skip_claude_executable, should_use_inherited};
 
 pub(crate) use super::access_policy::{build_respond_to_env_with_policy, RespondToEnv};
-
+mod job_title;
+mod logging;
+use logging::child_rust_log_filter;
 mod metadata;
 pub(crate) use metadata::{
     apply_agent_display_env, resolve_session_title, runtime_metadata_env_vars,
@@ -30,10 +32,8 @@ pub(crate) use metadata::{
 mod stop;
 pub(crate) use stop::managed_agent_runtime_keys;
 pub use stop::{stop_managed_agent_process, stop_managed_agent_workspace_pair};
-
 mod sweep;
 pub(crate) use sweep::sweep_untracked_bundle_harnesses;
-
 mod process;
 #[cfg(test)]
 use process::{
@@ -49,8 +49,7 @@ mod orphan_sweep;
 #[cfg(target_os = "macos")]
 use orphan_sweep::proc_pidinfo;
 pub(crate) use orphan_sweep::{
-    sweep_orphaned_agent_processes, sweep_system_agent_processes,
-    sweep_system_agent_processes_with_grace,
+    spawn_periodic_orphan_sweep, sweep_orphaned_agent_processes, sweep_system_agent_processes,
 };
 #[cfg(target_os = "macos")]
 use orphan_sweep::{BSDInfo, PROC_PIDTBSDINFO};
@@ -71,6 +70,7 @@ pub use lifecycle::{kill_stale_tracked_processes, sync_managed_agent_processes};
 mod spawn_key; // production spawn-key derivation + its regressions
 pub(crate) use spawn_key::bound_runtime_key;
 
+pub(in crate::managed_agents) mod sandbox_env;
 /// Classify an agent's persona against the live catalog for the Agents-menu
 /// drift indicator. Returns `(out_of_date, orphaned)`.
 ///
@@ -297,11 +297,13 @@ pub fn build_managed_agent_summary(
         .and_then(|r| r.mcp_command)
         .unwrap_or("")
         .to_string();
+    let job_title = job_title::resolve_job_title(record, personas);
 
     Ok(ManagedAgentSummary {
         pubkey: record.pubkey.clone(),
         name: record.name.clone(),
         persona_id: record.persona_id.clone(),
+        job_title,
         runtime: record.runtime.clone(),
         team_id: record.team_id.clone(),
         relay_url: record.relay_url.clone(),
@@ -810,6 +812,8 @@ pub fn spawn_agent_child(
         command.env(key, value);
     }
 
+    sandbox_env::apply_sandbox_env(&mut command, app, record.sandbox_id.as_deref());
+
     // B5: carry persisted effort; harness resolves thought_level configId at first session.
     // Written AFTER descriptor.env so the canonical persisted value wins over any
     // user-supplied BUZZ_ACP_EFFORT_LEVEL entry, mirroring the A1 model-authority pattern
@@ -926,14 +930,6 @@ pub fn spawn_agent_child(
         adapter_availability: spawned_adapter_availability,
         start_nonce,
     })
-}
-
-fn child_rust_log_filter() -> String {
-    match std::env::var("RUST_LOG") {
-        Ok(existing) if existing.contains("buzz_acp") => existing,
-        Ok(existing) if !existing.trim().is_empty() => format!("{existing},buzz_acp=info"),
-        _ => "buzz_acp=info".to_string(),
-    }
 }
 
 /// Spawn (or adopt) the runtime pair for `record` on the caller's bound

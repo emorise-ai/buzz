@@ -45,8 +45,10 @@ fn record() -> ManagedAgentRecord {
         pubkey: "p".repeat(64),
         name: "agent".into(),
         persona_id: None,
+        job_title: None,
         private_key_nsec: "nsec1fake".into(),
         auth_tag: None,
+        sandbox_id: None,
         relay_url: "ws://localhost:3000".into(),
         avatar_url: None,
         acp_command: "buzz-acp".into(),
@@ -104,6 +106,7 @@ fn persona(id: &str, runtime: Option<&str>, prompt: &str) -> AgentDefinition {
     AgentDefinition {
         id: id.into(),
         display_name: id.into(),
+        job_title: None,
         avatar_url: None,
         system_prompt: prompt.into(),
         runtime: runtime.map(str::to_string),

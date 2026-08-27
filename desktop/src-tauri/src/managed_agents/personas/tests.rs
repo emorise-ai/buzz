@@ -10,6 +10,7 @@ fn custom_persona(id: &str, display_name: &str) -> AgentDefinition {
     AgentDefinition {
         id: id.to_string(),
         display_name: display_name.to_string(),
+        job_title: None,
         avatar_url: Some("https://example.com/avatar.png".to_string()),
         system_prompt: "Custom prompt".to_string(),
         runtime: None,
@@ -313,6 +314,7 @@ fn migrate_preserves_customized_personas() {
     let mut stored = vec![AgentDefinition {
         id: "builtin:researcher".to_string(),
         display_name: "My Researcher".to_string(),
+        job_title: None,
         system_prompt: "My custom research workflow with special instructions".to_string(),
         is_builtin: false,
         is_active: true,
@@ -347,6 +349,7 @@ fn migrate_is_idempotent() {
     let mut stored_with_retired = vec![AgentDefinition {
         id: "builtin:researcher".to_string(),
         display_name: "Researcher (retired)".to_string(),
+        job_title: None,
         system_prompt: "My custom prompt".to_string(),
         is_builtin: false,
         is_active: false,
@@ -363,6 +366,7 @@ fn migrate_is_idempotent() {
     let mut stored_pre_demotion = vec![AgentDefinition {
         id: "builtin:reviewer".to_string(),
         display_name: "Reviewer".to_string(),
+        job_title: None,
         system_prompt: "Custom review prompt".to_string(),
         is_builtin: true,
         is_active: true,

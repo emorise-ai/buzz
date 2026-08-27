@@ -3,6 +3,11 @@ target/
 **/target/
 desktop/src-tauri/target/
 
+# Hermit toolchain cache (~1GB of host-arch binaries and a Cargo registry
+# cache). The image installs its own toolchain, so this is pure build-context
+# weight — and large enough to exhaust the builder's disk while exporting.
+.hermit/
+
 # Native non-relay UI builds (not part of the public image)
 desktop/
 mobile/

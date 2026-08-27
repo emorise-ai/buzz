@@ -118,6 +118,10 @@ pub(crate) struct SpawnConfigSnapshot {
     /// rename that changes nothing.
     pub session_title: Option<String>,
     pub auth_tag: Option<String>,
+    /// Mirrors `ManagedAgentRecord.sandbox_id`. Attach/detach ("Start a
+    /// computer" / "Stop computer") changes what this stamps and must badge —
+    /// the broker URL/id env only takes effect on the next spawn.
+    pub sandbox_id: Option<String>,
     pub respond_to: String,
     /// `None` outside allowlist mode — spawn sets
     /// `BUZZ_ACP_RESPOND_TO_ALLOWLIST` only there, so edits to a dormant list
@@ -197,6 +201,7 @@ impl SpawnConfigSnapshot {
                 .then(|| resolve_session_title(record.display_name.as_deref(), &record.name))
                 .flatten(),
             auth_tag: record.auth_tag.clone(),
+            sandbox_id: record.sandbox_id.clone(),
             respond_to: respond_to.as_str().to_string(),
             respond_to_allowlist: (respond_to == super::types::RespondTo::Allowlist).then(|| {
                 // A list spawn would reject is captured raw: the stamped

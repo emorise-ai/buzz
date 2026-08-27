@@ -120,6 +120,45 @@ test.describe("doctor CTA nudge card screenshots", () => {
   });
 
   /**
+   * 00 — a credential-only request is a neutral handoff, not a runtime error.
+   * It names the key and agent once and exposes exactly one secure action.
+   */
+  test("00-secure-credential-request", async ({ page }) => {
+    await page.addInitScript(() => {
+      window.localStorage.setItem("buzz-theme", "dark");
+    });
+    await installMockBridge(page, {
+      managedAgents: [
+        {
+          pubkey: AGENT_PUBKEY,
+          name: AGENT_NAME,
+          status: "running" as const,
+          channelNames: ["general"],
+        },
+      ],
+    });
+
+    await page.goto("/", { waitUntil: "domcontentloaded" });
+    const content = makeNudgeSentinel(AGENT_NAME, AGENT_PUBKEY, [
+      { surface: "env_key", key: "ODOO_API_KEY" },
+    ]);
+    await injectNudgeAndNavigate(page, content);
+
+    const card = page.locator("[data-config-nudge]").last();
+    await expect(card).toContainText("Secure credential requested");
+    await expect(card).toContainText("Tyler Agent needs ODOO_API_KEY");
+    await expect(
+      card.getByRole("button", { name: "Add securely" }),
+    ).toHaveCount(1);
+
+    await card.scrollIntoViewIfNeeded();
+    await settleAnimations(page);
+    await card.screenshot({
+      path: `${SHOTS}/00-secure-credential-request.png`,
+    });
+  });
+
+  /**
    * 01 — pure cli_login card (all requirements are cli_login, availability=available):
    * Tooling is installed but needs login — Doctor has no auth functionality
    * and would be a misleading dead-end. The card is purely informational:
@@ -210,8 +249,8 @@ test.describe("doctor CTA nudge card screenshots", () => {
   /**
    * 03 — mixed card: one cli_login (adapter_missing) + one env_key requirement.
    * Each requirement row owns its CTA, right-aligned to a shared edge:
-   * the cli_login row opens Agent runtimes and the env_key row shows
-   * "Edit Agent →", both at the same x (vertically aligned).
+   * the cli_login row opens Agent runtimes and the env_key row opens secure
+   * credential entry, both at the same x (vertically aligned).
    */
   test("03-mixed-requirements-inline-doctor-cta", async ({ page }) => {
     await installMockBridge(page, {
@@ -244,10 +283,12 @@ test.describe("doctor CTA nudge card screenshots", () => {
 
     const card = page.locator("[data-config-nudge]").last();
     await expect(card).toBeVisible({ timeout: 10_000 });
-    // Mixed card: cli_login opens Agent runtimes; env_key opens Edit Agent.
+    // Mixed card: cli_login opens Agent runtimes; env_key opens secure entry.
     await expect(card.getByText("Open Agent runtimes →")).toBeVisible();
     // Both per-row CTAs share the same right edge (vertically aligned).
-    await expect(card.getByText("Edit Agent →", { exact: true })).toBeVisible();
+    await expect(
+      card.getByText("Add securely →", { exact: true }),
+    ).toBeVisible();
 
     await card.scrollIntoViewIfNeeded();
     await settleAnimations(page);

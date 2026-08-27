@@ -75,6 +75,8 @@ pub fn apply_persona_behavior(
 #[serde(rename_all = "camelCase")]
 pub struct CreatePersonaRequest {
     pub display_name: String,
+    #[serde(default)]
+    pub job_title: Option<String>,
     pub avatar_url: Option<String>,
     pub system_prompt: String,
     #[serde(default)]
@@ -102,6 +104,8 @@ pub struct CreatePersonaRequest {
 pub struct UpdatePersonaRequest {
     pub id: String,
     pub display_name: String,
+    #[serde(default, deserialize_with = "crate::util::double_option")]
+    pub job_title: Option<Option<String>>,
     pub avatar_url: Option<String>,
     pub system_prompt: String,
     #[serde(default)]
@@ -271,6 +275,7 @@ mod tests {
         AgentDefinition {
             id: "p-1".to_string(),
             display_name: "Test".to_string(),
+            job_title: None,
             avatar_url: None,
             system_prompt: "prompt".to_string(),
             runtime: None,

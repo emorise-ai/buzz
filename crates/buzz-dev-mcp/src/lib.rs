@@ -10,9 +10,11 @@ use rmcp::{
 use std::path::Path;
 use std::sync::Arc;
 
+mod browser;
 mod paths;
 mod read_file;
 mod rg;
+mod serve_http;
 mod shell;
 mod shim;
 mod str_replace;
@@ -69,6 +71,66 @@ impl DevMcp {
         Parameters(p): Parameters<view_image::ViewImageParams>,
     ) -> Result<CallToolResult, ErrorData> {
         view_image::run(&self.state, p).await
+    }
+
+    #[tool(
+        name = "browser_navigate",
+        description = "Open a URL in the agent's own Chromium. This is a REAL browser on a visible desktop that a human can watch and take over — so for anything needing a login, navigate to the login page and ask the person to sign in via the desktop viewer rather than asking them for a password. Sessions persist, so a site signed into once stays signed in."
+    )]
+    async fn browser_navigate(
+        &self,
+        Parameters(p): Parameters<browser::NavigateParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        browser::navigate(p).await
+    }
+
+    #[tool(
+        name = "browser_read",
+        description = "Read the visible text of the current page, optionally scoped to a CSS selector. Prefer this over screenshots for extracting information — it is far cheaper and exact. Output is truncated at ~20k characters."
+    )]
+    async fn browser_read(
+        &self,
+        Parameters(p): Parameters<browser::ReadParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        browser::read_page(p).await
+    }
+
+    #[tool(
+        name = "browser_click",
+        description = "Click the first element matching a CSS selector on the current page. Returns the URL afterwards so you can tell whether it navigated."
+    )]
+    async fn browser_click(
+        &self,
+        Parameters(p): Parameters<browser::ClickParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        browser::click(p).await
+    }
+
+    #[tool(
+        name = "browser_type",
+        description = "Type text into the input matching a CSS selector, optionally submitting afterwards. NEVER type passwords, 2FA codes, or other credentials with this tool — ask the person to enter those in the desktop viewer instead, so they stay out of the conversation."
+    )]
+    async fn browser_type(
+        &self,
+        Parameters(p): Parameters<browser::TypeParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        browser::type_text(p).await
+    }
+
+    #[tool(
+        name = "browser_screenshot",
+        description = "Capture the current page as an image you can look at. Use when layout or visual appearance matters; use browser_read for text."
+    )]
+    async fn browser_screenshot(&self) -> Result<CallToolResult, ErrorData> {
+        browser::screenshot().await
+    }
+
+    #[tool(
+        name = "browser_tabs",
+        description = "List the pages currently open in the agent's browser, newest first. The newest is the one the other browser tools act on."
+    )]
+    async fn browser_tabs(&self) -> Result<CallToolResult, ErrorData> {
+        browser::tabs().await
     }
 
     #[tool(
@@ -180,8 +242,114 @@ async fn async_main(cmd: String) -> Result<(), Box<dyn std::error::Error>> {
     let shim = shim::Shim::install()?;
     let state = Arc::new(shell::SharedState::new(cwd, shim)?);
 
-    let service = DevMcp::new(state).serve(stdio()).await?;
-    service.waiting().await?;
+    // Two transports, one tool surface.
+    //
+    // stdio (the default) is for an agent that spawns this process as a child:
+    // the pipe *is* the trust boundary, so there is nothing to authenticate.
+    //
+    // HTTP is for an agent whose reasoning model runs on another machine —
+    // the sandbox holds the tools, the operator's side holds the brain and the
+    // LLM credential. That endpoint is remote code execution by design, so it
+    // authenticates every call by Buzz identity and serves exactly one owner.
+    // See `serve_http` for the reasoning.
+    match std::env::var("BUZZ_DEV_MCP_BIND")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        Some(bind) => serve_over_http(state, bind).await,
+        None => {
+            let service = DevMcp::new(state).serve(stdio()).await?;
+            service.waiting().await?;
+            Ok(())
+        }
+    }
+}
+
+/// Serve the tool surface over authenticated HTTP.
+///
+/// Refuses to start without an owner: a tool server that would run any shell
+/// command for any caller is never the intended configuration, so an unset
+/// owner is a startup error rather than an open port.
+async fn serve_over_http(
+    state: Arc<shell::SharedState>,
+    bind: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpService,
+    };
+
+    let owner = std::env::var("BUZZ_DEV_MCP_OWNER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or(
+            "BUZZ_DEV_MCP_BIND is set but BUZZ_DEV_MCP_OWNER is not — refusing to \
+             serve tools to an unauthenticated caller. Set it to the hex pubkey of \
+             the agent that owns this sandbox.",
+        )?;
+
+    // NIP-98 signs the exact URL the caller used, so verification needs to know
+    // which origins count as this server. A sandbox generally cannot know that
+    // — it is created before it has an IP, and may be reached by container IP,
+    // hostname, or a tunnel — so by default any origin is accepted and the
+    // signature's authority comes from the method, path, body, and owner key.
+    // An operator fronting this with a fixed origin can pin it here.
+    let public_url = std::env::var("BUZZ_DEV_MCP_PUBLIC_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+
+    // The broker mints this per sandbox and returns it to the launcher. Absent
+    // when a sandbox was started without one, leaving NIP-98 as the only route.
+    let bearer_token = std::env::var("BUZZ_DEV_MCP_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+
+    let auth = serve_http::AuthConfig::new(owner, public_url.clone(), bearer_token.clone())?;
+
+    // rmcp defaults to accepting loopback `Host` values only, guarding a
+    // browser-driven DNS-rebinding attack against a server bound to localhost.
+    // A sandbox is reached by container IP or hostname, so that default rejects
+    // every legitimate request with "Host header is not allowed".
+    //
+    // Relaxing it is safe here for a reason the default cannot assume: rebinding
+    // attacks work because a local server trusts anyone who can reach it, and
+    // this one trusts nobody — every call must carry a NIP-98 signature from the
+    // owning key, checked before the request reaches this service. A browser
+    // tricked into calling the port cannot produce one.
+    //
+    // `BUZZ_DEV_MCP_HOSTS` narrows it again for an operator who knows the
+    // hostname in advance.
+    let allowed_hosts: Vec<String> = std::env::var("BUZZ_DEV_MCP_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .collect();
+    let mut http_config =
+        rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig::default();
+    http_config = if allowed_hosts.is_empty() {
+        http_config.disable_allowed_hosts()
+    } else {
+        http_config.with_allowed_hosts(allowed_hosts)
+    };
+
+    let service = StreamableHttpService::new(
+        move || Ok(DevMcp::new(state.clone())),
+        LocalSessionManager::default().into(),
+        http_config,
+    );
+
+    let app = axum::Router::new().nest_service("/mcp", service).layer(
+        axum::middleware::from_fn_with_state(auth, serve_http::require_owner),
+    );
+
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    tracing::info!(
+        %bind,
+        pinned_origin = public_url.as_deref().unwrap_or("<any>"),
+        bearer_token = bearer_token.is_some(),
+        "serving tools over authenticated HTTP (Bearer and/or NIP-98, single owner)"
+    );
+    axum::serve(listener, app).await?;
     Ok(())
 }
 

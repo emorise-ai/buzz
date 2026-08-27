@@ -489,6 +489,7 @@ fn sample_persona() -> AgentDefinition {
     AgentDefinition {
         id: "custom:helper".to_string(),
         display_name: "Helper".to_string(),
+        job_title: None,
         avatar_url: Some("https://example.com/a.png".to_string()),
         system_prompt: "You help.".to_string(),
         runtime: Some("goose".to_string()),
@@ -718,6 +719,7 @@ fn summary_fixture(
     super::ManagedAgentSummary {
         pubkey: "aa".repeat(32),
         name: "test".into(),
+        job_title: None,
         persona_id: None,
         runtime: None,
         team_id: None,

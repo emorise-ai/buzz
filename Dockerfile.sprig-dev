@@ -1,0 +1,123 @@
+# syntax=docker/dockerfile:1.7
+#
+# Sprig DEV image — the agent box with a real toolchain.
+#
+# Sibling of Dockerfile.sprig, not a replacement. That image is deliberately
+# minimal (bash, curl, git) and stays the default for chat-shaped agents. This
+# one adds the language runtimes a coding agent needs to actually build, test,
+# and run a project: Node, Python, and the usual build tooling.
+#
+# Two deliberate differences from Dockerfile.sprig:
+#
+#   1. Debian (glibc) rather than Alpine (musl). Node, Playwright browsers, and
+#      a long tail of prebuilt native npm/pip wheels ship glibc binaries only.
+#      On musl they either fail to install or fail at runtime, which is exactly
+#      the class of failure an agent cannot diagnose or work around.
+#   2. The `agent` user is created with UID/GID 10001 to match RUN_AS_UID in
+#      crates/buzz-backend-kubernetes/src/config.rs. Dockerfile.sprig gets 1000
+#      from `adduser -D` and relies on the pod securityContext to override it;
+#      matching here means the image behaves identically whether or not the
+#      substrate pins the UID (a plain `docker run` does not).
+#
+# Everything else is held byte-identical to Dockerfile.sprig on purpose — the
+# same eight multicall symlinks, the same system git-signing config, the same
+# HOME/PATH/WORKDIR, and the same entrypoint. buzz-dev-mcp resolves `buzz`,
+# `rg`, `tree`, and the git helpers off PATH; drop one symlink and the agent
+# silently loses the Buzz CLI or commit signing. The entrypoint must remain the
+# exec'd PID 1 so the harness receives SIGTERM directly (docs/remote-agents.md
+# §Entrypoint, and the L1 launcher obligations).
+#
+# Multi-arch is produced by building this file on native amd64 and arm64
+# runners. Keep every base pinned to a manifest-list digest so either
+# architecture resolves to immutable source bytes.
+
+FROM rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      cmake \
+      git \
+      libssl-dev \
+      perl \
+      pkg-config \
+      protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY . .
+RUN cargo build --locked --profile sprig -p sprig \
+    && strip target/sprig/sprig
+
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    NODE_MAJOR=22
+
+# Base runtime + toolchain. Node comes from NodeSource because Debian
+# bookworm ships Node 18, which is past LTS maintenance.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash \
+      build-essential \
+      ca-certificates \
+      curl \
+      git \
+      gnupg \
+      jq \
+      less \
+      openssh-client \
+      python3 \
+      python3-pip \
+      python3-venv \
+      ripgrep \
+      unzip \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+         | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
+         > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g pnpm@10 \
+    && rm -rf /var/lib/apt/lists/*
+
+# GitHub CLI — agents open and inspect PRs.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /etc/apt/keyrings/githubcli.gpg \
+    && chmod 0644 /etc/apt/keyrings/githubcli.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/githubcli.gpg] https://cli.github.com/packages stable main" \
+         > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# UID 10001 matches RUN_AS_UID/RUN_AS_GID in the Kubernetes backend, so the
+# image's own user and a UID-pinning substrate agree.
+RUN groupadd --gid 10001 agent \
+    && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/agent \
+         --shell /bin/bash agent \
+    && install -d -o agent -g agent /workspace /home/agent \
+    && git config --system gpg.format x509 \
+    && git config --system gpg.x509.program /usr/local/bin/git-sign-nostr \
+    && git config --system commit.gpgSign true \
+    && git config --system tag.gpgSign true \
+    && git config --system --add safe.directory /workspace
+
+COPY --from=builder --chmod=0755 /build/target/sprig/sprig /usr/local/bin/sprig
+COPY --chmod=0755 scripts/sprig-entrypoint.sh /usr/local/bin/sprig-entrypoint
+
+# The multicall surface. buzz-dev-mcp's shim prepends its own tempdir to PATH
+# and symlinks these same names back to itself; the image provides them too so
+# they resolve for any process that did not inherit that shim. `rg` is a real
+# binary above and is deliberately NOT symlinked here — the apt one is faster
+# and fully featured, and buzz-dev-mcp's shim still shadows it in-session.
+RUN for name in \
+      buzz-acp buzz-agent buzz-dev-mcp tree buzz \
+      git-credential-nostr git-sign-nostr; do \
+        ln -s sprig "/usr/local/bin/$name"; \
+    done
+
+ENV HOME=/home/agent \
+    PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
+    npm_config_fund=false \
+    npm_config_audit=false \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+WORKDIR /home/agent
+USER agent
+ENTRYPOINT ["/usr/local/bin/sprig-entrypoint"]

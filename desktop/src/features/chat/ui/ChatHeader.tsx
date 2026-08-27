@@ -26,6 +26,8 @@ type ChatHeaderProps = {
   /** Ref to the outer chrome wrapper when `belowSystemChrome` is true. */
   chromeWrapperRef?: React.Ref<HTMLDivElement>;
   title: string;
+  /** Optional secondary label shown beside the title, such as an agent role. */
+  subtitle?: string;
   description?: string;
   channelType?: ChannelType;
   visibility?: ChannelVisibility;
@@ -89,6 +91,7 @@ export function ChatHeader({
   belowSystemChrome = false,
   chromeWrapperRef,
   title,
+  subtitle,
   description,
   channelType,
   visibility,
@@ -99,6 +102,7 @@ export function ChatHeader({
   transparentChrome = false,
 }: ChatHeaderProps) {
   const trimmedDescription = description?.trim() ?? "";
+  const trimmedSubtitle = subtitle?.trim() ?? "";
 
   async function handleCopyTitle() {
     const value = title.trim();
@@ -143,6 +147,15 @@ export function ChatHeader({
             >
               {title}
             </h1>
+            {trimmedSubtitle ? (
+              <span
+                className="min-w-0 truncate text-xs font-normal text-muted-foreground"
+                data-testid="chat-subtitle"
+                title={trimmedSubtitle}
+              >
+                · {trimmedSubtitle}
+              </span>
+            ) : null}
             <Button
               aria-label={`Copy channel name: ${title}`}
               className="h-6 w-6 shrink-0 opacity-0 text-muted-foreground transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/title:opacity-100"

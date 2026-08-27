@@ -15,6 +15,7 @@ import { Route as indexRouteImport } from "./routes/index";
 import { Route as workflowsDotworkflowIdRouteImport } from "./routes/workflows.$workflowId";
 import { Route as projectsDotprojectIdRouteImport } from "./routes/projects.$projectId";
 import { Route as messagesDotnewRouteImport } from "./routes/messages.new";
+import { Route as computerDotsandboxIdRouteImport } from "./routes/computer.$sandboxId";
 import { Route as channelsDotchannelIdRouteImport } from "./routes/channels.$channelId";
 import { Route as channelsDotchannelIdDotpostsDotpostIdRouteImport } from "./routes/channels.$channelId.posts.$postId";
 
@@ -68,6 +69,11 @@ const messagesDotnewRoute = messagesDotnewRouteImport.update({
   path: "/messages/new",
   getParentRoute: () => rootRouteImport,
 } as any);
+const computerDotsandboxIdRoute = computerDotsandboxIdRouteImport.update({
+  id: "/computer/$sandboxId",
+  path: "/computer/$sandboxId",
+  getParentRoute: () => rootRouteImport,
+} as any);
 const channelsDotchannelIdRoute = channelsDotchannelIdRouteImport.update({
   id: "/channels/$channelId",
   path: "/channels/$channelId",
@@ -89,6 +95,7 @@ export interface FileRoutesByFullPath {
   "/settings": typeof settingsRoute;
   "/workflows": typeof workflowsRoute;
   "/channels/$channelId": typeof channelsDotchannelIdRoute;
+  "/computer/$sandboxId": typeof computerDotsandboxIdRoute;
   "/messages/new": typeof messagesDotnewRoute;
   "/projects/$projectId": typeof projectsDotprojectIdRoute;
   "/workflows/$workflowId": typeof workflowsDotworkflowIdRoute;
@@ -103,6 +110,7 @@ export interface FileRoutesByTo {
   "/settings": typeof settingsRoute;
   "/workflows": typeof workflowsRoute;
   "/channels/$channelId": typeof channelsDotchannelIdRoute;
+  "/computer/$sandboxId": typeof computerDotsandboxIdRoute;
   "/messages/new": typeof messagesDotnewRoute;
   "/projects/$projectId": typeof projectsDotprojectIdRoute;
   "/workflows/$workflowId": typeof workflowsDotworkflowIdRoute;
@@ -118,6 +126,7 @@ export interface FileRoutesById {
   "/settings": typeof settingsRoute;
   "/workflows": typeof workflowsRoute;
   "/channels/$channelId": typeof channelsDotchannelIdRoute;
+  "/computer/$sandboxId": typeof computerDotsandboxIdRoute;
   "/messages/new": typeof messagesDotnewRoute;
   "/projects/$projectId": typeof projectsDotprojectIdRoute;
   "/workflows/$workflowId": typeof workflowsDotworkflowIdRoute;
@@ -134,6 +143,7 @@ export interface FileRouteTypes {
     | "/settings"
     | "/workflows"
     | "/channels/$channelId"
+    | "/computer/$sandboxId"
     | "/messages/new"
     | "/projects/$projectId"
     | "/workflows/$workflowId"
@@ -148,6 +158,7 @@ export interface FileRouteTypes {
     | "/settings"
     | "/workflows"
     | "/channels/$channelId"
+    | "/computer/$sandboxId"
     | "/messages/new"
     | "/projects/$projectId"
     | "/workflows/$workflowId"
@@ -162,6 +173,7 @@ export interface FileRouteTypes {
     | "/settings"
     | "/workflows"
     | "/channels/$channelId"
+    | "/computer/$sandboxId"
     | "/messages/new"
     | "/projects/$projectId"
     | "/workflows/$workflowId"
@@ -177,6 +189,7 @@ export interface RootRouteChildren {
   settingsRoute: typeof settingsRoute;
   workflowsRoute: typeof workflowsRoute;
   channelsDotchannelIdRoute: typeof channelsDotchannelIdRoute;
+  computerDotsandboxIdRoute: typeof computerDotsandboxIdRoute;
   messagesDotnewRoute: typeof messagesDotnewRoute;
   projectsDotprojectIdRoute: typeof projectsDotprojectIdRoute;
   workflowsDotworkflowIdRoute: typeof workflowsDotworkflowIdRoute;
@@ -255,6 +268,13 @@ declare module "@tanstack/react-router" {
       preLoaderRoute: typeof messagesDotnewRouteImport;
       parentRoute: typeof rootRouteImport;
     };
+    "/computer/$sandboxId": {
+      id: "/computer/$sandboxId";
+      path: "/computer/$sandboxId";
+      fullPath: "/computer/$sandboxId";
+      preLoaderRoute: typeof computerDotsandboxIdRouteImport;
+      parentRoute: typeof rootRouteImport;
+    };
     "/channels/$channelId": {
       id: "/channels/$channelId";
       path: "/channels/$channelId";
@@ -281,6 +301,7 @@ const rootRouteChildren: RootRouteChildren = {
   settingsRoute: settingsRoute,
   workflowsRoute: workflowsRoute,
   channelsDotchannelIdRoute: channelsDotchannelIdRoute,
+  computerDotsandboxIdRoute: computerDotsandboxIdRoute,
   messagesDotnewRoute: messagesDotnewRoute,
   projectsDotprojectIdRoute: projectsDotprojectIdRoute,
   workflowsDotworkflowIdRoute: workflowsDotworkflowIdRoute,

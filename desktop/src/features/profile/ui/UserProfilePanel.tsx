@@ -100,7 +100,6 @@ import { getUserProfilePanelHeaderContent } from "@/features/profile/ui/UserProf
 import { UserProfileEditAgentDialog } from "@/features/profile/ui/UserProfileEditAgentDialog";
 import { useProfileEditAgentRequest } from "@/features/profile/ui/useProfileEditAgentRequest";
 export type { ProfilePanelTab, ProfilePanelView };
-
 export function UserProfilePanel({
   canResetWidth,
   currentPubkey,
@@ -792,6 +791,7 @@ export function UserProfilePanel({
           channels={profileChannels}
           channelsLoading={channelsQuery.isLoading}
           displayName={displayName}
+          jobTitle={resolvedPersona?.jobTitle ?? managedAgent?.jobTitle ?? null}
           followMutation={followMutation}
           agentInstruction={agentInstruction}
           handleAgentPrimaryAction={handleAgentPrimaryAction}

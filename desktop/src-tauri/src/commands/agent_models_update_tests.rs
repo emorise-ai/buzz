@@ -1,5 +1,46 @@
 use super::*;
 
+#[test]
+fn credential_merge_preserves_sibling_environment_values() {
+    let current = BTreeMap::from([("SIBLING_TOKEN".to_string(), "keep-me".to_string())]);
+
+    let merged = merged_credential_env(
+        &current,
+        "OPENAI_API_KEY".to_string(),
+        "sk-secret-value".to_string(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        merged.get("SIBLING_TOKEN").map(String::as_str),
+        Some("keep-me")
+    );
+    assert_eq!(
+        merged.get("OPENAI_API_KEY").map(String::as_str),
+        Some("sk-secret-value")
+    );
+}
+
+#[test]
+fn credential_merge_rejects_empty_or_reserved_values_without_echoing_secret() {
+    let empty_error = merged_credential_env(
+        &BTreeMap::new(),
+        "OPENAI_API_KEY".to_string(),
+        "   ".to_string(),
+    )
+    .unwrap_err();
+    assert_eq!(empty_error, "credential value cannot be empty");
+
+    let secret = "should-never-appear-in-errors";
+    let reserved_error = merged_credential_env(
+        &BTreeMap::new(),
+        "BUZZ_PRIVATE_KEY".to_string(),
+        secret.to_string(),
+    )
+    .unwrap_err();
+    assert!(!reserved_error.contains(secret));
+}
+
 fn provider_record(deployed: bool) -> ManagedAgentRecord {
     let mut record: ManagedAgentRecord = serde_json::from_value(serde_json::json!({
         "pubkey": "agent", "name": "Agent", "relay_url": "", "acp_command": "",

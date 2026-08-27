@@ -84,6 +84,7 @@ export type EncodedTeamSnapshotPayload = {
 
 export type TeamSnapshotMemberPreview = {
   displayName: string;
+  jobTitle: string | null;
   systemPrompt: string | null;
   avatarUrl: string | null;
   hasSourceAllowlist: boolean;

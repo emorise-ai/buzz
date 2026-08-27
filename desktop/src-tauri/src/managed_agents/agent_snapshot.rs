@@ -98,6 +98,8 @@ pub enum MemoryLevel {
 #[serde(rename_all = "camelCase")]
 pub struct AgentSnapshotDefinition {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_title: Option<String>,
     /// Portable source classification for import-preview metadata. Imported
     /// definitions are still created as custom agents with fresh identities.
     #[serde(default)]
@@ -206,6 +208,7 @@ pub fn build_snapshot(
             .display_name
             .clone()
             .unwrap_or_else(|| record.name.clone()),
+        job_title: record.job_title.clone(),
         source_is_builtin: record.is_builtin,
         system_prompt: record.system_prompt.clone(),
         runtime: record.runtime.clone(),

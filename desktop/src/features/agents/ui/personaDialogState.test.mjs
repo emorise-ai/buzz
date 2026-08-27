@@ -154,6 +154,32 @@ test("editPersonaDialogState preserves the persona id for updates", () => {
   });
 });
 
+test("persona dialog state carries a configured job title", () => {
+  const persona = {
+    id: "persona-title",
+    displayName: "Avery",
+    jobTitle: "Principal Researcher",
+    avatarUrl: null,
+    systemPrompt: "Research carefully.",
+    runtime: null,
+    model: null,
+    provider: null,
+    isBuiltIn: false,
+    isActive: true,
+    createdAt: "2025-01-01T00:00:00Z",
+    updatedAt: "2025-01-02T00:00:00Z",
+  };
+
+  assert.equal(
+    editPersonaDialogState(persona).initialValues.jobTitle,
+    "Principal Researcher",
+  );
+  assert.equal(
+    duplicatePersonaDialogState(persona).initialValues.jobTitle,
+    "Principal Researcher",
+  );
+});
+
 test("editPersonaDialogState seeds envVars and namePool from the persona", () => {
   const state = editPersonaDialogState({
     id: "persona-3",

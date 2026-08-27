@@ -1,5 +1,80 @@
 use super::*;
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetManagedAgentCredentialRequest {
+    pub pubkey: String,
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetManagedAgentCredentialResponse {
+    /// `None` means the active runtime pair restarted successfully. When set,
+    /// the credential is already durable and the caller should offer a retry
+    /// without asking the user to enter it again.
+    pub restart_error: Option<String>,
+}
+
+fn merged_credential_env(
+    current: &BTreeMap<String, String>,
+    key: String,
+    value: String,
+) -> Result<BTreeMap<String, String>, String> {
+    if value.trim().is_empty() {
+        return Err("credential value cannot be empty".to_string());
+    }
+
+    let mut merged = current.clone();
+    merged.insert(key, value);
+    crate::managed_agents::validate_user_env_keys(&merged)?;
+    Ok(merged)
+}
+
+/// Save one credential into a local managed agent's environment, then restart
+/// only the runtime pair for the relay that displayed the authenticated setup
+/// nudge. The response never carries the submitted value or sibling env values
+/// back across IPC.
+#[tauri::command]
+pub async fn set_managed_agent_credential(
+    input: SetManagedAgentCredentialRequest,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<SetManagedAgentCredentialResponse, String> {
+    let pubkey = input.pubkey.trim().to_ascii_lowercase();
+    let relay_url = relay_ws_url_with_override(&state);
+
+    {
+        let _store_guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let mut records = load_managed_agents(&app)?;
+        let record = find_managed_agent_mut(&mut records, &pubkey)?;
+        if record.backend != crate::managed_agents::BackendKind::Local {
+            return Err("secure credential entry currently supports local agents only".to_string());
+        }
+
+        record.env_vars = merged_credential_env(&record.env_vars, input.key, input.value)?;
+        record.updated_at = now_iso();
+        save_managed_agents(&app, &records)?;
+
+        if let Some(saved_record) = records.iter().find(|record| record.pubkey == pubkey) {
+            super::super::agents::retain_managed_agent_pending(&app, &state, saved_record);
+        }
+    }
+
+    try_regenerate_nest(&app);
+
+    let restart_error =
+        crate::managed_agents::restart_managed_agent_runtime(pubkey, relay_url, app)
+            .await
+            .err();
+
+    Ok(SetManagedAgentCredentialResponse { restart_error })
+}
+
 pub(crate) fn managed_agent_access_policy_changed(
     current_mode: crate::managed_agents::RespondTo,
     current_allowlist: &[String],

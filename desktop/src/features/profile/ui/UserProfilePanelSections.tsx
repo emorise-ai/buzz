@@ -8,6 +8,7 @@ import {
 } from "@/features/agents/lib/managedAgentControlActions";
 import { RestartDiffBadge } from "@/features/agents/ui/RestartDiffBadge";
 import { AgentConfigPanel } from "@/features/agents/ui/AgentConfigPanel";
+import { AgentSandboxPreview } from "@/features/agents/sandbox/AgentSandboxPreview";
 import type { IdentityArchiveActions } from "@/features/identity-archive/hooks";
 import { getPresenceLabel } from "@/features/presence/lib/presence";
 import { PresenceDot } from "@/features/presence/ui/PresenceBadge";
@@ -66,6 +67,7 @@ export type ProfileSummaryViewProps = {
   channels: ProfileChannelLink[];
   channelsLoading: boolean;
   displayName: string;
+  jobTitle: string | null;
   followMutation: ReturnType<typeof useFollowMutation>;
   canInstantiateAgent: boolean;
   agentInstruction: string | null;
@@ -142,6 +144,7 @@ export function ProfileSummaryView({
   channels,
   channelsLoading,
   displayName,
+  jobTitle,
   followMutation,
   canInstantiateAgent,
   agentInstruction,
@@ -404,6 +407,7 @@ export function ProfileSummaryView({
       >
         <ProfileHero
           displayName={displayName}
+          jobTitle={jobTitle}
           isBot={isBot}
           onEditAgent={canEditAgent ? handleEditAgent : undefined}
           presenceStatus={avatarStatus}
@@ -472,6 +476,8 @@ export function ProfileSummaryView({
           restartDiff={managedAgent.restartDiff}
         />
       ) : null}
+
+      {isBot && pubkey ? <AgentSandboxPreview agentPubkey={pubkey} /> : null}
 
       {showTabSection ? (
         <section className={cn(isBot ? "space-y-0" : "space-y-3")}>
@@ -599,6 +605,7 @@ export function ProfileSummaryView({
 
 function ProfileHero({
   displayName,
+  jobTitle,
   isBot,
   onEditAgent,
   presenceStatus,
@@ -606,6 +613,7 @@ function ProfileHero({
   userStatus,
 }: {
   displayName: string;
+  jobTitle: string | null;
   isBot: boolean;
   onEditAgent?: () => void;
   presenceStatus: "online" | "away" | "offline" | undefined;
@@ -688,6 +696,15 @@ function ProfileHero({
             {botIndicator}
           </h3>
         )}
+
+        {jobTitle?.trim() ? (
+          <p
+            className="text-sm font-medium text-muted-foreground"
+            data-testid="user-profile-job-title"
+          >
+            {jobTitle.trim()}
+          </p>
+        ) : null}
 
         {profile?.about?.trim() ? (
           <ProfileHeroDescription

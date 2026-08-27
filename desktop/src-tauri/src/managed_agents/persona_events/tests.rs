@@ -8,8 +8,10 @@ pub(super) fn sample_record() -> ManagedAgentRecord {
         pubkey: "p".repeat(64),
         name: "agent".into(),
         persona_id: Some("test-persona".into()),
+        job_title: None,
         private_key_nsec: "nsec1fake".into(),
         auth_tag: None,
+        sandbox_id: None,
         relay_url: "ws://localhost:3000".into(),
         avatar_url: None,
         acp_command: "buzz-acp".into(),
@@ -145,6 +147,7 @@ pub(super) fn sample_persona() -> AgentDefinition {
     AgentDefinition {
         id: "test-persona".to_string(),
         display_name: "Test Persona".to_string(),
+        job_title: None,
         avatar_url: Some("https://example.com/avatar.png".to_string()),
         system_prompt: "You are a test assistant.".to_string(),
         runtime: Some("goose".to_string()),
@@ -327,6 +330,7 @@ fn content_matches_nip_ap_vector() {
         respond_to: None,
         respond_to_allowlist: Vec::new(),
         parallelism: None,
+        job_title: None,
     };
     assert_eq!(
         serde_json::to_string(&content).unwrap(),
@@ -372,6 +376,7 @@ fn content_matches_nip_ap_vector() {
     let record = AgentDefinition {
         id: "test-agent".to_string(),
         display_name: "Test Agent".to_string(),
+        job_title: None,
         avatar_url: Some("https://example.com/avatar.png".to_string()),
         system_prompt: "You are a test assistant.".to_string(),
         runtime: Some("goose".to_string()),
@@ -403,6 +408,7 @@ fn round_trip_minimal_persona() {
     let record = AgentDefinition {
         id: "minimal".to_string(),
         display_name: "Minimal".to_string(),
+        job_title: None,
         avatar_url: None,
         system_prompt: "Hello".to_string(),
         runtime: None,
@@ -439,6 +445,36 @@ fn round_trip_minimal_persona() {
     // Deserialized persona is always non-builtin and active
     assert!(!restored.is_builtin);
     assert!(restored.is_active);
+}
+
+#[test]
+fn round_trip_job_title_and_omit_it_for_legacy_personas() {
+    let mut record = sample_persona();
+    record.job_title = Some("Principal Researcher".to_string());
+    let event = build_persona_event(&record)
+        .unwrap()
+        .sign_with_keys(&nostr::Keys::generate())
+        .unwrap();
+
+    assert_eq!(
+        serde_json::from_str::<PersonaEventContent>(&event.content)
+            .unwrap()
+            .job_title
+            .as_deref(),
+        Some("Principal Researcher")
+    );
+    assert_eq!(
+        persona_from_event(&event).unwrap().job_title.as_deref(),
+        Some("Principal Researcher")
+    );
+
+    let legacy: PersonaEventContent =
+        serde_json::from_str(r#"{"display_name":"Legacy","system_prompt":"No title"}"#).unwrap();
+    assert_eq!(legacy.job_title, None);
+    assert_eq!(
+        serde_json::to_string(&legacy).unwrap(),
+        r#"{"display_name":"Legacy","system_prompt":"No title"}"#
+    );
 }
 
 #[test]
@@ -500,6 +536,7 @@ fn quad_absent_definition_hash_stable_across_activation() {
     let record = AgentDefinition {
         id: "quad-absent".to_string(),
         display_name: "Test".to_string(),
+        job_title: None,
         avatar_url: None,
         system_prompt: "Hello".to_string(),
         runtime: Some("goose".to_string()),
@@ -525,6 +562,7 @@ fn quad_absent_definition_hash_stable_across_activation() {
         respond_to: None,
         respond_to_allowlist: Vec::new(),
         parallelism: None,
+        job_title: None,
         ..live.clone()
     };
     assert_eq!(
@@ -544,6 +582,7 @@ fn persona_from_event_content_for_test(content: PersonaEventContent) -> AgentDef
     AgentDefinition {
         id: "staged".to_string(),
         display_name: content.display_name,
+        job_title: content.job_title,
         avatar_url: content.avatar_url,
         system_prompt: content.system_prompt.unwrap_or_default(),
         runtime: content.runtime,
@@ -578,6 +617,7 @@ fn persona_content_hash_is_deterministic() {
         respond_to: None,
         respond_to_allowlist: Vec::new(),
         parallelism: None,
+        job_title: None,
     };
     let hash1 = persona_content_hash(&content);
     let hash2 = persona_content_hash(&content);
@@ -598,6 +638,7 @@ fn persona_content_hash_changes_on_edit() {
         respond_to: None,
         respond_to_allowlist: Vec::new(),
         parallelism: None,
+        job_title: None,
     };
     let mut content2 = content1.clone();
     content2.system_prompt = Some("Goodbye".to_string());

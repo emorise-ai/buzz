@@ -10,7 +10,7 @@ services:
       POSTGRES_DB: buzz
       PGDATA: /var/lib/postgresql/data
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:5437:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     networks:
@@ -34,7 +34,7 @@ services:
     image: redis:7-alpine
     container_name: buzz-redis
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:6381:6379"
     networks:
       - buzz-net
     healthcheck:
@@ -108,8 +108,8 @@ services:
       MINIO_ROOT_USER: buzz_dev
       MINIO_ROOT_PASSWORD: buzz_dev_secret
     ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
+      - "127.0.0.1:9004:9000"
+      - "127.0.0.1:9005:9001"
     volumes:
       - minio-data:/data
     networks:

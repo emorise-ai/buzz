@@ -95,6 +95,7 @@ type MockCommandAvailability = {
 export type MockManagedAgentSeed = {
   pubkey: string;
   name: string;
+  jobTitle?: string | null;
   avatarUrl?: string | null;
   personaId?: string | null;
   /** Harness/runtime id pin; `null` = inherit from persona (native default). */
@@ -291,6 +292,12 @@ type E2eConfig = {
       mcp?: MockCommandAvailability;
     };
     managedAgents?: MockManagedAgentSeed[];
+    /** Reject successive secure credential saves before mutating the agent. */
+    setManagedAgentCredentialErrors?: string[];
+    /** Return a partial-success restart error after securely saving. */
+    setManagedAgentCredentialRestartErrors?: string[];
+    /** Reject successive explicit pair-runtime restart retries. */
+    restartManagedAgentRuntimeErrors?: string[];
     /** Result returned by the mocked `add_agent_to_huddle` command. */
     addAgentToHuddleResult?: {
       ephemeral_added: boolean;
@@ -903,6 +910,7 @@ type RawRelayAgent = {
 type RawManagedAgent = {
   pubkey: string;
   name: string;
+  job_title?: string | null;
   persona_id: string | null;
   /** Record-level harness/runtime pin (`null` when inheriting from the persona). */
   runtime: string | null;
@@ -1229,6 +1237,24 @@ declare global {
       createdAt?: number;
       pubkey?: string;
       threadHeadId?: string;
+    }) => RelayEvent;
+    /**
+     * Emit a sandbox lifecycle event (kind:48200 created / 48201 destroyed) to
+     * any live owner-scoped subscription, so the agent-card sandbox preview can
+     * be exercised in specs. `ownerPubkey` is the agent the sandbox belongs to
+     * (the `#p` value the card filters on).
+     */
+    __BUZZ_E2E_EMIT_MOCK_SANDBOX__?: (input: {
+      ownerPubkey: string;
+      destroyed?: boolean;
+      sandboxId?: string;
+      name?: string;
+      image?: string;
+      cpus?: number;
+      memoryMb?: number;
+      expiresAt?: number;
+      viewerUrl?: string;
+      reason?: string;
     }) => RelayEvent;
     __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: (
       command: string,
@@ -1763,6 +1789,7 @@ function cloneManagedAgent(agent: MockManagedAgent): RawManagedAgent {
   return {
     pubkey: agent.pubkey,
     name: agent.name,
+    job_title: agent.job_title ?? null,
     persona_id: agent.persona_id,
     runtime: agent.runtime ?? null,
     relay_url: agent.relay_url,
@@ -2323,6 +2350,7 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     pubkey: seed.pubkey,
     name: seed.name,
     persona_id: seed.personaId ?? null,
+    job_title: seed.jobTitle ?? null,
     // Native serde always emits this key (`null` when unpinned) — the bridge
     // must mirror the wire shape, not omit the key.
     runtime: seed.runtime ?? null,
@@ -4683,6 +4711,26 @@ function emitMockLiveEvent(channelId: string, event: RelayEvent) {
       if (
         (subscription.channelId === channelId ||
           subscription.channelId === GLOBAL_MOCK_SUBSCRIPTION) &&
+        (!subscription.kinds || subscription.kinds.includes(event.kind))
+      ) {
+        sendWsText(socket.handler, ["EVENT", subId, event]);
+      }
+    }
+  }
+}
+
+/**
+ * Dispatch an event to every live subscription whose `#p` owner filter contains
+ * `ownerPubkey` and whose kind filter admits the event. The owner-scoped analog
+ * of `emitMockLiveEvent` — used for sandbox lifecycle events, which are keyed by
+ * the owning agent, not a channel.
+ */
+function emitMockOwnerLiveEvent(ownerPubkey: string, event: RelayEvent) {
+  const owner = ownerPubkey.toLowerCase();
+  for (const socket of mockSockets.values()) {
+    for (const [subId, subscription] of socket.subscriptions) {
+      if (
+        subscription.ownerPubkeys.some((p) => p.toLowerCase() === owner) &&
         (!subscription.kinds || subscription.kinds.includes(event.kind))
       ) {
         sendWsText(socket.handler, ["EVENT", subId, event]);
@@ -9046,6 +9094,7 @@ async function handleCreateManagedAgent(
   const managedAgent: MockManagedAgent = {
     pubkey,
     name,
+    job_title: null,
     persona_id: args.input.personaId ?? null,
     // Create never pins a harness id — the record inherits from the persona.
     runtime: null,
@@ -9165,10 +9214,16 @@ function upsertMockManagedAgentRuntime(
 function handleManagedAgentRuntimeAction(
   action: "start" | "stop" | "restart",
   args: { pubkey: string; relayUrl: string },
+  config?: E2eConfig,
 ): MockManagedAgentRuntimeRow {
   const agent = getMockManagedAgent(args.pubkey);
   if (agent.backend.type !== "local") {
     throw new Error("managed runtime pairs require a local agent");
+  }
+  if (action === "restart") {
+    const restartError =
+      config?.mock?.restartManagedAgentRuntimeErrors?.shift();
+    if (restartError) throw new Error(restartError);
   }
   return {
     ...upsertMockManagedAgentRuntime(
@@ -9360,6 +9415,44 @@ async function handleUpdateManagedAgent(args: {
   }
   agent.updated_at = new Date().toISOString();
   return { agent: cloneManagedAgent(agent), profile_sync_error: null };
+}
+
+function handleSetManagedAgentCredential(
+  args: {
+    input: {
+      pubkey: string;
+      key: string;
+      value: string;
+    };
+  },
+  config?: E2eConfig,
+): { restartError: string | null } {
+  const saveError = config?.mock?.setManagedAgentCredentialErrors?.shift();
+  if (saveError) throw new Error(saveError);
+
+  const agent = getMockManagedAgent(args.input.pubkey);
+  if (agent.backend.type !== "local") {
+    throw new Error(
+      "secure credential entry currently supports local agents only",
+    );
+  }
+
+  agent.env_vars = {
+    ...agent.env_vars,
+    [args.input.key]: args.input.value,
+  };
+  agent.updated_at = new Date().toISOString();
+
+  const restartError =
+    config?.mock?.setManagedAgentCredentialRestartErrors?.shift() ?? null;
+  if (!restartError) {
+    upsertMockManagedAgentRuntime(
+      args.input.pubkey,
+      getRelayWsUrl(config),
+      "ready",
+    );
+  }
+  return { restartError };
 }
 
 /**
@@ -10877,6 +10970,43 @@ export function maybeInstallE2eTauriMocks() {
     );
   };
   window.__BUZZ_E2E_PREPEND_MOCK_HISTORY__ = prependMockHistory;
+  window.__BUZZ_E2E_EMIT_MOCK_SANDBOX__ = ({
+    ownerPubkey,
+    destroyed,
+    sandboxId = "mock-sandbox",
+    name = "buzz-sandbox-mock",
+    image = "sprig-desktop",
+    cpus = 2,
+    memoryMb = 4096,
+    expiresAt = Math.floor(Date.now() / 1000) + 3600,
+    viewerUrl,
+    reason = "destroyed",
+  }) => {
+    const tags: string[][] = destroyed
+      ? [
+          ["d", sandboxId],
+          ["reason", reason],
+          ["p", ownerPubkey],
+        ]
+      : [
+          ["d", sandboxId],
+          ["name", name],
+          ["image", image],
+          ["cpus", String(cpus)],
+          ["memory_mb", String(memoryMb)],
+          ["expires_at", String(expiresAt)],
+          ["p", ownerPubkey],
+          ...(viewerUrl ? [["viewer", viewerUrl]] : []),
+        ];
+    const event = createMockEvent(
+      destroyed ? 48201 : 48200,
+      "",
+      tags,
+      "broker",
+    );
+    emitMockOwnerLiveEvent(ownerPubkey, event);
+    return event;
+  };
   window.__BUZZ_E2E_EMIT_MOCK_TYPING__ = ({
     channelName,
     createdAt,
@@ -12067,6 +12197,13 @@ export function maybeInstallE2eTauriMocks() {
           },
           activeConfig,
         );
+      case "mint_sandbox_viewer_url": {
+        // The real command signs a NIP-98 token; the mock just echoes the URL
+        // with a placeholder token so the viewer dialog can render in specs.
+        const url = (payload as { viewerUrl?: string } | null)?.viewerUrl ?? "";
+        const separator = url.includes("?") ? "&" : "?";
+        return `${url}${separator}t=mock-token`;
+      }
       case "get_os_idle_seconds":
         // e2e runs headless with no OS idle API; the presence hook falls back
         // to in-app activity tracking.
@@ -13166,16 +13303,19 @@ export function maybeInstallE2eTauriMocks() {
         return handleManagedAgentRuntimeAction(
           "start",
           payload as { pubkey: string; relayUrl: string },
+          activeConfig,
         );
       case "stop_managed_agent_runtime":
         return handleManagedAgentRuntimeAction(
           "stop",
           payload as { pubkey: string; relayUrl: string },
+          activeConfig,
         );
       case "restart_managed_agent_runtime":
         return handleManagedAgentRuntimeAction(
           "restart",
           payload as { pubkey: string; relayUrl: string },
+          activeConfig,
         );
       case "reconcile_managed_agent_runtimes":
         // Post-create bootstrap reconcile: no new pairs in the mock world.
@@ -13394,6 +13534,11 @@ export function maybeInstallE2eTauriMocks() {
       case "update_managed_agent":
         return handleUpdateManagedAgent(
           payload as Parameters<typeof handleUpdateManagedAgent>[0],
+        );
+      case "set_managed_agent_credential":
+        return handleSetManagedAgentCredential(
+          payload as Parameters<typeof handleSetManagedAgentCredential>[0],
+          activeConfig,
         );
       case "create_channel":
         return handleCreateChannel(

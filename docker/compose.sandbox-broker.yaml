@@ -1,0 +1,55 @@
+# Sandbox broker — runs on the sandbox host (Matterhorn).
+#
+# Creates and reaps agent containers on behalf of buzz-backend-docker, which
+# runs on whatever machine launches an agent and holds NO substrate
+# credentials. See SANDBOX-PLAN.md §Phase 2.
+#
+# Trust note: this service mounts the docker socket, so it can create
+# containers on the host. That is its job, and it is why it binds to loopback
+# only, authenticates every mutating call by Buzz identity (NIP-98) and defers
+# authorization to the relay, and decides every container limit itself rather
+# than accepting them from a caller. Sandboxes never see the socket.
+
+services:
+  broker:
+    image: buzz-sandbox-broker:local
+    environment:
+      # The broker's own Buzz identity. It signs its membership queries to the
+      # relay with this, so an unset key makes every authorization check fail
+      # closed. There is no shared bearer token: callers authenticate by
+      # signing with their agent key.
+      BUZZ_SANDBOX_RELAY_KEY: ${BUZZ_SANDBOX_RELAY_KEY:?set BUZZ_SANDBOX_RELAY_KEY (the broker's nsec/hex key)}
+      # The relay the broker asks about membership and publishes 48200/48201 to.
+      BUZZ_SANDBOX_RELAY_URL: ${BUZZ_SANDBOX_RELAY_URL:?set BUZZ_SANDBOX_RELAY_URL (https://…)}
+      # NIP-98 signs the exact URL the caller used, and verification rebuilds it
+      # from this value rather than the Host header. It must match the origin
+      # callers actually reach — tunnel on 9310, or a mismatch rejects every
+      # request in a way that looks like a broken signature.
+      BUZZ_SANDBOX_PUBLIC_URL: ${BUZZ_SANDBOX_PUBLIC_URL:-http://127.0.0.1:9310}
+      # Prefix allowlist. An unlisted image must never hold an agent key.
+      BUZZ_SANDBOX_IMAGES: ${BUZZ_SANDBOX_IMAGES:-ghcr.io/block/buzz-sprig,buzz-sprig-dev}
+      BUZZ_SANDBOX_NETWORK: ${BUZZ_SANDBOX_NETWORK:-buzz-sandboxes}
+      BUZZ_SANDBOX_BIND: 0.0.0.0:9310
+      # Writable-layer cap. Only settable on overlay2-over-XFS with pquota;
+      # Matterhorn is ext4, so it stays unset there and disk is uncapped.
+      BUZZ_SANDBOX_DISK: ${BUZZ_SANDBOX_DISK:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      # Loopback only — reached through an authenticated tunnel or a Traefik
+      # route, never published to the internet directly.
+      - "127.0.0.1:9310:9310"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    restart: unless-stopped
+
+# Sandboxes run on their own bridge so they cannot reach production containers
+# by name. Created out-of-band because the 172.16-31 space on this host is
+# nearly exhausted:
+#   docker network create --driver bridge --subnet 172.16.240.0/24 buzz-sandboxes
+networks:
+  default:
+    name: buzz-sandbox-broker

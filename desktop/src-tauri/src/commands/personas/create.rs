@@ -7,8 +7,9 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     managed_agents::{
-        apply_persona_behavior, load_personas, save_personas, try_regenerate_nest,
-        validate_agent_definition_text, AgentDefinition, CatalogSource, CreatePersonaRequest,
+        apply_persona_behavior, load_personas, normalize_optional_job_title, save_personas,
+        try_regenerate_nest, validate_agent_definition_text, validate_optional_job_title,
+        AgentDefinition, CatalogSource, CreatePersonaRequest,
     },
     util::now_iso,
 };
@@ -30,6 +31,8 @@ pub async fn create_persona(
         let system_prompt = input.system_prompt.clone();
         validate_agent_definition_text(&display_name, &system_prompt)?;
         let avatar_url = trim_optional(input.avatar_url);
+        let job_title = normalize_optional_job_title(input.job_title);
+        validate_optional_job_title(job_title.as_deref())?;
         let runtime = trim_optional(input.runtime);
         let model = trim_optional(input.model);
         let provider = trim_optional(input.provider);
@@ -57,6 +60,7 @@ pub async fn create_persona(
         let mut persona = AgentDefinition {
             id: Uuid::new_v4().to_string(),
             display_name,
+            job_title,
             avatar_url,
             system_prompt,
             runtime,

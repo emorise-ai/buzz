@@ -9,6 +9,7 @@ export type CatalogPersonaShareLevel = "not-shared" | "none";
 
 type CatalogAgentProjection = {
   displayName: string;
+  jobTitle: string | null;
   avatarUrl: string | null;
   systemPrompt: string;
   runtime: string | null;
@@ -68,6 +69,7 @@ function publicationToPersona(
       localPersona?.id ??
       `catalog:${publication.ownerPubkey}:${publication.sourcePersonaId}`,
     displayName: publication.agent.displayName,
+    jobTitle: publication.agent.jobTitle,
     avatarUrl: publication.agent.avatarUrl,
     systemPrompt: publication.agent.systemPrompt,
     runtime: publication.agent.runtime,

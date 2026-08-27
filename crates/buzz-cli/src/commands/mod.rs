@@ -16,6 +16,8 @@ pub mod project_channel;
 pub mod projects;
 pub mod reactions;
 pub mod repos;
+pub mod sandbox;
+pub mod skills;
 pub mod social;
 pub mod upload;
 pub mod users;

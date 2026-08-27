@@ -36,9 +36,24 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # view_image tool: HTTP fetch (workspace reqwest is already used by buzz-cli;
 # adding it here is essentially free), base64 encoding, and decode/resize.
 reqwest = { workspace = true }
+# Browser tools speak CDP, which needs a websocket: the HTTP endpoints can list
+# and open tabs but cannot evaluate, click, or type.
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 buzz-core = { workspace = true }
+# Remote tool serving: the agent's brain runs elsewhere and drives these tools
+# over authenticated HTTP. axum carries the transport, buzz-auth verifies the
+# NIP-98 signature on every call, chrono bounds replay.
+axum = { workspace = true }
+buzz-auth = { workspace = true }
+chrono = { workspace = true }
+# Constant-time token comparison: a bearer token is a secret compared for
+# equality, the exact shape that leaks through timing with `==`.
+subtle = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal", "process"] }

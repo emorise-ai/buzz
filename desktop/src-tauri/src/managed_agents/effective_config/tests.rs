@@ -10,6 +10,7 @@ fn definition(
     AgentDefinition {
         id: id.to_string(),
         display_name: "Test Definition".to_string(),
+        job_title: None,
         avatar_url: None,
         system_prompt: prompt.to_string(),
         runtime: None,
@@ -42,8 +43,10 @@ fn record(
         pubkey: "agent-pk".to_string(),
         name: "Agent".to_string(),
         persona_id: persona_id.map(str::to_string),
+        job_title: None,
         private_key_nsec: "".to_string(),
         auth_tag: None,
+        sandbox_id: None,
         relay_url: "ws://localhost:3000".to_string(),
         avatar_url: None,
         acp_command: "buzz-acp".to_string(),

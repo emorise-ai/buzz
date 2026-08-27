@@ -385,3 +385,41 @@ pub(crate) fn collect_same_instance_orphans(
 ) -> std::collections::HashSet<u32> {
     std::collections::HashSet::new()
 }
+
+/// Periodic sweep: reap orphaned agents from dead instances every 60s.
+/// Catches agents that escaped both the Justfile trap and boot-time reaping
+/// (e.g. a `just staging` Ctrl+C leak that only gets collected by a
+/// different instance's periodic sweep). Spawned once from `lib.rs` setup.
+pub(crate) fn spawn_periodic_orphan_sweep(sweep_handle: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        use std::collections::HashSet;
+        use std::time::Duration;
+        use tauri::Manager;
+        let instance_id = current_instance_id(&sweep_handle);
+        let state = sweep_handle.state::<crate::app_state::AppState>();
+        // Two-tick grace: only reap same-instance orphans seen on two
+        // consecutive sweeps. Prevents killing a legitimately-starting
+        // agent that spawned between the skip-list snapshot and the scan.
+        let mut prev_orphans: HashSet<u32> = HashSet::new();
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            // Collect PIDs of our own live agents to avoid killing them.
+            let skip_pids: Vec<u32> = state
+                .managed_agent_processes
+                .lock()
+                .map(|runtimes| runtimes.values().map(|rt| rt.child.id()).collect())
+                .unwrap_or_default();
+            let prev = prev_orphans.clone();
+            let inst = instance_id.clone();
+            // Run the blocking syscall work off the async executor.
+            let new_orphans = tauri::async_runtime::spawn_blocking(move || {
+                let orphans = sweep_system_agent_processes_with_grace(&inst, &skip_pids, &prev);
+                reap_dead_instance_agents(&inst, &skip_pids);
+                orphans
+            })
+            .await
+            .unwrap_or_default();
+            prev_orphans = new_orphans;
+        }
+    });
+}

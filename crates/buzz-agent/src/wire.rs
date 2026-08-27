@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::types::{ContentBlock, McpServerStdio};
+use crate::types::{ContentBlock, McpServer};
 
 pub const PARSE_ERROR: i32 = -32700;
 pub const INVALID_REQUEST: i32 = -32600;
@@ -60,7 +60,7 @@ pub struct InitializeParams {
 pub struct SessionNewParams {
     pub cwd: String,
     #[serde(default)]
-    pub mcp_servers: Vec<McpServerStdio>,
+    pub mcp_servers: Vec<McpServer>,
     #[serde(default)]
     pub system_prompt: Option<String>,
 }

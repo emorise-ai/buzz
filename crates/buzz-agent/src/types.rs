@@ -543,6 +543,44 @@ pub struct McpServerStdio {
     pub env: Vec<EnvVar>,
 }
 
+/// A remote tool server, driven over HTTP instead of spawned locally.
+///
+/// The ACP schema's `McpServerHttp`. Used when the tools live on another
+/// machine — a sandbox holding a shell, a filesystem, and a browser but no
+/// model credential — so the reasoning stays here and only the hands are
+/// remote.
+#[derive(Debug, Deserialize, Clone)]
+pub struct McpServerHttp {
+    pub name: String,
+    pub url: String,
+}
+
+/// One tool server, of either transport.
+///
+/// Deserialized by shape rather than a tag: the ACP schema distinguishes the
+/// variants by a `type` discriminator that only the HTTP form carries, so an
+/// untagged enum reproduces it without rejecting the stdio form that every
+/// existing caller sends.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum McpServer {
+    /// Remote first: it is the more specific shape (`url` is required and
+    /// `command` absent), so trying it first prevents a stdio match on a
+    /// payload that is really remote.
+    Http(McpServerHttp),
+    Stdio(McpServerStdio),
+}
+
+impl McpServer {
+    /// The server's name, whichever transport it uses.
+    pub fn name(&self) -> &str {
+        match self {
+            McpServer::Stdio(s) => &s.name,
+            McpServer::Http(h) => &h.name,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct EnvVar {
     pub name: String,

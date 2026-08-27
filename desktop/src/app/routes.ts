@@ -16,4 +16,5 @@ export const routes = rootRoute("root.tsx", [
     "/channels/$channelId/posts/$postId",
     "channels.$channelId.posts.$postId.tsx",
   ),
+  route("/computer/$sandboxId", "computer.$sandboxId.tsx"),
 ]);

@@ -1,4 +1,4 @@
-import { LogIn, SquareTerminal } from "lucide-react";
+import { LogIn, Monitor, SquareTerminal } from "lucide-react";
 import type * as React from "react";
 
 import { ChatHeader } from "@/features/chat/ui/ChatHeader";
@@ -9,6 +9,14 @@ import { getDmParticipantPreview } from "@/features/channels/lib/dmParticipantDi
 import { ChannelGlyph } from "@/features/channels/ui/ChannelGlyph";
 import { ChannelHeaderStatusBadge } from "@/features/channels/ui/ChannelHeaderStatusBadge";
 import { ChannelMembersBar } from "@/features/channels/ui/ChannelMembersBar";
+import { useAgentSandbox } from "@/features/agents/sandbox/useAgentSandbox";
+import { useHasEverHadComputer } from "@/features/agents/sandbox/computerEverAssignedStore";
+import {
+  toggleComputerPanel,
+  useComputerPanel,
+} from "@/features/agents/sandbox/computerPanelStore";
+import { startAndOpenComputer } from "@/features/agents/sandbox/sandboxLifecycle";
+import { toast } from "sonner";
 import {
   DEFAULT_HOVER_PROFILE_STATUS_GEOMETRY,
   ProfileAvatarWithStatus,
@@ -17,6 +25,7 @@ import {
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { Button } from "@/shared/ui/button";
 import type { Channel, PresenceStatus } from "@/shared/api/types";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import {
   toggleTerminalPanel,
@@ -74,6 +83,10 @@ export function ChannelScreenHeader({
     activeChannel?.channelType === "dm" &&
     activeDmHeaderParticipants.length > 1;
   const activeDmParticipant = activeDmHeaderParticipants[0] ?? null;
+  const activeDmJobTitle =
+    !isGroupDm && activeDmParticipant?.jobTitle
+      ? activeDmParticipant.jobTitle
+      : undefined;
   const showJoinButton =
     activeChannel !== null &&
     !activeChannel.isMember &&
@@ -96,6 +109,66 @@ export function ChannelScreenHeader({
       <SquareTerminal />
     </Button>
   ) : null;
+
+  // Only a 1:1 DM has a single "the agent I'm talking to" — group DMs and
+  // channels have no unambiguous counterpart to show a computer for.
+  const dmCounterpartPubkey =
+    activeChannel?.channelType === "dm" &&
+    activeDmHeaderParticipants.length === 1
+      ? activeDmHeaderParticipants[0].pubkey
+      : null;
+  const dmCounterpartSandbox = useAgentSandbox(dmCounterpartPubkey);
+  const dmCounterpartEverHadComputer =
+    useHasEverHadComputer(dmCounterpartPubkey);
+  const computerPanel = useComputerPanel();
+  const isComputerPanelOpenForCounterpart =
+    computerPanel.open &&
+    dmCounterpartPubkey !== null &&
+    computerPanel.ownerPubkey !== null &&
+    normalizePubkey(computerPanel.ownerPubkey) ===
+      normalizePubkey(dmCounterpartPubkey);
+  // Three states: never had a computer → no button; had one but it's gone
+  // (expired/stopped) → dim "asleep" button that starts a new one; live →
+  // bright button that opens the existing preview.
+  const computerButton =
+    activeChannel && dmCounterpartPubkey && dmCounterpartSandbox ? (
+      <Button
+        aria-label={
+          isComputerPanelOpenForCounterpart ? "Hide computer" : "Open computer"
+        }
+        onClick={() => toggleComputerPanel(dmCounterpartPubkey)}
+        size="icon"
+        title="Computer"
+        type="button"
+        variant={isComputerPanelOpenForCounterpart ? "secondary" : "outline"}
+      >
+        <Monitor />
+      </Button>
+    ) : activeChannel && dmCounterpartPubkey && dmCounterpartEverHadComputer ? (
+      <Button
+        aria-label="Start computer"
+        className="opacity-50 hover:opacity-80"
+        onClick={() => {
+          startAndOpenComputer(dmCounterpartPubkey).catch((err) => {
+            console.error(
+              "[ChannelScreenHeader] startAndOpenComputer failed:",
+              err,
+            );
+            toast.error(
+              err instanceof Error
+                ? err.message
+                : "Could not start a computer.",
+            );
+          });
+        }}
+        size="icon"
+        title="Computer (asleep)"
+        type="button"
+        variant="outline"
+      >
+        <Monitor />
+      </Button>
+    ) : null;
   const channelActions = activeChannel ? (
     showJoinButton ? (
       <div className="flex items-center gap-1">
@@ -126,8 +199,9 @@ export function ChannelScreenHeader({
     headerEndActions
   );
   const actions =
-    terminalButton || channelActions ? (
+    computerButton || terminalButton || channelActions ? (
       <div className="flex items-center gap-1">
+        {computerButton}
         {terminalButton}
         {channelActions}
       </div>
@@ -195,6 +269,7 @@ export function ChannelScreenHeader({
           ephemeralDisplay={activeChannelEphemeralDisplay}
         />
       }
+      subtitle={activeDmJobTitle}
       title={activeChannelTitle}
       transparentChrome={transparentChrome}
       visibility={activeChannel?.visibility}

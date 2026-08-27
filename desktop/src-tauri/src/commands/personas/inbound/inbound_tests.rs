@@ -12,6 +12,7 @@ fn local_in_app() -> AgentDefinition {
     AgentDefinition {
         id: UUID.to_string(),
         display_name: "Local".to_string(),
+        job_title: None,
         avatar_url: None,
         system_prompt: "local prompt".to_string(),
         runtime: Some("goose".to_string()),
@@ -39,6 +40,7 @@ fn inbound_for(d_tag: &str, display_name: &str) -> AgentDefinition {
     AgentDefinition {
         id: d_tag.to_string(),
         display_name: display_name.to_string(),
+        job_title: None,
         avatar_url: Some("https://example.com/a.png".to_string()),
         system_prompt: "remote prompt".to_string(),
         runtime: Some("acp".to_string()),
@@ -162,8 +164,10 @@ fn local_agent() -> ManagedAgentRecord {
         pubkey: AGENT_PUBKEY.to_string(),
         name: "Local Agent".to_string(),
         persona_id: Some("persona-local".to_string()),
+        job_title: None,
         private_key_nsec: "nsec1localsecret".to_string(),
         auth_tag: Some("localauthtag".to_string()),
+        sandbox_id: None,
         relay_url: "wss://relay.local".to_string(),
         avatar_url: None,
         acp_command: "buzz-acp".to_string(),

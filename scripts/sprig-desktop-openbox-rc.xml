@@ -1,0 +1,228 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Minimal openbox config for the agent's desktop.
+
+  The goal is to de-Linux the screen: a human taking over should see "a
+  purpose-built agent computer" — wallpaper visible, a handful of real
+  draggable windows (browser, file manager, terminal), a way to launch
+  them — not a stock Linux window manager. Desktop-switching keybinds stay
+  disabled (there is only one desktop, nothing to switch to). The
+  root-window right-click menu, previously disabled, is back — rebuilt
+  from scratch as a minimal styled launcher (exactly 4 entries, no
+  Debian/Reconfigure/Exit clutter openbox ships by default; see
+  sprig-desktop-menu.xml, referenced below via <menu><file>) — as a
+  secondary way to open a window alongside the primary one: the tint2
+  dock (sprig-desktop-tint2rc, started by supervise.sh) now docked at the
+  bottom of the screen. The launcher points at the BuzzDark theme
+  (sprig-desktop-theme/, installed to ~/.themes/BuzzDark) so window chrome
+  and the menu itself are flat and dark instead of openbox's stock 1990s
+  beveled look.
+
+  Chromium used to be forced fullscreen/undecorated here. Reverted: full
+  reasoning in sprig-desktop-supervise.sh above the chromium launch — the
+  short version is it hid the wallpaper and made the Computer view read as
+  "all Chrome" instead of a desktop. It is a normal decorated window now,
+  sized and positioned by supervise's window size and position flags
+  rather than by an openbox rule, so it starts large and centered but
+  stays fully draggable/resizable like every other window.
+
+  Openbox tolerates a config this small; anything not specified falls back
+  to its compiled-in defaults.
+-->
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <theme>
+    <name>BuzzDark</name>
+    <!-- L=label I=iconify M=maximize C=close. An earlier revision used
+         "LIM": windows had no close button at all. -->
+    <titleLayout>LIMC</titleLayout>
+    <keepBorder>yes</keepBorder>
+    <animateIconify>no</animateIconify>
+    <!-- Titlebar and menu fonts live HERE, not in the themerc: modern
+         openbox ignores font keys inside a theme file (they are a relic
+         of the 3.4-era format), so a "window.font" line in themerc
+         silently does nothing and the titlebar collapses to the default
+         tiny font's line height. The font size below is what actually
+         drives the titlebar's rendered height (bar = font line height +
+         2 x themerc padding.height). -->
+    <font place="ActiveWindow"><name>Inter</name><size>10</size><weight>Bold</weight><slant>Normal</slant></font>
+    <font place="InactiveWindow"><name>Inter</name><size>10</size><weight>Bold</weight><slant>Normal</slant></font>
+    <font place="MenuHeader"><name>Inter</name><size>10</size><weight>Bold</weight><slant>Normal</slant></font>
+    <font place="MenuItem"><name>Inter</name><size>10</size><weight>Normal</weight><slant>Normal</slant></font>
+    <font place="ActiveOnScreenDisplay"><name>Inter</name><size>10</size><weight>Bold</weight><slant>Normal</slant></font>
+    <font place="InactiveOnScreenDisplay"><name>Inter</name><size>10</size><weight>Normal</weight><slant>Normal</slant></font>
+  </theme>
+
+  <desktops>
+    <!-- Single desktop: nothing to switch between, so switching keybinds
+         and the pager have nothing to do even if triggered. -->
+    <number>1</number>
+  </desktops>
+
+  <keyboard>
+    <!-- A <keyboard> block overrides the compiled-in defaults (which
+         include desktop-switch keybinds this single-desktop setup doesn't
+         want). Alt-Tab is deliberately restored: launched windows of the
+         same app open at the same spot (openbox position rules pin them),
+         so a stacked window with no taskbar would otherwise be reachable
+         only by dragging the one above it away. -->
+    <keybind key="A-Tab">
+      <action name="NextWindow"><finalactions><action name="Focus"/><action name="Raise"/><action name="Unshade"/></finalactions></action>
+    </keybind>
+    <keybind key="A-S-Tab">
+      <action name="PreviousWindow"><finalactions><action name="Focus"/><action name="Raise"/><action name="Unshade"/></finalactions></action>
+    </keybind>
+  </keyboard>
+
+  <mouse>
+    <!-- A <mouse> block REPLACES openbox's entire compiled-in mouse
+         binding set, not just the contexts named inside it — this bit
+         once already: an earlier version of this file defined only the
+         Root context (for the right-click menu below) and, as a side
+         effect, silently deleted every other context's default bindings,
+         including Titlebar's built-in click-and-drag-to-move. The result
+         was windows that LOOKED decorated (real titlebar, real height)
+         but genuinely could not be dragged — confirmed with xdotool
+         mousedown/move/mouseup sequences that produced zero position
+         change, across several drag speeds and click-target theories,
+         before finding the real cause here. Every context below restates
+         openbox's own defaults for window interaction; only Root's
+         right-click is actually new. -->
+    <context name="Frame">
+      <mousebind button="A-Left" action="Press">
+        <action name="Focus" />
+        <action name="Raise" />
+      </mousebind>
+      <mousebind button="A-Left" action="Drag">
+        <action name="Move" />
+      </mousebind>
+      <mousebind button="A-Middle" action="Press">
+        <action name="Lower" />
+        <action name="FocusToBottom" />
+        <action name="Unfocus" />
+      </mousebind>
+      <mousebind button="A-Right" action="Press">
+        <action name="Focus" />
+        <action name="Raise" />
+      </mousebind>
+      <mousebind button="A-Right" action="Drag">
+        <action name="Resize" />
+      </mousebind>
+    </context>
+
+    <context name="Titlebar">
+      <mousebind button="Left" action="Press">
+        <action name="Focus" />
+        <action name="Raise" />
+      </mousebind>
+      <mousebind button="Left" action="Drag">
+        <action name="Move" />
+      </mousebind>
+      <mousebind button="Left" action="DoubleClick">
+        <action name="ToggleMaximize" />
+      </mousebind>
+      <mousebind button="Up" action="Click">
+        <action name="Shade" />
+      </mousebind>
+      <mousebind button="Down" action="Click">
+        <action name="Unshade" />
+      </mousebind>
+    </context>
+
+    <context name="Top"><mousebind button="Left" action="Press"><action name="Focus" /><action name="Raise" /></mousebind><mousebind button="Left" action="Drag"><action name="Resize" /></mousebind></context>
+    <context name="Left"><mousebind button="Left" action="Press"><action name="Focus" /><action name="Raise" /></mousebind><mousebind button="Left" action="Drag"><action name="Resize" /></mousebind></context>
+    <context name="Right"><mousebind button="Left" action="Press"><action name="Focus" /><action name="Raise" /></mousebind><mousebind button="Left" action="Drag"><action name="Resize" /></mousebind></context>
+    <context name="Bottom"><mousebind button="Left" action="Press"><action name="Focus" /><action name="Raise" /></mousebind><mousebind button="Left" action="Drag"><action name="Resize" /></mousebind></context>
+    <context name="TRCorner"><mousebind button="Left" action="Press"><action name="Focus" /><action name="Raise" /></mousebind><mousebind button="Left" action="Drag"><action name="Resize" /></mousebind></context>
+    <context name="TLCorner"><mousebind button="Left" action="Press"><action name="Focus" /><action name="Raise" /></mousebind><mousebind button="Left" action="Drag"><action name="Resize" /></mousebind></context>
+    <context name="BRCorner"><mousebind button="Left" action="Press"><action name="Focus" /><action name="Raise" /></mousebind><mousebind button="Left" action="Drag"><action name="Resize" /></mousebind></context>
+    <context name="BLCorner"><mousebind button="Left" action="Press"><action name="Focus" /><action name="Raise" /></mousebind><mousebind button="Left" action="Drag"><action name="Resize" /></mousebind></context>
+
+    <context name="Close">
+      <mousebind button="Left" action="Click">
+        <action name="Close" />
+      </mousebind>
+    </context>
+    <context name="Maximize">
+      <mousebind button="Left" action="Click">
+        <action name="ToggleMaximize" />
+      </mousebind>
+    </context>
+    <context name="Iconify">
+      <mousebind button="Left" action="Click">
+        <action name="Iconify" />
+      </mousebind>
+    </context>
+
+    <context name="Client">
+      <mousebind button="Left" action="Press">
+        <action name="Focus" />
+        <action name="Raise" />
+      </mousebind>
+    </context>
+
+    <context name="Root">
+      <mousebind button="Right" action="Press">
+        <action name="ShowMenu">
+          <menu>root-menu</menu>
+        </action>
+      </mousebind>
+    </context>
+  </mouse>
+
+  <menu>
+    <!-- The <menu> block in rc.xml is only a pointer to menu FILE(S), never
+         a container for inline menu items — an earlier version of this
+         file put a <menu id="root-menu"> definition directly in here, and
+         openbox silently ignored it (no parse error, no log line) and fell
+         back to the stock system menu.xml instead. The actual 4-entry
+         "Buzz" menu (New Browser Window / Files / Terminal / Close) lives
+         in the separate sprig-desktop-menu.xml, referenced here by its
+         installed filename. -->
+    <file>menu.xml</file>
+  </menu>
+
+  <applications>
+    <!-- Every window (Chromium, Thunar, the terminal) keeps normal
+         decorations — this is a real desktop now, not a single fullscreen
+         appliance. Chromium's initial size/position comes from its own
+         window size and position flags in supervise, not a rule here, so
+         it starts as a large centered window a human can still drag,
+         resize, and stack against the file manager or terminal.
+
+         Thunar and xfce4-terminal get explicit spawn size/position too:
+         openbox's default cascade placement opened them flush against the
+         top of the screen (y=0), leaving no room to draw a titlebar above
+         the client area, so a freshly launched window looked undecorated
+         even though it wasn't — the decoration was there, just clipped
+         off-screen. Thunar opens ~1000x650 center-left, the terminal
+         ~1100x700 near center-right, staggered from Chromium's own
+         position so all three are visible and overlapping on launch
+         rather than stacked exactly on top of each other. -->
+    <application class="*">
+      <decor>yes</decor>
+      <maximized>no</maximized>
+    </application>
+
+    <application class="Thunar">
+      <size>
+        <width>1000</width>
+        <height>650</height>
+      </size>
+      <position force="no">
+        <x>90</x>
+        <y>130</y>
+      </position>
+    </application>
+
+    <application class="Xfce4-terminal">
+      <size>
+        <width>1100</width>
+        <height>700</height>
+      </size>
+      <position force="no">
+        <x>750</x>
+        <y>200</y>
+      </position>
+    </application>
+  </applications>
+</openbox_config>

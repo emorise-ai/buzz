@@ -1,0 +1,188 @@
+# syntax=docker/dockerfile:1.7
+#
+# Sprig DESKTOP image — the agent gets a visible, shared Linux desktop.
+#
+# Built ON TOP of buzz-sprig-dev rather than beside it, so the agent keeps its
+# entire toolchain and multicall surface (buzz, rg, tree, git signing) and gains
+# a screen. One container, one filesystem: a file the agent writes with its file
+# tools is the same file the browser can upload, and a download lands where the
+# agent can read it. A separate browser-appliance container cannot do that
+# without extra plumbing.
+#
+# The point of this image is the HANDOFF. The agent drives Chromium over the
+# DevTools protocol while a human watches the same X display over VNC and can
+# take the mouse and keyboard at any moment — to log into a site, solve a
+# CAPTCHA, or approve something. Both controllers act on ONE browser profile,
+# so a session the human authenticates stays authenticated for the agent.
+# Credentials the human types are never handed to the model: they go into the
+# browser's own password store, not into the agent's context.
+#
+# Layers of the stack, innermost first:
+#   Xvfb        headless X server (the screen that exists without a monitor)
+#   openbox     window manager (so Chromium has decorations and focus)
+#   chromium    the actual browser, with --remote-debugging-port for the agent
+#   x11vnc      exports that X display over RFB
+#   websockify  wraps RFB in a websocket so a browser tab can be the client
+#   novnc       the in-browser client itself, served as static files
+#   ttyd        a web terminal (xterm.js over websocket) onto a real shell
+#   thunar      GUI file manager (opens /workspace) — GTK3, pairs with xfce4
+#   xfce4-term. GUI terminal, themed dark, separate from ttyd (see below)
+#   picom       compositor — soft window shadows and fade-in, nothing else
+#   tint2       native dock — launcher + taskbar, drawn inside the X display
+#
+# Everything is a Debian package except ttyd, which Debian does not package —
+# it is pinned by checksum below as a static binary straight from upstream.
+# No other third-party repos, no other vendored binaries.
+#
+# Direction shifted a few times: "de-Linux this, hide that it's Linux",
+# then "make it look like a real, familiar desktop — similar to Ubuntu",
+# then a file-manager swap once pcmanfm's GTK2 chrome turned out to be the
+# thing still reading as dated even with the Yaru theme applied (its
+# toolbar/menubar/icon set stayed GTK2-flavoured regardless of theming —
+# see the removed pcmanfm.conf's git history if this needs the full story).
+# The current shape: Yaru icons + Yaru-dark GTK3 chrome (Ubuntu's own
+# theme, packaged in Debian bookworm) applied to Thunar and xfce4-terminal
+# — both GTK3, both take Yaru cleanly — so the Computer view reads as an
+# actual known desktop environment instead of a bare/generic one. An
+# aubergine-tinted variant of the BuzzDark openbox titlebar theme keeps
+# window chrome from clashing with Yaru's signature purple-grey, real
+# fonts (Inter for UI, JetBrains Mono for code), and the navy-teal
+# wallpaper is kept as-is (not Ubuntu branding — that part stays ours).
+# New windows can still be launched from the root-window right-click menu
+# (styled by BuzzDark, see openbox-rc.xml), but the primary launcher is now
+# a tint2 dock (sprig-desktop-tint2rc) docked at the bottom of the screen.
+# tint2 was in this image once before and got pulled — not because it was
+# broken, but because it was redundant with an app-level (React) overlay
+# dock drawn on top of the screen iframe, so the human saw two docks at
+# once. That overlay dock is gone now (its icons and taskbar polling lived
+# entirely in desktop/, fed by the broker's /windows endpoint, which is
+# gone too), so tint2 is back as the ONE dock, native to the desktop itself:
+# it scales with the stream's real resolution (proportional in a sidebar
+# preview the same as fullscreen, which a screen-space overlay never was),
+# and its launcher reads real .desktop files, so any app dropped into this
+# image shows up with its actual icon instead of needing a hand-drawn one
+# added to the app's dock code. See sprig-desktop-tint2rc for the panel
+# config and how it avoids reserving screen space (_NET_WM_STRUT) that
+# would shift Chromium/Thunar/terminal's hand-tuned positions below.
+#
+# Two terminals exist for two different jobs: ttyd is the one the broker's
+# web viewer and the agent's own shell access go through (no GUI needed,
+# works over a plain browser tab, styled via ttyd's -t client options in
+# supervise since it renders in the HUMAN's browser, not this container);
+# xfce4-terminal is a normal window in the Computer view for when a human
+# wants a terminal alongside Thunar and Chromium without leaving the
+# desktop. Neither replaces the other.
+#
+# ~/.gtkrc-2.0 (GTK2 config) is still installed even though nothing in the
+# current app set links GTK2 — Thunar and xfce4-terminal are both GTK3.
+# It is harmless dead weight (a handful of text lines) rather than
+# something worth ripping out: any future GTK2 app dropped into this image
+# picks up Yaru-dark automatically instead of silently defaulting to the
+# stock light theme the way pcmanfm once did.
+
+ARG BASE=buzz-sprig-dev:latest
+FROM ${BASE}
+
+USER root
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    DISPLAY=:1 \
+    SCREEN_GEOMETRY=1920x1080x24 \
+    VNC_PORT=5901 \
+    DESKTOP_PORT=6080 \
+    CDP_PORT=9222 \
+    TERMINAL_PORT=7681
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      adwaita-icon-theme \
+      ca-certificates \
+      chromium \
+      curl \
+      dbus-x11 \
+      ffmpeg \
+      fontconfig \
+      fonts-inter \
+      fonts-jetbrains-mono \
+      fonts-liberation \
+      fonts-noto-color-emoji \
+      gnome-themes-extra \
+      novnc \
+      openbox \
+      picom \
+      procps \
+      scrot \
+      thunar \
+      tint2 \
+      websockify \
+      x11-utils \
+      x11-xserver-utils \
+      x11vnc \
+      xdotool \
+      xfce4-terminal \
+      xvfb \
+      xwallpaper \
+      yaru-theme-gtk \
+      yaru-theme-icon \
+    && rm -rf /var/lib/apt/lists/*
+
+# Google Chrome was tried here (2026-08-17, user request) and REVERTED: the
+# official build SIGTRAPs on startup inside this hardened container — its
+# crashpad crash reporter fails under cap-drop ALL + no-new-privileges
+# ("chrome_crashpad_handler: --database is required" then Trace/breakpoint
+# trap), verified live with --disable-crashpad/--disable-crash-reporter/
+# --crash-dumps-dir/--headless=new and even --cap-add SYS_PTRACE — all trap.
+# Debian's Chromium is built without that layer and runs fine; it is the
+# same engine and identical UI. Do not re-add Chrome without solving the
+# crashpad-in-hardened-container problem first.
+
+# ttyd: no Debian package exists, so pull the static upstream binary and pin
+# it by checksum (published alongside the release as SHA256SUMS).
+ARG TTYD_VERSION=1.7.7
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) ttyd_arch=x86_64; ttyd_sha=8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be4f55 ;; \
+      arm64) ttyd_arch=aarch64; ttyd_sha=b38acadd89d1d396a0f5649aa52c539edbad07f4bc7348b27b4f4b7219dd4165 ;; \
+      *) echo "unsupported architecture for ttyd: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /usr/local/bin/ttyd \
+      "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.${ttyd_arch}"; \
+    echo "${ttyd_sha}  /usr/local/bin/ttyd" | sha256sum -c -; \
+    chmod 0755 /usr/local/bin/ttyd
+
+# Chromium's profile and the VNC state live under the agent's home, which is
+# where a volume gets mounted — that is what makes a login survive a restart.
+RUN install -d -o agent -g agent \
+      /home/agent/.config/chromium \
+      /home/agent/.config/openbox \
+      /home/agent/.config/gtk-3.0 \
+      /home/agent/.config/fontconfig \
+      /home/agent/.config/xfce4/terminal \
+      /home/agent/.config/tint2 \
+      /home/agent/.local/share/applications \
+      /home/agent/.themes/BuzzDark \
+      /home/agent/.vnc \
+      /home/agent/Downloads
+
+COPY --chmod=0755 scripts/sprig-desktop-browser.sh /usr/local/bin/buzz-browser
+COPY --chmod=0755 scripts/sprig-desktop-entrypoint.sh /usr/local/bin/sprig-desktop-entrypoint
+COPY --chmod=0755 scripts/sprig-desktop-supervise.sh /usr/local/bin/sprig-desktop-supervise
+COPY --chown=agent:agent scripts/sprig-desktop-openbox-rc.xml /home/agent/.config/openbox/rc.xml
+COPY --chown=agent:agent scripts/sprig-desktop-menu.xml /home/agent/.config/openbox/menu.xml
+COPY --chown=agent:agent scripts/sprig-desktop-start.html /home/agent/.buzz-start.html
+COPY --chown=agent:agent scripts/sprig-desktop-wallpaper.png /home/agent/.buzz-wallpaper.png
+COPY --chown=agent:agent scripts/sprig-desktop-theme/ /home/agent/.themes/BuzzDark/
+COPY --chown=agent:agent scripts/sprig-desktop-gtk3-settings.ini /home/agent/.config/gtk-3.0/settings.ini
+COPY --chown=agent:agent scripts/sprig-desktop-gtkrc-2.0 /home/agent/.gtkrc-2.0
+COPY --chown=agent:agent scripts/sprig-desktop-fontconfig.conf /home/agent/.config/fontconfig/fonts.conf
+COPY --chown=agent:agent scripts/sprig-desktop-picom.conf /home/agent/.config/picom.conf
+COPY --chown=agent:agent scripts/sprig-desktop-terminalrc /home/agent/.config/xfce4/terminal/terminalrc
+COPY --chown=agent:agent scripts/sprig-desktop-tint2rc /home/agent/.config/tint2/tint2rc
+COPY --chown=agent:agent scripts/sprig-desktop-thunar.desktop /home/agent/.local/share/applications/sprig-thunar.desktop
+
+USER agent
+WORKDIR /home/agent
+
+# Same contract as the base image: the entrypoint execs the harness as PID 1
+# after starting the desktop in the background, so buzz-acp still receives
+# SIGTERM directly and the L1 signal obligation holds.
+ENTRYPOINT ["/usr/local/bin/sprig-desktop-entrypoint"]

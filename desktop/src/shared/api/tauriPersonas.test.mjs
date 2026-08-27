@@ -28,3 +28,11 @@ test("fromRawPersona maps source_team to sourceTeam", () => {
 
   assert.equal(persona.sourceTeam, "team-research");
 });
+
+test("fromRawPersona maps an optional job title and supports legacy payloads", () => {
+  assert.equal(
+    fromRawPersona(rawPersona({ job_title: "Principal Researcher" })).jobTitle,
+    "Principal Researcher",
+  );
+  assert.equal(fromRawPersona(rawPersona()).jobTitle, null);
+});

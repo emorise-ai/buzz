@@ -22,16 +22,91 @@ use crate::usage::{
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 
+/// The tool name a `session/request_permission` request is about.
+///
+/// Adapters place it differently, so the known locations are tried in turn
+/// rather than assuming one shape.
+fn tool_name_of(msg: &serde_json::Value) -> Option<&str> {
+    let p = msg.get("params")?;
+    p.get("toolCall")
+        .and_then(|t| t.get("title").or_else(|| t.get("name")))
+        .or_else(|| p.get("toolName"))
+        .or_else(|| p.get("title"))
+        .and_then(|v| v.as_str())
+}
+
 /// An MCP server configuration passed to `session/new`.
 ///
-/// Corresponds to the `McpServerStdio` variant in the ACP schema.
-/// All four fields are **required** by the schema (`args` and `env` may be empty arrays).
+/// Two transports, because the tools do not always run beside the model.
+///
+/// * **Stdio** — the agent spawns the tool server as a child process and speaks
+///   over the pipe. The process boundary is the trust boundary.
+/// * **Http** — the tool server runs elsewhere (a sandbox on another host) and
+///   the agent drives it over the network. Used when the reasoning model, and
+///   its LLM credential, deliberately stay off the machine being controlled.
+///
+/// `Http` is only legal when the agent advertises `mcpCapabilities.http` in its
+/// `initialize` response; sending it to an agent that does not is a protocol
+/// error, so callers must check first.
+///
+/// Serialized untagged with an explicit `type` field in each variant, matching
+/// the ACP schema's discriminated union.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct McpServer {
+#[serde(untagged)]
+pub enum McpServer {
+    /// `McpServerStdio`. All four fields are **required** by the schema
+    /// (`args` and `env` may be empty arrays).
+    Stdio {
+        name: String,
+        command: String,
+        args: Vec<String>,
+        env: Vec<EnvVar>,
+    },
+    /// `McpServerHttp`. Credentials belong in `headers`, which the agent sends
+    /// on every request to `url`.
+    Http {
+        #[serde(rename = "type")]
+        transport: HttpTransportTag,
+        name: String,
+        url: String,
+        headers: Vec<HttpHeader>,
+    },
+}
+
+/// Transport-agnostic readers, so assertions do not have to match on the
+/// variant to check a field every server has.
+#[cfg(test)]
+impl McpServer {
+    /// The server's name, whichever transport it uses.
+    pub fn name(&self) -> &str {
+        match self {
+            McpServer::Stdio { name, .. } | McpServer::Http { name, .. } => name,
+        }
+    }
+
+    /// The environment passed to a stdio server. Empty for remote servers,
+    /// whose environment is fixed where they run.
+    pub fn env(&self) -> &[EnvVar] {
+        match self {
+            McpServer::Stdio { env, .. } => env,
+            McpServer::Http { .. } => &[],
+        }
+    }
+}
+
+/// The `type` discriminator for the HTTP variant. A single-valued enum rather
+/// than a bare string so the discriminator cannot be set to anything else.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub enum HttpTransportTag {
+    #[serde(rename = "http")]
+    Http,
+}
+
+/// One HTTP header sent with every request to a remote MCP server.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HttpHeader {
     pub name: String,
-    pub command: String,
-    pub args: Vec<String>,
-    pub env: Vec<EnvVar>,
+    pub value: String,
 }
 
 /// A single environment variable for an MCP server.
@@ -156,6 +231,12 @@ pub struct AcpClient {
     /// Used by [`cancel_with_cleanup`](AcpClient::cancel_with_cleanup) to send
     /// a `cancelled` outcome before the agent returns from `session/prompt`.
     pending_permission_id: Option<serde_json::Value>,
+    /// Tool-name substrings the operator has excluded, lowercased.
+    ///
+    /// Empty by default. Non-empty when the agent must be steered away from a
+    /// tool it would otherwise prefer — most usefully its built-in shell, when
+    /// the work is supposed to happen in a remote sandbox.
+    denied_tools: Vec<String>,
     /// Whether we have already sent a response to the pending permission request.
     /// Guards against double-response if a timeout fires after the allow_once
     /// response was written but before `pending_permission_id` was cleared.
@@ -551,6 +632,13 @@ impl AcpClient {
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
             pending_permission_id: None,
+            // Populated by the caller; empty means every tool is permitted.
+            denied_tools: std::env::var("BUZZ_ACP_DENY_TOOLS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|t| t.trim().to_ascii_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect(),
             permission_responded: false,
             last_prompt_id: None,
             current_hard_deadline: None,
@@ -1953,6 +2041,44 @@ impl AcpClient {
             options.len()
         );
 
+        // Deny a tool the operator has excluded.
+        //
+        // This is the lever that makes a remote sandbox actually get used. An
+        // agent with its own built-in shell will reach for that rather than an
+        // MCP tool doing the same job, so the sandbox sits connected and idle
+        // while commands run on the host the agent happens to be on. ACP
+        // already asks permission per tool call, so the answer is to say no:
+        // denied once, the agent falls back to the MCP tool that remains.
+        //
+        // Matched as a substring against the tool name, because adapters
+        // qualify names differently (`Bash`, `mcp__x__shell`) and an operator
+        // should not have to know which form a given agent uses.
+        let denied = self.denied_tools.iter().find(|needle| {
+            tool_name_of(msg).is_some_and(|name| name.to_ascii_lowercase().contains(&**needle))
+        });
+        if let Some(needle) = denied {
+            let name = tool_name_of(msg).unwrap_or_default();
+            tracing::info!(
+                target: "acp::permission",
+                "denying tool {name:?} (matches excluded {needle:?})"
+            );
+            let reject = options
+                .iter()
+                .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("reject_once"));
+            if let Some(opt) = reject {
+                let option_id = opt["optionId"].as_str().unwrap_or("reject");
+                let response = permission_response_selected(&id, option_id);
+                self.write_ndjson(&response).await?;
+                self.permission_responded = true;
+                self.pending_permission_id = None;
+                return Ok(());
+            }
+            tracing::warn!(
+                target: "acp::permission",
+                "tool {name:?} is excluded but the agent offered no reject option; allowing"
+            );
+        }
+
         // Find allow_once by kind — NEVER hardcode optionId.
         let allow_once = options
             .iter()
@@ -2489,6 +2615,43 @@ mod tests {
     }
 
     #[test]
+    fn tool_name_is_found_wherever_the_adapter_puts_it() {
+        let shapes = [
+            serde_json::json!({"params":{"toolCall":{"title":"Bash"}}}),
+            serde_json::json!({"params":{"toolCall":{"name":"Bash"}}}),
+            serde_json::json!({"params":{"toolName":"Bash"}}),
+            serde_json::json!({"params":{"title":"Bash"}}),
+        ];
+        for m in shapes {
+            assert_eq!(tool_name_of(&m), Some("Bash"), "shape not handled: {m}");
+        }
+        assert_eq!(tool_name_of(&serde_json::json!({"params":{}})), None);
+    }
+
+    /// Matching is case-insensitive and by substring, so an operator excluding
+    /// "bash" catches `Bash` and `mcp__local__bash` alike without knowing which
+    /// spelling a given adapter uses.
+    #[test]
+    fn denial_matches_a_qualified_tool_name() {
+        let denied = ["bash".to_string()];
+        for name in ["Bash", "bash", "mcp__local__Bash"] {
+            let msg = serde_json::json!({"params":{"toolCall":{"title":name}}});
+            assert!(
+                denied.iter().any(|n| tool_name_of(&msg)
+                    .is_some_and(|t| t.to_ascii_lowercase().contains(n.as_str()))),
+                "{name} should be denied"
+            );
+        }
+        // The sandbox's own shell must survive a "bash" exclusion.
+        let sandbox = serde_json::json!({"params":{"toolCall":{"title":"mcp__sandbox__shell"}}});
+        assert!(
+            !denied.iter().any(|n| tool_name_of(&sandbox)
+                .is_some_and(|t| t.to_ascii_lowercase().contains(n.as_str()))),
+            "the remote shell must remain allowed"
+        );
+    }
+
+    #[test]
     fn initialize_request_format() {
         let msg = serde_json::json!({
             "jsonrpc": "2.0",
@@ -2524,7 +2687,7 @@ mod tests {
     #[test]
     fn session_new_mcp_server_has_required_fields() {
         // Schema requires name, command, args, env — all present, args/env may be empty.
-        let server = McpServer {
+        let server = McpServer::Stdio {
             name: "test-mcp".into(),
             command: "/usr/local/bin/test-mcp-server".into(),
             args: vec![],

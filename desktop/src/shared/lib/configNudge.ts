@@ -144,7 +144,9 @@ function isConfigNudgeRequirement(v: unknown): v is ConfigNudgeRequirement {
     case "normalized_field":
       return typeof r.field === "string";
     case "env_key":
-      return typeof r.key === "string";
+      return (
+        typeof r.key === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(r.key)
+      );
     case "cli_login":
       return (
         Array.isArray(r.probe_args) &&

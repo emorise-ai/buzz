@@ -18,6 +18,7 @@ import { Badge } from "@/shared/ui/badge";
 import { IdentityCardSkeleton } from "@/shared/ui/identity-card-skeleton";
 import { AgentIdentityCard } from "./AgentIdentityCard";
 import { AgentRuntimeAvatarControl } from "./AgentRuntimeAvatarControl";
+import { AgentSandboxCardIndicator } from "@/features/agents/sandbox/AgentSandboxCardIndicator";
 import { CreateIdentityCard } from "./CreateIdentityCard";
 import { PersonaActionsMenu } from "./PersonaActionsMenu";
 import { buildUnifiedGroups } from "./unifiedAgentGroups";
@@ -310,7 +311,11 @@ function AgentPersonaCard({
         )
       }
       avatarUrl={avatarUrl}
+      cornerBadge={
+        agent ? <AgentSandboxCardIndicator agentPubkey={agent.pubkey} /> : null
+      }
       dataTestId={`persona-agent-row-${persona.id}`}
+      jobTitle={persona.jobTitle}
       label={title}
       modelLabel={modelLabel}
       onClick={() => {
@@ -392,7 +397,9 @@ function StandaloneAgentCard({
         />
       }
       avatarUrl={profileQuery.data?.avatarUrl}
+      cornerBadge={<AgentSandboxCardIndicator agentPubkey={agent.pubkey} />}
       dataTestId={`managed-agent-${agent.pubkey}`}
+      jobTitle={agent.jobTitle}
       label={title}
       modelLabel={resolveAgentCardModelLabel({
         agent,

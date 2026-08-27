@@ -123,6 +123,7 @@ fn built_in_persona_records(now: &str) -> Vec<AgentDefinition> {
         .map(|persona| AgentDefinition {
             id: persona.id.to_string(),
             display_name: persona.display_name.to_string(),
+            job_title: None,
             avatar_url: persona.avatar_url.map(|s| s.to_string()),
             system_prompt: persona.system_prompt.to_string(),
             runtime: persona.runtime.map(|s| s.to_string()),

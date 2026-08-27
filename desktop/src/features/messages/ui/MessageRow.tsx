@@ -44,6 +44,7 @@ import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
 import type { VideoReviewContext } from "@/shared/ui/VideoPlayer";
 import { VideoReviewCommentMarkdown } from "@/shared/ui/VideoReviewCommentMarkdown";
 import { MessageActionBar } from "./MessageActionBar";
+import { MessageAgentComputerIndicator } from "@/features/agents/sandbox/MessageAgentComputerIndicator";
 import { editMessage } from "@/shared/api/tauri";
 import { hasLinkPreviewSuppression } from "@/features/messages/lib/formatTimelineMessages";
 import { toast } from "sonner";
@@ -60,16 +61,12 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { getAgentAddressMentionPubkeys } from "@/features/messages/lib/agentAddressMention.mjs";
 import { getVisibleAgentAddressPubkeys } from "@/features/messages/lib/getVisibleAgentAddressPubkeys";
 import { MessageAgentAddressPrefix } from "./MessageAgentAddressPrefix";
+import type { ThreadDepthGuideAction } from "./MessageRow.types";
+
+export type { ThreadDepthGuideAction } from "./MessageRow.types";
 
 const DiffMessage = React.lazy(() => import("./DiffMessage"));
 const DiffMessageExpanded = React.lazy(() => import("./DiffMessageExpanded"));
-
-export type ThreadDepthGuideAction = {
-  active?: boolean;
-  depth: number;
-  label: string;
-  message: TimelineMessage;
-};
 
 export const MessageRow = React.memo(
   function MessageRow({
@@ -559,7 +556,6 @@ export const MessageRow = React.memo(
         ownerPubkey={message.ownerPubkey}
       />
     ) : null;
-
     const actionBarNode = (
       <div
         className={cn(
@@ -667,6 +663,10 @@ export const MessageRow = React.memo(
         <MessageMetaSegments
           segments={[
             { key: "owner", node: agentOwnerNode },
+            {
+              key: "computer",
+              node: <MessageAgentComputerIndicator message={message} />,
+            },
             { key: "timestamp", node: inlineMetadataNode },
             { key: "persona", node: personaNode },
           ]}

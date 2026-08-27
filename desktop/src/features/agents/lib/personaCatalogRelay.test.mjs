@@ -14,6 +14,7 @@ function publication(overrides = {}) {
     createdAt: 1,
     agent: {
       displayName: "Relay Reviewer",
+      jobTitle: null,
       avatarUrl: null,
       systemPrompt: "Review changes.",
       runtime: null,
@@ -156,4 +157,22 @@ test("test_own_publication_still_resolves_by_local_id", () => {
 
   assert.equal(personas[0].id, "reviewer");
   assert.equal(personas[0].catalogSource.isOwn, true);
+});
+
+test("a shared persona carries its optional job title", () => {
+  const personas = catalogPersonasFromPublications(
+    [
+      publication({
+        agent: {
+          ...publication().agent,
+          displayName: "Avery",
+          jobTitle: "Principal Researcher",
+        },
+      }),
+    ],
+    [],
+    BOB,
+  );
+
+  assert.equal(personas[0].jobTitle, "Principal Researcher");
 });

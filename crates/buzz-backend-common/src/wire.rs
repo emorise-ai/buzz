@@ -1,7 +1,7 @@
 //! The stdin/stdout JSON protocol (spec §Provider Protocol).
 //!
 //! One process per operation: one JSON object in, one JSON object out.
-//! These types are this provider's view of the contract; the golden fixtures
+//! These types are the shared view of the contract; the golden fixtures
 //! in `tests/fixtures/provider-wire/` are the arbiter shared with the desktop.
 
 use serde::{Deserialize, Serialize};
@@ -125,17 +125,25 @@ impl Response {
         })
     }
 
-    /// The provider's self-description (spec §Info). Pure — no cluster
-    /// contact — because the desktop calls it to render the config form
-    /// before a kubeconfig is known to exist.
-    pub fn info() -> Self {
+    /// The provider's self-description (spec §Info).
+    ///
+    /// Pure — no substrate contact — because the desktop calls it to render the
+    /// config form before any credential is known to exist. The three
+    /// substrate-specific values are supplied by the binding; everything else
+    /// about the protocol is identical across substrates, which is why this
+    /// lives here rather than being copied into each one.
+    pub fn info(
+        name: &'static str,
+        description: &'static str,
+        config_schema: serde_json::Value,
+    ) -> Self {
         Response::Info(InfoResponse {
             ok: true,
-            name: "kubernetes",
+            name,
             version: env!("CARGO_PKG_VERSION"),
             protocol_version: PROTOCOL_VERSION,
-            description: "Runs agents as pods in a Kubernetes cluster",
-            config_schema: crate::config::config_schema(),
+            description,
+            config_schema,
         })
     }
 
