@@ -95,7 +95,7 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
             validate_agent_definition_text(&display_name, &system_prompt)?;
             let avatar_url = trim_optional(input.avatar_url);
             let job_title_present = input.job_title.is_some();
-            let job_title = input.job_title.map(normalize_optional_job_title).flatten();
+            let job_title = input.job_title.and_then(normalize_optional_job_title);
             if let Some(job_title) = job_title.as_deref() {
                 validate_optional_job_title(Some(job_title))?;
             }
