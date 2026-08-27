@@ -1152,6 +1152,8 @@ pub(crate) fn format_event_block(
         block.push_str(&format!("\nTags: {tags_str}"));
     }
 
+    append_attachment_instructions(&mut block, &be.event);
+
     // Parsed structural fields.
     let thread = parse_thread_tags(&be.event);
     let mut parsed_parts = Vec::new();
@@ -1179,6 +1181,79 @@ pub(crate) fn format_event_block(
     }
 
     block
+}
+
+/// Turn NIP-92 `imeta` metadata into an actionable attachment handoff.
+///
+/// Buzz messages carry attachment references, not inline bytes. The ACP
+/// harness and its tools already inherit the relay URL and signer, so the
+/// agent can authenticate a Blossom GET with `buzz media get`. Making that
+/// operation explicit prevents a model from treating "see attached" as text-
+/// only context or asking the user to upload the same file somewhere else.
+fn append_attachment_instructions(block: &mut String, event: &Event) {
+    let mut attachments = Vec::new();
+
+    for tag in event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind().to_string() == "imeta")
+    {
+        let mut url = None;
+        let mut mime = None;
+        let mut hash = None;
+        let mut filename = None;
+
+        for field in tag.as_slice().iter().skip(1) {
+            let Some((key, value)) = field.split_once(' ') else {
+                continue;
+            };
+            match key {
+                "url" => url = Some(value),
+                "m" => mime = Some(value),
+                "x" => hash = Some(value),
+                "filename" => filename = Some(value),
+                _ => {}
+            }
+        }
+
+        if let Some(url) = url {
+            attachments.push((url, mime, hash, filename));
+        }
+    }
+
+    if attachments.is_empty() {
+        return;
+    }
+
+    block.push_str(
+        "\nAttachments: These files are already stored in Buzz; their bytes are not embedded in the text above.",
+    );
+    for (index, (url, mime, hash, filename)) in attachments.into_iter().enumerate() {
+        let local_path = format!(
+            "/tmp/buzz-attachment-{}-{}",
+            &event.id.to_hex()[..12],
+            index + 1
+        );
+        block.push_str(&format!(
+            "\n- Attachment {}: url={url}; mime={}; sha256={}; filename={}",
+            index + 1,
+            mime.unwrap_or("unknown"),
+            hash.unwrap_or("unknown"),
+            filename.unwrap_or("unnamed"),
+        ));
+        block.push_str(&format!(
+            "\n  Fetch it with: buzz media get \"{url}\" --output \"{local_path}\""
+        ));
+        if mime.is_some_and(|value| value.starts_with("image/")) {
+            block.push_str(&format!(
+                "\n  Before making any visual claim, inspect \"{local_path}\" with your image-viewing tool. Do not infer its pixels from the filename, message text, or metadata."
+            ));
+        } else {
+            block.push_str(&format!(
+                "\n  Inspect the downloaded file at \"{local_path}\" with an appropriate local tool before answering about its contents."
+            ));
+        }
+    }
 }
 
 /// Append a reply instruction when the agent is responding to a thread event.
@@ -4246,6 +4321,63 @@ mod tests {
             prompt.contains("Tags:"),
             "tags should always be included, even for stream messages"
         );
+    }
+
+    #[test]
+    fn test_format_event_block_makes_buzz_image_attachment_actionable() {
+        let ch = Uuid::new_v4();
+        let hash = "a".repeat(64);
+        let url = format!("https://relay.example.com/media/{hash}.png");
+        let event = make_event_with_tags(
+            "Please match the attached CAD image exactly.",
+            vec![vec![
+                "imeta".into(),
+                format!("url {url}"),
+                "m image/png".into(),
+                format!("x {hash}"),
+                "size 1234".into(),
+                "filename outdoor-kitchen.png".into(),
+            ]],
+        );
+        let event_id = event.id.to_hex();
+        let block = format_event_block(
+            ch,
+            None,
+            &BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            },
+            None,
+        );
+
+        assert!(block.contains("These files are already stored in Buzz"));
+        assert!(block.contains(&format!(
+            "buzz media get \"{url}\" --output \"/tmp/buzz-attachment-{}-1\"",
+            &event_id[..12]
+        )));
+        assert!(block.contains("mime=image/png"));
+        assert!(block.contains("filename=outdoor-kitchen.png"));
+        assert!(block.contains("Before making any visual claim"));
+        assert!(block.contains("with your image-viewing tool"));
+    }
+
+    #[test]
+    fn test_format_event_block_does_not_invent_attachment_steps_without_imeta() {
+        let event = make_event("plain message");
+        let block = format_event_block(
+            Uuid::new_v4(),
+            None,
+            &BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            },
+            None,
+        );
+
+        assert!(!block.contains("Attachments:"));
+        assert!(!block.contains("buzz media get"));
     }
 
     #[test]
