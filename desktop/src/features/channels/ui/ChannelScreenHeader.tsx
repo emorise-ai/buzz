@@ -6,6 +6,7 @@ import type { EphemeralChannelDisplay } from "@/features/channels/lib/ephemeralC
 import type { ActiveDmHeaderParticipant } from "@/features/channels/useActiveChannelHeader";
 import { getChannelDescription } from "@/features/channels/lib/channelDescription";
 import { getDmParticipantPreview } from "@/features/channels/lib/dmParticipantDisplay";
+import { ChannelGlyph } from "@/features/channels/ui/ChannelGlyph";
 import { ChannelHeaderStatusBadge } from "@/features/channels/ui/ChannelHeaderStatusBadge";
 import { ChannelMembersBar } from "@/features/channels/ui/ChannelMembersBar";
 import { useAgentSandbox } from "@/features/agents/sandbox/useAgentSandbox";
@@ -47,6 +48,7 @@ type ChannelScreenHeaderProps = {
   activeDmPresenceStatus: PresenceStatus | null;
   chromeWrapperRef?: React.Ref<HTMLDivElement>;
   currentPubkey?: string;
+  headerEndActions?: React.ReactNode;
   isAddBotOpen?: boolean;
   isJoining?: boolean;
   showHeaderContent?: boolean;
@@ -67,6 +69,7 @@ export function ChannelScreenHeader({
   activeDmPresenceStatus,
   chromeWrapperRef,
   currentPubkey,
+  headerEndActions,
   isAddBotOpen,
   isJoining = false,
   onAddBotOpenChange,
@@ -168,19 +171,23 @@ export function ChannelScreenHeader({
     ) : null;
   const channelActions = activeChannel ? (
     showJoinButton ? (
-      <Button
-        disabled={isJoining}
-        onClick={() => void onJoinChannel()}
-        size="sm"
-        variant="default"
-      >
-        <LogIn className="mr-1.5 h-4 w-4" />
-        {isJoining ? "Joining…" : "Join"}
-      </Button>
+      <div className="flex items-center gap-1">
+        <Button
+          disabled={isJoining}
+          onClick={() => void onJoinChannel()}
+          size="sm"
+          variant="default"
+        >
+          <LogIn className="mr-1.5 h-4 w-4" />
+          {isJoining ? "Joining…" : "Join"}
+        </Button>
+        {headerEndActions}
+      </div>
     ) : (
       <ChannelMembersBar
         channel={activeChannel}
         currentPubkey={currentPubkey}
+        endActions={headerEndActions}
         isAddBotOpen={isAddBotOpen}
         onAddBotOpenChange={onAddBotOpenChange}
         onManageChannel={onManageChannel}
@@ -188,14 +195,17 @@ export function ChannelScreenHeader({
         variant={actionsVariant}
       />
     )
-  ) : null;
-  const actions = activeChannel ? (
-    <div className="flex items-center gap-1">
-      {computerButton}
-      {terminalButton}
-      {channelActions}
-    </div>
-  ) : null;
+  ) : (
+    headerEndActions
+  );
+  const actions =
+    computerButton || terminalButton || channelActions ? (
+      <div className="flex items-center gap-1">
+        {computerButton}
+        {terminalButton}
+        {channelActions}
+      </div>
+    ) : null;
 
   if (!showHeaderContent) {
     return null;
@@ -247,6 +257,11 @@ export function ChannelScreenHeader({
               testId="chat-header-dm-avatar"
             />
           )
+        ) : activeChannel ? (
+          <ChannelGlyph
+            channel={activeChannel}
+            className="h-4 w-4 translate-y-px text-muted-foreground"
+          />
         ) : undefined
       }
       statusBadge={

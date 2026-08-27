@@ -90,7 +90,12 @@ async function resetCommunityState({
 }
 
 type CommunityInitResult =
-  | { isReady: true; needsSetup: false; appliedKey: string }
+  | {
+      isReady: true;
+      needsSetup: false;
+      appliedKey: string;
+      identityPubkey: string | null;
+    }
   | {
       isReady: false;
       needsSetup: true;
@@ -348,6 +353,7 @@ export function useCommunityInit(
           isReady: true,
           needsSetup: false,
           appliedKey: communityKey,
+          identityPubkey,
         });
       }
     }

@@ -1,6 +1,5 @@
 import * as React from "react";
 import { AlertTriangle } from "lucide-react";
-
 import {
   depthGuideActionsEqual,
   numberArrayEqual,
@@ -60,6 +59,7 @@ import { SentFromThreadLine } from "./SentFromThreadLine";
 import { WaveMessageAttachment } from "./WaveMessageAttachment";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { getAgentAddressMentionPubkeys } from "@/features/messages/lib/agentAddressMention.mjs";
+import { getVisibleAgentAddressPubkeys } from "@/features/messages/lib/getVisibleAgentAddressPubkeys";
 import { MessageAgentAddressPrefix } from "./MessageAgentAddressPrefix";
 
 const DiffMessage = React.lazy(() => import("./DiffMessage"));
@@ -281,10 +281,12 @@ export const MessageRow = React.memo(
       return Object.keys(values).length > 0 ? values : undefined;
     }, [isKnownAgentPubkey, mentionPubkeysByName]);
     const addressedAgentPubkeys = React.useMemo(() => {
-      return getAgentAddressMentionPubkeys(message.tags).filter(
-        isKnownAgentPubkey,
+      return getVisibleAgentAddressPubkeys(
+        message.body,
+        getAgentAddressMentionPubkeys(message.tags).filter(isKnownAgentPubkey),
+        mentionPubkeysByName,
       );
-    }, [isKnownAgentPubkey, message.tags]);
+    }, [isKnownAgentPubkey, mentionPubkeysByName, message.body, message.tags]);
     const agentAddressPrefix =
       addressedAgentPubkeys.length > 0 ? (
         <MessageAgentAddressPrefix
@@ -397,6 +399,7 @@ export const MessageRow = React.memo(
                   setExpandedDiffId(message.id);
                 }}
                 repoUrl={getTag("repo")}
+                searchQuery={searchQuery}
                 truncated={getTag("truncated") === "true"}
               />
             </React.Suspense>
@@ -418,6 +421,7 @@ export const MessageRow = React.memo(
                 fallbackText={waveMessage.fallbackText}
                 huddleMemberPubkeys={huddleMemberPubkeys}
                 huddleMemberPubkeysPending={huddleMemberPubkeysPending}
+                searchQuery={searchQuery}
               />
             );
           }
