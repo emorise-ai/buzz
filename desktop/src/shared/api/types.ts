@@ -1,7 +1,6 @@
 export type ChannelType = "stream" | "forum" | "dm";
 export type ChannelVisibility = "open" | "private";
 export type ChannelRole = "owner" | "admin" | "member" | "guest" | "bot";
-
 export type Channel = {
   id: string;
   name: string;
@@ -46,9 +45,6 @@ export type CreateChannelInput = {
   visibility: ChannelVisibility;
   description?: string;
   ttlSeconds?: number;
-};
-export type OpenDmInput = {
-  pubkeys: string[];
 };
 export type UpdateChannelInput = {
   channelId: string;
