@@ -3,6 +3,7 @@ import { beforeEach, test } from "node:test";
 
 import {
   closeComputerPanel,
+  consumeComputerViewerRequest,
   getComputerPanelSnapshotForTests,
   openComputerPanel,
   resetComputerPanelForTests,
@@ -16,11 +17,13 @@ test("panel opens for an owner and closes", () => {
   assert.deepEqual(getComputerPanelSnapshotForTests(), {
     open: true,
     ownerPubkey: "agent-a",
+    viewerRequested: true,
   });
   closeComputerPanel();
   assert.deepEqual(getComputerPanelSnapshotForTests(), {
     open: false,
     ownerPubkey: null,
+    viewerRequested: false,
   });
 });
 
@@ -29,6 +32,7 @@ test("closing an already-closed panel is a no-op", () => {
   assert.deepEqual(getComputerPanelSnapshotForTests(), {
     open: false,
     ownerPubkey: null,
+    viewerRequested: false,
   });
 });
 
@@ -36,6 +40,7 @@ test("toggle opens, then closes for the same owner", () => {
   toggleComputerPanel("agent-a");
   assert.equal(getComputerPanelSnapshotForTests().open, true);
   assert.equal(getComputerPanelSnapshotForTests().ownerPubkey, "agent-a");
+  assert.equal(getComputerPanelSnapshotForTests().viewerRequested, true);
   toggleComputerPanel("agent-a");
   assert.equal(getComputerPanelSnapshotForTests().open, false);
 });
@@ -49,5 +54,22 @@ test("toggle for a different owner switches rather than closing", () => {
   assert.deepEqual(getComputerPanelSnapshotForTests(), {
     open: true,
     ownerPubkey: "agent-b",
+    viewerRequested: true,
   });
+});
+
+test("viewer request is consumed without closing the panel", () => {
+  openComputerPanel("agent-a");
+  consumeComputerViewerRequest("agent-a");
+  assert.deepEqual(getComputerPanelSnapshotForTests(), {
+    open: true,
+    ownerPubkey: "agent-a",
+    viewerRequested: false,
+  });
+});
+
+test("another owner cannot consume the viewer request", () => {
+  openComputerPanel("agent-a");
+  consumeComputerViewerRequest("agent-b");
+  assert.equal(getComputerPanelSnapshotForTests().viewerRequested, true);
 });

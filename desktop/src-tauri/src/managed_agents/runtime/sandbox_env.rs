@@ -8,8 +8,9 @@
 //! to clobber the broker URL, which has to match the broker's own allowlisted
 //! public URL or the agent's NIP-98-signed `buzz sandbox` calls fail auth.
 //! `buzz-acp`'s "you have a computer" briefing is itself gated on
-//! `BUZZ_SANDBOX_BROKER_URL` being set, so clearing both on detach is what
-//! makes the agent correctly report having no computer again.
+//! `BUZZ_SANDBOX_BROKER_URL` being set. Every managed agent receives that URL
+//! so it can create its own computer; `BUZZ_SANDBOX_ID` is present only while
+//! Desktop has attached a specific computer to the agent.
 
 use tauri::{AppHandle, Manager};
 
@@ -79,15 +80,10 @@ pub(crate) fn apply_sandbox_env(
 /// Pure decision function for the computer-use env vars
 /// (`BUZZ_SANDBOX_BROKER_URL` / `BUZZ_SANDBOX_ID`).
 ///
-/// `Some(sandbox_id)` sets both — the harness's "you have a computer"
-/// briefing and its `buzz sandbox` tools are gated on
-/// `BUZZ_SANDBOX_BROKER_URL` being present. `None` removes both, belt-and-
-/// suspenders against an inherited parent env var granting phantom
-/// computer-use after detach.
-///
-/// `broker_base` is always computed (even when there's no sandbox to attach)
-/// so the caller doesn't need a conditional — a `None` sandbox_id simply
-/// discards it via the remove path.
+/// The broker URL is always set so an unattached managed agent can run
+/// `buzz sandbox create` itself. `Some(sandbox_id)` also pins the default
+/// target; `None` removes only that id so a stale parent value cannot make the
+/// agent operate another computer by accident.
 fn build_sandbox_env(sandbox_id: Option<&str>, broker_base: &str) -> RespondToEnv {
     match sandbox_id {
         Some(id) => (
@@ -98,8 +94,8 @@ fn build_sandbox_env(sandbox_id: Option<&str>, broker_base: &str) -> RespondToEn
             Vec::new(),
         ),
         None => (
-            Vec::new(),
-            vec!["BUZZ_SANDBOX_BROKER_URL", "BUZZ_SANDBOX_ID"],
+            vec![("BUZZ_SANDBOX_BROKER_URL", broker_base.to_string())],
+            vec!["BUZZ_SANDBOX_ID"],
         ),
     }
 }
@@ -179,11 +175,15 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_env_none_id_removes_both() {
+    fn sandbox_env_none_id_keeps_broker_for_self_service_create() {
         let (set, remove) =
             build_sandbox_env(None, "https://relay.staging.emorise.com/sandbox-viewer");
-        assert!(set.is_empty());
-        assert!(remove.contains(&"BUZZ_SANDBOX_BROKER_URL"));
+        let set_map: std::collections::HashMap<_, _> = set.into_iter().collect();
+        assert_eq!(
+            set_map.get("BUZZ_SANDBOX_BROKER_URL").map(String::as_str),
+            Some("https://relay.staging.emorise.com/sandbox-viewer")
+        );
         assert!(remove.contains(&"BUZZ_SANDBOX_ID"));
+        assert!(!remove.contains(&"BUZZ_SANDBOX_BROKER_URL"));
     }
 }

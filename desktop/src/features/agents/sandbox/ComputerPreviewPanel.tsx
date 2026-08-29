@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ExternalLink, Monitor } from "lucide-react";
+import { ExternalLink, Maximize2, Monitor } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -22,6 +22,8 @@ import { formatSandboxRemaining, isSandboxExpired } from "./sandboxCountdown";
 import { mintViewerUrl } from "./mintViewerUrl";
 import { openComputerWindow } from "./openComputerWindow";
 import { SandboxStage } from "./SandboxStage";
+import { SandboxViewerDialog } from "./SandboxViewerDialog";
+import { consumeComputerViewerRequest } from "./computerPanelStore";
 
 /**
  * Live sidebar view of an agent's computer, opened from the Computer button
@@ -34,6 +36,7 @@ export function ComputerPreviewPanel({
   isSinglePanelView = false,
   layout = "standalone",
   transparentChrome = false,
+  openViewerOnReady = false,
   widthPx,
   onClose,
 }: {
@@ -41,6 +44,7 @@ export function ComputerPreviewPanel({
   isSinglePanelView?: boolean;
   layout?: AuxiliaryPanelLayout;
   transparentChrome?: boolean;
+  openViewerOnReady?: boolean;
   widthPx: number;
   onClose: () => void;
 }) {
@@ -56,6 +60,7 @@ export function ComputerPreviewPanel({
   const [userInControl, setUserInControl] = React.useState(false);
   const [mintedUrl, setMintedUrl] = React.useState<string | null>(null);
   const [minting, setMinting] = React.useState(false);
+  const [viewerOpen, setViewerOpen] = React.useState(false);
 
   const viewerUrl = sandbox?.viewerUrl ?? null;
 
@@ -93,6 +98,12 @@ export function ComputerPreviewPanel({
       ? formatSandboxRemaining(sandbox.expiresAt, now)
       : null;
 
+  React.useEffect(() => {
+    if (!openViewerOnReady || !sandbox || !mintedUrl || expired) return;
+    setViewerOpen(true);
+    consumeComputerViewerRequest(ownerPubkey);
+  }, [expired, mintedUrl, openViewerOnReady, ownerPubkey, sandbox]);
+
   async function handlePopOut() {
     if (!sandbox) return;
     try {
@@ -112,99 +123,134 @@ export function ComputerPreviewPanel({
   }
 
   return (
-    <AuxiliaryPanel
-      isSinglePanelView={isSinglePanelView}
-      layout={layout}
-      onClose={onClose}
-      testId="computer-preview-panel"
-      transparentChrome={transparentChrome}
-      widthPx={widthPx}
-      header={
-        <AuxiliaryPanelHeader
-          backdrop={layout !== "split"}
-          backdropSurface="soft"
-          inset={layout !== "split" ? "wide" : "default"}
-        >
-          <AuxiliaryPanelHeaderGroup
-            align="start"
-            leading={<Monitor className="h-4 w-4 shrink-0" />}
+    <>
+      <AuxiliaryPanel
+        isSinglePanelView={isSinglePanelView}
+        layout={layout}
+        onClose={onClose}
+        testId="computer-preview-panel"
+        transparentChrome={transparentChrome}
+        widthPx={widthPx}
+        header={
+          <AuxiliaryPanelHeader
+            backdrop={layout !== "split"}
+            backdropSurface="soft"
+            inset={layout !== "split" ? "wide" : "default"}
           >
-            <div className="min-w-0 flex-1">
-              <h2
-                className="truncate text-sm font-semibold leading-5"
-                data-testid="computer-preview-panel-title"
-                title={title}
-              >
-                {title}
-              </h2>
-              {remaining && !expired ? (
-                <p className="truncate text-2xs text-muted-foreground">
-                  {remaining}
-                </p>
+            <AuxiliaryPanelHeaderGroup
+              align="start"
+              leading={<Monitor className="h-4 w-4 shrink-0" />}
+            >
+              <div className="min-w-0 flex-1">
+                <h2
+                  className="truncate text-sm font-semibold leading-5"
+                  data-testid="computer-preview-panel-title"
+                  title={title}
+                >
+                  {title}
+                </h2>
+                {remaining && !expired ? (
+                  <p className="truncate text-2xs text-muted-foreground">
+                    {remaining}
+                  </p>
+                ) : null}
+              </div>
+            </AuxiliaryPanelHeaderGroup>
+            <AuxiliaryPanelHeaderActions includeCloseAction>
+              {sandbox ? (
+                <>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        data-testid="computer-preview-full-screen"
+                        aria-label="Open full screen"
+                        disabled={!mintedUrl || expired}
+                        onClick={() => setViewerOpen(true)}
+                      >
+                        <Maximize2 className="h-4 w-4" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Open full screen</TooltipContent>
+                  </Tooltip>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        data-testid="computer-preview-pop-out"
+                        aria-label="Open in a new window"
+                        onClick={() => void handlePopOut()}
+                      >
+                        <ExternalLink className="h-4 w-4" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Open in a new window</TooltipContent>
+                  </Tooltip>
+                </>
               ) : null}
+            </AuxiliaryPanelHeaderActions>
+          </AuxiliaryPanelHeader>
+        }
+      >
+        <AuxiliaryPanelBody className="flex min-h-0 flex-1 flex-col overflow-hidden p-0">
+          {!sandbox ? (
+            <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
+              <Monitor
+                className={cn(
+                  "h-8 w-8 text-muted-foreground",
+                  everHadComputer && "animate-pulse",
+                )}
+              />
+              <p className="text-sm font-medium text-foreground">
+                {everHadComputer ? "Starting computer…" : "No computer running"}
+              </p>
             </div>
-          </AuxiliaryPanelHeaderGroup>
-          <AuxiliaryPanelHeaderActions includeCloseAction>
-            {sandbox ? (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    data-testid="computer-preview-pop-out"
-                    aria-label="Open in a new window"
-                    onClick={() => void handlePopOut()}
-                  >
-                    <ExternalLink className="h-4 w-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Open in a new window</TooltipContent>
-              </Tooltip>
-            ) : null}
-          </AuxiliaryPanelHeaderActions>
-        </AuxiliaryPanelHeader>
-      }
-    >
-      <AuxiliaryPanelBody className="flex min-h-0 flex-1 flex-col overflow-hidden p-0">
-        {!sandbox ? (
-          <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
-            <Monitor
-              className={cn(
-                "h-8 w-8 text-muted-foreground",
-                everHadComputer && "animate-pulse",
-              )}
+          ) : mintedUrl ? (
+            <SandboxStage
+              viewerUrl={mintedUrl}
+              sandboxId={sandbox.id}
+              sandboxName={sandbox.name}
+              agentDisplayName={agentDisplayName}
+              remaining={remaining}
+              expired={expired}
+              userInControl={userInControl}
+              onUserInControlChange={setUserInControl}
             />
-            <p className="text-sm font-medium text-foreground">
-              {everHadComputer ? "Starting computer…" : "No computer running"}
-            </p>
-          </div>
-        ) : mintedUrl ? (
-          <SandboxStage
-            viewerUrl={mintedUrl}
-            sandboxId={sandbox.id}
-            sandboxName={sandbox.name}
-            agentDisplayName={agentDisplayName}
-            remaining={remaining}
-            expired={expired}
-            userInControl={userInControl}
-            onUserInControlChange={setUserInControl}
-          />
-        ) : (
-          <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
-            <Monitor
-              className={
-                minting
-                  ? "h-8 w-8 animate-pulse text-muted-foreground"
-                  : "h-8 w-8 text-muted-foreground"
-              }
-            />
-            <p className="text-2xs text-muted-foreground">
-              {minting ? "Connecting…" : "Screen not reachable"}
-            </p>
-          </div>
-        )}
-      </AuxiliaryPanelBody>
-    </AuxiliaryPanel>
+          ) : (
+            <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
+              <Monitor
+                className={
+                  minting
+                    ? "h-8 w-8 animate-pulse text-muted-foreground"
+                    : "h-8 w-8 text-muted-foreground"
+                }
+              />
+              <p className="text-2xs text-muted-foreground">
+                {minting ? "Connecting…" : "Screen not reachable"}
+              </p>
+            </div>
+          )}
+        </AuxiliaryPanelBody>
+      </AuxiliaryPanel>
+      {sandbox && mintedUrl ? (
+        <SandboxViewerDialog
+          agentDisplayName={agentDisplayName}
+          expired={expired}
+          expiresAt={sandbox.expiresAt}
+          onOpenChange={setViewerOpen}
+          open={viewerOpen}
+          ownerPubkey={ownerPubkey}
+          rawViewerUrl={sandbox.viewerUrl ?? undefined}
+          remaining={remaining}
+          sandboxId={sandbox.id}
+          sandboxName={sandbox.name}
+          viewerUrl={mintedUrl}
+        />
+      ) : null}
+    </>
   );
 }

@@ -431,7 +431,7 @@ export const ChannelPane = React.memo(function ChannelPane({
       }),
     [agentSessionAgents, openAgentSessionPubkey, profilePanelPubkey, profiles],
   );
-  const computerPanel = useChannelComputerPanel(activeChannel, currentPubkey, {
+  const computerPanel = useChannelComputerPanel({
     isSinglePanelView,
     split: useSplitAuxiliaryPane,
     widthPx: threadPanelWidthPx,
@@ -923,6 +923,8 @@ export const ChannelPane = React.memo(function ChannelPane({
             );
             return wrapThreadPanel(panel);
           })()
+        ) : computerPanel.surface ? (
+          wrapAux(computerPanel.surface, "computer-preview-panel")
         ) : activeChannel && selectedAgent ? (
           (() => {
             const effectiveAgentSessionChannelId =
@@ -984,8 +986,6 @@ export const ChannelPane = React.memo(function ChannelPane({
             );
             return wrapAux(panel, "user-profile-panel");
           })()
-        ) : computerPanel.surface ? (
-          wrapAux(computerPanel.surface, "computer-preview-panel")
         ) : (
           idleAuxiliarySurface
         )}

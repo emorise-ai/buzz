@@ -4561,12 +4561,12 @@ mod computer_prompt_tests {
     fn computer_prompt_is_appended_with_a_sandbox_broker() {
         let prompt = effective_base_prompt(true);
         assert!(prompt.contains("Your Computer"));
-        // Commands target the running sandbox by default — BUZZ_SANDBOX_ID is
-        // an override, not a guaranteed env var, so the prompt must not
-        // promise it is always set.
-        assert!(prompt.contains("automatically target the computer you are running inside"));
+        // The broker is available before a computer exists, so the prompt
+        // must teach the self-service create path without promising an id.
+        assert!(prompt.contains("If no computer is running, create one"));
+        assert!(prompt.contains("buzz sandbox create"));
         assert!(prompt.contains("BUZZ_SANDBOX_ID"));
-        assert!(prompt.contains("overrides the default target"));
+        assert!(prompt.contains("attached computer is the default target"));
         assert!(prompt.contains("buzz sandbox exec"));
         assert!(prompt.contains("buzz sandbox screenshot"));
         assert!(prompt.contains("take over the mouse and keyboard"));
@@ -5215,10 +5215,9 @@ fn check_remote_mcp_supported(
 
 /// Whether this harness process is wired to a sandbox broker.
 ///
-/// `BUZZ_SANDBOX_BROKER_URL` is injected by the deploy path
-/// (`buzz-backend-docker`) into managed sandboxes only, so its presence in
-/// the harness's own process env — not any per-agent config — is what
-/// distinguishes a sandboxed agent from one running elsewhere.
+/// `BUZZ_SANDBOX_BROKER_URL` is injected into managed runtimes that can reach
+/// the broker. Its presence in the harness's own process env — not any
+/// per-agent config — enables the computer prompt and self-service lifecycle.
 fn has_sandbox_broker() -> bool {
     std::env::var("BUZZ_SANDBOX_BROKER_URL")
         .map(|v| !v.trim().is_empty())

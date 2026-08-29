@@ -133,6 +133,7 @@ export function ChannelScreenHeader({
   const computerButton =
     activeChannel && dmCounterpartPubkey && dmCounterpartSandbox ? (
       <Button
+        data-testid="channel-computer-button"
         aria-label={
           isComputerPanelOpenForCounterpart ? "Hide computer" : "Open computer"
         }
@@ -148,6 +149,7 @@ export function ChannelScreenHeader({
       <Button
         aria-label="Start computer"
         className="opacity-50 hover:opacity-80"
+        data-testid="channel-computer-button"
         onClick={() => {
           startAndOpenComputer(dmCounterpartPubkey).catch((err) => {
             console.error(

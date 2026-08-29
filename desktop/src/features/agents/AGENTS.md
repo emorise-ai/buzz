@@ -267,6 +267,15 @@ with a TypeScript lookup table or an id comparison in a component.
     request a credential during an ordinary conversation. Do not infer requests
     from natural-language phrases, and do not promise the secure control to
     independently operated relay agents that Desktop cannot restart.
+
+16. **Managed Codex discovery belongs to the Buzz nest.** Spawn sets
+    `CODEX_HOME` to the active `~/.buzz[-dev]/.codex` directory so a managed
+    agent sees Buzz's canonical `buzz-cli` skill without inheriting the human's
+    personal plugins, skills, hooks, or MCP servers. Authentication is the only
+    host Codex state bridged into that isolated home. Do not copy the host
+    `config.toml`, plugin cache, or skill directories into the nest, and apply
+    the canonical runtime home after user environment values so an agent config
+    cannot opt back into host discovery accidentally.
     A credential-only nudge is a neutral request, not a destructive runtime
     error: render one concise key/agent summary and exactly one explicit secure
     action. Mixed setup failures may retain row-level routing and error styling.

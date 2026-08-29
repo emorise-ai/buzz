@@ -13,9 +13,15 @@ type Snapshot = {
   open: boolean;
   /** The agent whose computer is showing, or null when closed. */
   ownerPubkey: string | null;
+  /** One-shot request to open the large viewer as soon as the screen is ready. */
+  viewerRequested: boolean;
 };
 
-let snapshot: Snapshot = { open: false, ownerPubkey: null };
+let snapshot: Snapshot = {
+  open: false,
+  ownerPubkey: null,
+  viewerRequested: false,
+};
 const listeners = new Set<() => void>();
 
 function publish(next: Snapshot) {
@@ -24,12 +30,24 @@ function publish(next: Snapshot) {
 }
 
 export function openComputerPanel(ownerPubkey: string) {
-  publish({ open: true, ownerPubkey });
+  publish({ open: true, ownerPubkey, viewerRequested: true });
 }
 
 export function closeComputerPanel() {
   if (!snapshot.open) return;
-  publish({ open: false, ownerPubkey: null });
+  publish({ open: false, ownerPubkey: null, viewerRequested: false });
+}
+
+/** Mark the large-view request handled without closing the docked screen. */
+export function consumeComputerViewerRequest(ownerPubkey: string) {
+  if (
+    !snapshot.open ||
+    snapshot.ownerPubkey !== ownerPubkey ||
+    !snapshot.viewerRequested
+  ) {
+    return;
+  }
+  publish({ ...snapshot, viewerRequested: false });
 }
 
 /** Toggle the panel for `ownerPubkey`: closes if already open for this
@@ -53,7 +71,7 @@ export function useComputerPanel() {
 }
 
 export function resetComputerPanelForTests() {
-  snapshot = { open: false, ownerPubkey: null };
+  snapshot = { open: false, ownerPubkey: null, viewerRequested: false };
 }
 
 export function getComputerPanelSnapshotForTests() {

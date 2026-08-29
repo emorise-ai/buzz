@@ -1240,9 +1240,8 @@ declare global {
     }) => RelayEvent;
     /**
      * Emit a sandbox lifecycle event (kind:48200 created / 48201 destroyed) to
-     * any live owner-scoped subscription, so the agent-card sandbox preview can
-     * be exercised in specs. `ownerPubkey` is the agent the sandbox belongs to
-     * (the `#p` value the card filters on).
+     * the live sandbox lifecycle subscription, so computer UI can be exercised
+     * in specs. `ownerPubkey` is the agent the sandbox belongs to (`p` tag).
      */
     __BUZZ_E2E_EMIT_MOCK_SANDBOX__?: (input: {
       ownerPubkey: string;
@@ -4720,17 +4719,17 @@ function emitMockLiveEvent(channelId: string, event: RelayEvent) {
 }
 
 /**
- * Dispatch an event to every live subscription whose `#p` owner filter contains
- * `ownerPubkey` and whose kind filter admits the event. The owner-scoped analog
- * of `emitMockLiveEvent` — used for sandbox lifecycle events, which are keyed by
- * the owning agent, not a channel.
+ * Dispatch a sandbox lifecycle event to matching live subscriptions. Production
+ * uses one community-wide kind subscription today; accepting an explicit `#p`
+ * filter as well keeps older owner-scoped test consumers working.
  */
 function emitMockOwnerLiveEvent(ownerPubkey: string, event: RelayEvent) {
   const owner = ownerPubkey.toLowerCase();
   for (const socket of mockSockets.values()) {
     for (const [subId, subscription] of socket.subscriptions) {
       if (
-        subscription.ownerPubkeys.some((p) => p.toLowerCase() === owner) &&
+        (subscription.ownerPubkeys.length === 0 ||
+          subscription.ownerPubkeys.some((p) => p.toLowerCase() === owner)) &&
         (!subscription.kinds || subscription.kinds.includes(event.kind))
       ) {
         sendWsText(socket.handler, ["EVENT", subId, event]);

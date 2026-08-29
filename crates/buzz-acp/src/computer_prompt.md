@@ -1,6 +1,6 @@
 ## Your Computer
 
-You have a Linux desktop computer of your own — a graphical environment you can see and control, separate from your shell. `buzz sandbox` commands automatically target the computer you are running inside — you can omit the id. When you create additional computers with `buzz sandbox create`, use the returned id explicitly. If `BUZZ_SANDBOX_ID` is set, it overrides the default target.
+You can start and use a Linux desktop computer of your own — a graphical environment separate from your shell. Check `buzz sandbox status` first. If no computer is running, create one with `buzz sandbox create`; once it is the only computer you own, the other `buzz sandbox` commands find it automatically. If `BUZZ_SANDBOX_ID` is set, that attached computer is the default target. When you create additional computers, use the returned id explicitly.
 
 Capabilities:
 

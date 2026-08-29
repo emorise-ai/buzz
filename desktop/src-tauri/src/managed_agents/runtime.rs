@@ -28,6 +28,7 @@ pub(crate) use metadata::{
     apply_agent_display_env, resolve_session_title, runtime_metadata_env_vars,
     DISPLAY_NAME_ENV_VAR, SESSION_TITLE_ENV_VAR,
 };
+mod runtime_home;
 
 mod stop;
 pub(crate) use stop::managed_agent_runtime_keys;
@@ -812,6 +813,11 @@ pub fn spawn_agent_child(
         command.env(key, value);
     }
 
+    runtime_home::apply_isolated_runtime_home(
+        &mut command,
+        runtime_meta,
+        super::default_agent_workdir().as_deref(),
+    )?;
     sandbox_env::apply_sandbox_env(&mut command, app, record.sandbox_id.as_deref());
 
     // B5: carry persisted effort; harness resolves thought_level configId at first session.

@@ -12,13 +12,14 @@ const AGENT_PUBKEY = TEST_IDENTITIES.tyler.pubkey;
 // A self-contained data: URL that stands in for the noVNC viewer, so the full
 // view renders a recognizable "screen" without a live sandbox or network.
 const MOCK_VIEWER = `data:text/html,${encodeURIComponent(
-  `<html><body style="margin:0;background:#101418;color:#cdd6f4;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><div style="text-align:center"><div style="font-size:48px">🖥️</div><div>Agent desktop (noVNC)</div></div></body></html>`,
+  `<html><body style="margin:0;background:#101418;color:#cdd6f4;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><div style="text-align:center"><div style="font-size:48px">Agent PC</div><div>Live remote desktop</div></div></body></html><!--`,
 )}`;
 
 /** Emit a sandbox-created (48200) event for the agent and wait for the card. */
 async function emitSandbox(
   page: import("@playwright/test").Page,
   overrides: Record<string, unknown> = {},
+  ownerPubkey = AGENT_PUBKEY,
 ) {
   // The card opens the owner-scoped subscription on mount; give the REQ a beat
   // to register before emitting, or the live event is dropped.
@@ -33,7 +34,7 @@ async function emitSandbox(
       if (!emit) throw new Error("sandbox emit hook unavailable");
       emit({ ownerPubkey, ...(extra as Record<string, unknown>) });
     },
-    { ownerPubkey: AGENT_PUBKEY, extra: overrides },
+    { ownerPubkey, extra: overrides },
   );
 }
 
@@ -48,6 +49,7 @@ async function gotoAgentProfile(page: import("@playwright/test").Page) {
   await expect(page.getByTestId("user-profile-panel")).toBeVisible({
     timeout: 10_000,
   });
+  await page.getByTestId("user-profile-tab-runtime").click();
 }
 
 test.describe("agent sandbox preview screenshots", () => {
@@ -98,7 +100,9 @@ test.describe("agent sandbox preview screenshots", () => {
 
     const dialog = page.getByRole("dialog");
     await expect(dialog).toBeVisible();
-    await expect(dialog).toContainText("share this screen with the agent");
+    await expect(dialog).toContainText(
+      "Agent is controlling — click to take over",
+    );
     await expect(dialog.locator("iframe")).toBeVisible();
     await waitForAnimations(page);
     await dialog.screenshot({ path: `${SHOTS}/02-full-view.png` });
@@ -170,5 +174,52 @@ test.describe("agent sandbox preview screenshots", () => {
     }, AGENT_PUBKEY);
 
     await expect(preview).toHaveCount(0, { timeout: 5_000 });
+  });
+
+  test("06-computer-button-opens-large-view-over-agent-activity", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await page.getByTestId("channel-agents").click();
+    await expect(page.getByTestId("chat-title")).toHaveText("agents");
+    const messageRow = page
+      .getByTestId("message-row")
+      .filter({ hasText: "Tyler Agent reporting in." });
+    await expect(messageRow).toBeVisible();
+    await messageRow
+      .locator("button")
+      .filter({ hasText: "Tyler Agent" })
+      .click();
+    await expect(page.getByTestId("user-profile-panel")).toBeVisible();
+    await page.getByTestId("user-profile-tab-runtime").click();
+    await emitSandbox(
+      page,
+      {
+        viewerUrl: MOCK_VIEWER,
+        expiresAt: Math.floor(Date.now() / 1000) + 42 * 60,
+      },
+      AGENT_PUBKEY,
+    );
+    await expect(
+      page.getByTestId(`agent-sandbox-preview-${AGENT_PUBKEY}`),
+    ).toBeVisible();
+    await page.getByTestId("user-profile-tab-info").click();
+    await page
+      .getByTestId(`user-profile-view-activity-${AGENT_PUBKEY}`)
+      .click();
+    await expect(page.getByTestId("agent-session-thread-panel")).toBeVisible();
+    await page
+      .getByTestId(`message-computer-indicator-${AGENT_PUBKEY}`)
+      .click();
+
+    await expect(page.getByTestId("computer-preview-panel")).toBeVisible();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toBeVisible();
+    await expect(dialog.locator("iframe")).toBeVisible();
+    await waitForAnimations(page);
+    await page.screenshot({
+      path: `${SHOTS}/06-activity-to-full-view.png`,
+      fullPage: true,
+    });
   });
 });
