@@ -29,7 +29,6 @@ pub(crate) use metadata::{
     DISPLAY_NAME_ENV_VAR, SESSION_TITLE_ENV_VAR,
 };
 mod runtime_home;
-
 mod stop;
 pub(crate) use stop::managed_agent_runtime_keys;
 pub use stop::{stop_managed_agent_process, stop_managed_agent_workspace_pair};
@@ -63,7 +62,6 @@ pub(crate) use instance_reaper::reap_dead_instance_agents;
 use instance_reaper::{buffer_contains_identifier, is_desktop_binary};
 
 // Exact-path harness sweep lives in runtime/sweep.rs (re-exported above).
-
 mod lifecycle;
 #[cfg(test)]
 use lifecycle::kill_stale_tracked_processes_with;
