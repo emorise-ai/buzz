@@ -257,6 +257,56 @@ impl Verifier {
         }
     }
 
+    /// Does the agent's latest signed profile publish a NIP-OA relationship
+    /// naming `owner_pubkey_hex` as its owner?
+    ///
+    /// A caller-generated NIP-OA signature is not sufficient: anyone can sign
+    /// a statement claiming an unrelated agent. Requiring the agent-authored
+    /// profile makes the relationship bilateral before it can authorize
+    /// mounting that agent's persistent browser and files.
+    pub async fn is_published_agent_owner(
+        &self,
+        owner_pubkey_hex: &str,
+        agent_pubkey_hex: &str,
+    ) -> bool {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => return false,
+        };
+        let filter = serde_json::json!([{
+            "kinds": [0],
+            "authors": [agent_pubkey_hex],
+            "limit": 1
+        }]);
+        let body = filter.to_string();
+        let url = format!("{}/query", self.relay_url);
+        let Some(auth) = self.sign_request("POST", &url, body.as_bytes()) else {
+            return false;
+        };
+        let Ok(response) = client
+            .post(&url)
+            .header(axum::http::header::AUTHORIZATION, format!("Nostr {auth}"))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+        else {
+            return false;
+        };
+        if !response.status().is_success() {
+            return false;
+        }
+        let Ok(events) = response.json::<Vec<nostr::Event>>().await else {
+            return false;
+        };
+        events.first().is_some_and(|event| {
+            profile_proves_agent_owner(event, owner_pubkey_hex, agent_pubkey_hex)
+        })
+    }
+
     /// Build a NIP-98 `Authorization` value for the broker's own request.
     fn sign_request(&self, method: &str, url: &str, body: &[u8]) -> Option<String> {
         use base64::Engine;
@@ -276,6 +326,34 @@ impl Verifier {
             .ok()?;
         Some(base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&event).ok()?))
     }
+}
+
+fn profile_proves_agent_owner(
+    event: &nostr::Event,
+    owner_pubkey_hex: &str,
+    agent_pubkey_hex: &str,
+) -> bool {
+    if event.kind != nostr::Kind::Metadata
+        || event.pubkey.to_hex() != agent_pubkey_hex
+        || event.verify().is_err()
+    {
+        return false;
+    }
+    let Ok(agent) = nostr::PublicKey::from_hex(agent_pubkey_hex) else {
+        return false;
+    };
+    event.tags.iter().any(|tag| {
+        let values = tag.as_slice();
+        if values.first().map(String::as_str) != Some("auth") {
+            return false;
+        }
+        let Ok(json) = serde_json::to_string(values) else {
+            return false;
+        };
+        buzz_sdk::nip_oa::verify_auth_tag(&json, &agent)
+            .map(|owner| owner.to_hex() == owner_pubkey_hex)
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]
@@ -545,5 +623,61 @@ mod tests {
         assert!(verifier()
             .verify_token("!!!not base64!!!", "https://broker.example/x")
             .is_err());
+    }
+
+    fn agent_profile(agent: &nostr::Keys, owner: &nostr::Keys) -> nostr::Event {
+        let auth_json = buzz_sdk::nip_oa::compute_auth_tag(owner, &agent.public_key(), "")
+            .expect("owner and agent are distinct");
+        let auth = buzz_sdk::nip_oa::parse_auth_tag(&auth_json).expect("valid auth tag");
+        nostr::EventBuilder::new(nostr::Kind::Metadata, "{}")
+            .tags([auth])
+            .sign_with_keys(agent)
+            .expect("profile signs")
+    }
+
+    #[test]
+    fn agent_signed_profile_proves_its_published_owner() {
+        let agent = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let profile = agent_profile(&agent, &owner);
+        assert!(profile_proves_agent_owner(
+            &profile,
+            &owner.public_key().to_hex(),
+            &agent.public_key().to_hex()
+        ));
+    }
+
+    #[test]
+    fn unilateral_or_mismatched_owner_claims_do_not_prove_relationship() {
+        let agent = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let attacker = nostr::Keys::generate();
+        let profile = agent_profile(&agent, &owner);
+
+        assert!(!profile_proves_agent_owner(
+            &profile,
+            &attacker.public_key().to_hex(),
+            &agent.public_key().to_hex()
+        ));
+        assert!(!profile_proves_agent_owner(
+            &profile,
+            &owner.public_key().to_hex(),
+            &attacker.public_key().to_hex()
+        ));
+
+        // Even a cryptographically valid attacker claim is insufficient when
+        // the agent did not publish it in its own signed profile.
+        let attacker_claim =
+            buzz_sdk::nip_oa::compute_auth_tag(&attacker, &agent.public_key(), "").unwrap();
+        let attacker_tag = buzz_sdk::nip_oa::parse_auth_tag(&attacker_claim).unwrap();
+        let self_signed_claim = nostr::EventBuilder::new(nostr::Kind::Metadata, "{}")
+            .tags([attacker_tag])
+            .sign_with_keys(&attacker)
+            .unwrap();
+        assert!(!profile_proves_agent_owner(
+            &self_signed_claim,
+            &attacker.public_key().to_hex(),
+            &agent.public_key().to_hex()
+        ));
     }
 }

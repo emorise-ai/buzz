@@ -10,6 +10,20 @@ set -uo pipefail
 
 log() { echo "[desktop] $*" >&2; }
 
+shutdown_desktop() {
+    log "shutdown requested; asking Chromium to flush its persistent profile"
+    pkill -TERM -x chrome >/dev/null 2>&1 || true
+    pkill -TERM -x chromium >/dev/null 2>&1 || true
+    for _ in $(seq 1 50); do
+        if ! pgrep -x chrome >/dev/null 2>&1 && ! pgrep -x chromium >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.2
+    done
+    exit 0
+}
+trap shutdown_desktop TERM INT
+
 : "${DISPLAY:=:1}"
 : "${SCREEN_GEOMETRY:=1920x1080x24}"
 : "${VNC_PORT:=5901}"
@@ -210,26 +224,44 @@ fi
 # headroom to software-render it via SwiftShader. These flags force Chromium
 # onto its CPU-rasterized WebGL path instead of trying (and failing) to find
 # real GPU hardware.
-buzz-browser \
-    --remote-debugging-port="${CDP_PORT}" \
-    --remote-allow-origins='*' \
-    --user-data-dir=/home/agent/.config/chromium \
-    --no-first-run \
-    --no-default-browser-check \
-    --disable-features=Translate \
-    --password-store=basic \
-    --force-dark-mode \
-    --enable-features=WebUIDarkMode \
-    --window-size=1700,950 \
-    --window-position=110,65 \
-    --no-sandbox \
-    --test-type \
-    --use-gl=angle \
-    --use-angle=swiftshader-webgl \
-    --enable-unsafe-swiftshader \
-    --ignore-gpu-blocklist \
-    "$BUZZ_DESKTOP_HOME" \
-    >/tmp/chromium.log 2>&1 &
+CHROMIUM_PROFILE=/home/agent/.config/chromium
+
+launch_browser() {
+    local session_args=()
+    if [ -f "$CHROMIUM_PROFILE/Local State" ]; then
+        # Do not append the Buzz start page here: an explicit URL would create
+        # an extra tab alongside Chromium's restored persistent session.
+        session_args+=(--restore-last-session)
+        log "restoring persistent browser session"
+    else
+        session_args+=("$BUZZ_DESKTOP_HOME")
+        log "starting fresh browser profile"
+    fi
+
+    buzz-browser \
+        --remote-debugging-port="${CDP_PORT}" \
+        --remote-allow-origins='*' \
+        --user-data-dir="$CHROMIUM_PROFILE" \
+        --no-first-run \
+        --no-default-browser-check \
+        --disable-features=Translate \
+        --password-store=basic \
+        --force-dark-mode \
+        --enable-features=WebUIDarkMode \
+        --window-size=1700,950 \
+        --window-position=110,65 \
+        --no-sandbox \
+        --test-type \
+        --use-gl=angle \
+        --use-angle=swiftshader-webgl \
+        --enable-unsafe-swiftshader \
+        --ignore-gpu-blocklist \
+        "${session_args[@]}" \
+        >>/tmp/chromium.log 2>&1 &
+}
+
+: >/tmp/chromium.log
+launch_browser
 
 for _ in $(seq 1 60); do
     if curl -sS --max-time 1 "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1; then
@@ -248,25 +280,7 @@ while true; do
     # Chrome's process name is "chrome", Chromium's is "chromium" — check both.
     if ! pgrep -x chrome >/dev/null 2>&1 && ! pgrep -x chromium >/dev/null 2>&1; then
         log "browser exited; restarting"
-        buzz-browser \
-            --remote-debugging-port="${CDP_PORT}" \
-            --remote-allow-origins='*' \
-            --user-data-dir=/home/agent/.config/chromium \
-            --no-first-run \
-            --no-default-browser-check \
-            --password-store=basic \
-            --force-dark-mode \
-            --enable-features=WebUIDarkMode \
-            --window-size=1700,950 \
-            --window-position=110,65 \
-            --test-type \
-            --no-sandbox \
-            --use-gl=angle \
-            --use-angle=swiftshader-webgl \
-            --enable-unsafe-swiftshader \
-            --ignore-gpu-blocklist \
-            "$BUZZ_DESKTOP_HOME" \
-            >>/tmp/chromium.log 2>&1 &
+        launch_browser
     fi
     if command -v ttyd >/dev/null 2>&1 && ! pgrep -x ttyd >/dev/null 2>&1; then
         log "ttyd exited; restarting"

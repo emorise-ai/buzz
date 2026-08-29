@@ -6,6 +6,7 @@
 //! between the provider and the daemon (SANDBOX-PLAN.md §Phase 2).
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Label every managed container carries. The broker's list/reap paths filter
 /// on it, so a container without it is invisible to this service — which is
@@ -23,6 +24,16 @@ pub const LABEL_OWNER: &str = "com.buzz.sandbox.owner";
 /// need to admit this identity too, not just the owner.
 pub const LABEL_MANAGER: &str = "com.buzz.sandbox.manager";
 pub const LABEL_EXPIRES: &str = "com.buzz.sandbox.expires-at";
+pub const VOLUME_LABEL_KEY: &str = "com.buzz.sandbox.volume";
+pub const VOLUME_LABEL_STORAGE_ID: &str = "com.buzz.sandbox.storage-id";
+pub const VOLUME_LABEL_NAMESPACE_ID: &str = "com.buzz.sandbox.namespace-id";
+pub const VOLUME_LABEL_OWNER_ID: &str = "com.buzz.sandbox.owner-id";
+pub const VOLUME_LABEL_ROLE: &str = "com.buzz.sandbox.volume-role";
+pub const VOLUME_LABEL_LIFECYCLE: &str = "com.buzz.sandbox.lifecycle";
+pub const VOLUME_LABEL_SCHEMA: &str = "com.buzz.sandbox.storage-schema";
+
+const HOME_PATH: &str = "/home/agent";
+const WORKSPACE_PATH: &str = "/workspace";
 
 /// Ceilings the broker will not exceed regardless of what is asked for.
 ///
@@ -78,8 +89,8 @@ pub struct CreateRequest {
 pub struct ExtendRequest {
     /// Seconds of lifetime wanted from *now*. The result is clamped so the
     /// sandbox's total lifetime never exceeds [`MAX_TTL_SECONDS`] from its
-    /// creation — repeated extends must not make a sandbox immortal, because
-    /// the TTL is the only bound on disk the host has (see `container_spec`).
+    /// creation — repeated extends must not make sandbox compute immortal.
+    /// Persistent named volumes deliberately outlive this compute TTL.
     pub ttl_seconds: u64,
 }
 
@@ -133,6 +144,81 @@ impl Limits {
     }
 }
 
+/// One named Docker volume that holds durable PC data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistentVolume {
+    pub name: String,
+    pub target: &'static str,
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+/// The durable user-data volumes mounted into one disposable computer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistentStorage {
+    pub storage_id: String,
+    pub namespace_id: String,
+    pub owner_id: String,
+    pub volumes: [PersistentVolume; 2],
+}
+
+/// Derive stable, non-identifying volume names for one agent in one community.
+///
+/// The namespace is operator-controlled and normally identifies the relay
+/// community. Hashing the framed pair prevents raw relay URLs and pubkeys from
+/// appearing in Docker metadata while keeping reactivation deterministic.
+pub fn persistent_storage(namespace: &str, owner: &str) -> PersistentStorage {
+    let namespace_id = hex::encode(Sha256::digest(namespace.as_bytes()));
+    let owner_id = hex::encode(Sha256::digest(owner.as_bytes()));
+    let mut hasher = Sha256::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update([0]);
+    hasher.update(owner.as_bytes());
+    let storage_id = hex::encode(hasher.finalize());
+
+    let volume = |role: &'static str, target: &'static str| {
+        let labels = std::collections::BTreeMap::from([
+            (VOLUME_LABEL_KEY.to_string(), "1".to_string()),
+            (VOLUME_LABEL_STORAGE_ID.to_string(), storage_id.clone()),
+            (VOLUME_LABEL_NAMESPACE_ID.to_string(), namespace_id.clone()),
+            (VOLUME_LABEL_OWNER_ID.to_string(), owner_id.clone()),
+            (VOLUME_LABEL_ROLE.to_string(), role.to_string()),
+            (VOLUME_LABEL_LIFECYCLE.to_string(), "persistent".to_string()),
+            (VOLUME_LABEL_SCHEMA.to_string(), "1".to_string()),
+        ]);
+        PersistentVolume {
+            name: format!("buzz-pc-{storage_id}-{role}"),
+            target,
+            labels,
+        }
+    };
+
+    let volumes = [
+        volume("home", HOME_PATH),
+        volume("workspace", WORKSPACE_PATH),
+    ];
+    PersistentStorage {
+        storage_id,
+        namespace_id,
+        owner_id,
+        volumes,
+    }
+}
+
+/// Resolve the identity whose durable PC data will mount.
+///
+/// Authorization of a distinct requested owner is performed against the
+/// agent's signed relay profile in `identity.rs`; this pure resolver only
+/// canonicalizes the key used for labels, dedupe, events, and storage.
+pub fn effective_owner(caller: &str, requested: Option<&str>) -> Result<String, String> {
+    let Some(requested) = requested else {
+        return Ok(caller.to_string());
+    };
+    let agent = nostr::PublicKey::from_hex(requested)
+        .map_err(|_| "owner must be a 64-character public key".to_string())?;
+    let canonical = agent.to_hex();
+    Ok(canonical)
+}
+
 /// Inputs to [`container_spec`].
 pub struct SpecInputs<'a> {
     pub image: &'a str,
@@ -146,6 +232,9 @@ pub struct SpecInputs<'a> {
     pub expires_at: i64,
     pub cpuset: &'a str,
     pub network: &'a str,
+    /// Named user-data volumes. Production creates these before the container;
+    /// tests may omit them to exercise the base hardening shape.
+    pub persistent_storage: Option<&'a PersistentStorage>,
     /// Writable-layer cap (e.g. "30G"), or None where unsupported.
     pub disk_limit: Option<&'a str>,
 }
@@ -176,9 +265,33 @@ pub fn container_spec(inputs: SpecInputs<'_>) -> serde_json::Value {
         expires_at,
         cpuset,
         network,
+        persistent_storage,
         disk_limit,
     } = inputs;
-    let env_vec: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let mut env_vec: Vec<String> = env
+        .iter()
+        .filter(|(key, _)| key.as_str() != "TINI_KILL_PROCESS_GROUP")
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    // Docker's init process forwards SIGTERM to the whole process group so
+    // the desktop supervisor can close Chromium cleanly alongside the harness.
+    env_vec.push("TINI_KILL_PROCESS_GROUP=1".to_string());
+    let mounts: Vec<serde_json::Value> = persistent_storage
+        .into_iter()
+        .flat_map(|storage| storage.volumes.iter())
+        .map(|volume| {
+            serde_json::json!({
+                "Type": "volume",
+                "Source": volume.name,
+                "Target": volume.target,
+                "ReadOnly": false,
+                // Docker copies the image directory into a newly created
+                // empty volume. That seeds UID/GID and desktop defaults on
+                // first activation, while later containers reuse its data.
+                "VolumeOptions": { "NoCopy": false }
+            })
+        })
+        .collect();
 
     let mut labels = serde_json::Map::new();
     labels.insert(LABEL_KEY.to_string(), serde_json::json!("1"));
@@ -211,7 +324,10 @@ pub fn container_spec(inputs: SpecInputs<'_>) -> serde_json::Value {
             "CapDrop": ["ALL"],
             "SecurityOpt": ["no-new-privileges"],
             "NetworkMode": network,
+            // Host paths remain forbidden. Durable state uses broker-created
+            // named volumes, never binds or the Docker socket.
             "Binds": [],
+            "Mounts": mounts,
             "AutoRemove": false,
             // The harness exits cleanly on SIGTERM; an intentional clean exit
             // must never be restarted (spec L1 item 5).
@@ -229,8 +345,9 @@ pub fn container_spec(inputs: SpecInputs<'_>) -> serde_json::Value {
     //
     // Consequence worth stating plainly: without it, a runaway build inside a
     // sandbox can fill the host disk that production sites share. Memory, CPU,
-    // and PIDs are capped; disk is not. Mitigations are the TTL reaper and the
-    // concurrency cap, neither of which bounds bytes written.
+    // and PIDs are capped; disk is not. The concurrency cap limits simultaneous
+    // writers, but persistent home/workspace volumes intentionally survive the
+    // TTL reaper and therefore require operator monitoring and eventual policy.
     if let Some(size) = disk_limit {
         spec["HostConfig"]["StorageOpt"] = serde_json::json!({ "size": size });
     }
@@ -561,6 +678,9 @@ pub const LAUNCH_APPS: &[(&str, &[&str])] = &[
             "buzz-browser",
             "--new-window",
             "--user-data-dir=/home/agent/.config/chromium",
+            "--restore-last-session",
+            "--no-first-run",
+            "--no-default-browser-check",
             "--password-store=basic",
             "--force-dark-mode",
             "--enable-features=WebUIDarkMode",
@@ -801,18 +921,25 @@ pub fn is_owner_or_manager(caller: &str, owner: Option<&str>, manager: Option<&s
 /// Docker socket.
 pub struct ExistingSandbox<'a> {
     pub owner: Option<&'a str>,
-    pub running: bool,
+    pub may_use_storage: bool,
+}
+
+/// Whether a Docker container state can currently or subsequently touch its
+/// mounted persistent volumes without first being recreated.
+pub fn container_state_may_use_storage(state: Option<&str>) -> bool {
+    !matches!(state, Some("exited" | "dead"))
 }
 
 /// Should `create_sandbox` reuse an existing container instead of making a
 /// new one?
 ///
-/// Per-owner dedup: an owner that already has a live (running) managed
+/// Per-owner dedup: an owner that already has a managed container which may
+/// still use storage (running, paused, restarting, or being created)
 /// sandbox gets that one back rather than a second box. Returns the index
 /// of the first matching entry, so the caller can look up the full record
 /// it needs to build a response from. `None` means proceed with a normal
 /// create — either the owner is unset (nothing to dedupe against) or none
-/// of their sandboxes are currently running.
+/// of their sandboxes can still use the persistent volumes.
 ///
 /// Pure decision, factored out of `create_sandbox` (main.rs) the same way
 /// `is_owner_or_manager` is factored out of `require_owner_or_manager`: the
@@ -825,7 +952,7 @@ pub fn existing_sandbox_for_owner(
     let owner = owner?;
     existing
         .iter()
-        .position(|s| s.running && s.owner == Some(owner))
+        .position(|s| s.may_use_storage && s.owner == Some(owner))
 }
 
 /// Is this image allowed to hold an agent's private key?
@@ -938,6 +1065,114 @@ mod tests {
     }
 
     #[test]
+    fn persistent_storage_is_stable_and_does_not_expose_identity() {
+        let first = persistent_storage("community-a", "agent-pubkey");
+        let second = persistent_storage("community-a", "agent-pubkey");
+
+        assert_eq!(first, second);
+        assert_eq!(first.storage_id.len(), 64);
+        for volume in &first.volumes {
+            assert!(!volume.name.contains("community-a"));
+            assert!(!volume.name.contains("agent-pubkey"));
+            assert_eq!(
+                volume.labels.get(VOLUME_LABEL_KEY).map(String::as_str),
+                Some("1")
+            );
+            assert_eq!(
+                volume
+                    .labels
+                    .get(VOLUME_LABEL_STORAGE_ID)
+                    .map(String::as_str),
+                Some(first.storage_id.as_str())
+            );
+            assert_eq!(
+                volume
+                    .labels
+                    .get(VOLUME_LABEL_NAMESPACE_ID)
+                    .map(String::as_str),
+                Some(first.namespace_id.as_str())
+            );
+            assert_eq!(
+                volume.labels.get(VOLUME_LABEL_OWNER_ID).map(String::as_str),
+                Some(first.owner_id.as_str())
+            );
+            assert_eq!(
+                volume
+                    .labels
+                    .get(VOLUME_LABEL_LIFECYCLE)
+                    .map(String::as_str),
+                Some("persistent")
+            );
+            assert_eq!(
+                volume.labels.get(VOLUME_LABEL_SCHEMA).map(String::as_str),
+                Some("1")
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_storage_is_isolated_by_owner_and_community() {
+        let base = persistent_storage("community-a", "agent-a");
+        let other_owner = persistent_storage("community-a", "agent-b");
+        let other_community = persistent_storage("community-b", "agent-a");
+
+        assert_ne!(base.storage_id, other_owner.storage_id);
+        assert_ne!(base.storage_id, other_community.storage_id);
+        assert_ne!(base.volumes[0].name, other_owner.volumes[0].name);
+        assert_ne!(base.volumes[0].name, other_community.volumes[0].name);
+    }
+
+    #[test]
+    fn effective_owner_accepts_self_service_and_canonicalizes_requested_keys() {
+        let caller = nostr::Keys::generate().public_key().to_hex();
+        let agent_hex = nostr::Keys::generate().public_key().to_hex();
+
+        assert_eq!(effective_owner(&caller, None).unwrap(), caller);
+        assert_eq!(
+            effective_owner(&caller, Some(&agent_hex)).unwrap(),
+            agent_hex
+        );
+    }
+
+    #[test]
+    fn effective_owner_refuses_non_keys() {
+        let caller = nostr::Keys::generate().public_key().to_hex();
+        assert!(effective_owner(&caller, Some("not-a-key")).is_err());
+    }
+
+    #[test]
+    fn persistent_storage_mounts_home_and_workspace_without_host_binds() {
+        let storage = persistent_storage("community", "agent");
+        let spec = container_spec(SpecInputs {
+            image: "img",
+            limits: Limits::resolve(&req(None, None, None)),
+            env: &EMPTY_ENV,
+            owner: Some("agent"),
+            manager: Some("manager"),
+            expires_at: 123,
+            cpuset: "0-1",
+            network: "sandbox",
+            persistent_storage: Some(&storage),
+            disk_limit: None,
+        });
+        let host = &spec["HostConfig"];
+        assert_eq!(host["Binds"], serde_json::json!([]));
+        let mounts = host["Mounts"].as_array().expect("mount array");
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0]["Type"], "volume");
+        assert_eq!(mounts[0]["Source"], storage.volumes[0].name);
+        assert_eq!(mounts[0]["Target"], HOME_PATH);
+        assert_eq!(mounts[0]["VolumeOptions"]["NoCopy"], false);
+        assert_eq!(mounts[1]["Source"], storage.volumes[1].name);
+        assert_eq!(mounts[1]["Target"], WORKSPACE_PATH);
+        assert_eq!(host["CapDrop"], serde_json::json!(["ALL"]));
+        assert_eq!(
+            host["SecurityOpt"],
+            serde_json::json!(["no-new-privileges"])
+        );
+    }
+
+    #[test]
     fn image_allowlist_rejects_unlisted_and_empty_config() {
         let allowed = vec!["ghcr.io/block/buzz-sprig".to_string()];
         assert!(image_allowed("ghcr.io/block/buzz-sprig-dev@sha256:x", &allowed).is_ok());
@@ -956,6 +1191,7 @@ mod tests {
             expires_at: 0,
             cpuset: "0-1",
             network: "sandbox",
+            persistent_storage: None,
             disk_limit: None,
         });
         // Entrypoint/Cmd absent => the image's own entrypoint execs the
@@ -975,6 +1211,7 @@ mod tests {
             expires_at: 123,
             cpuset: "0-1",
             network: "sandbox",
+            persistent_storage: None,
             disk_limit: None,
         });
         let hc = &spec["HostConfig"];
@@ -1003,6 +1240,7 @@ mod tests {
             expires_at: 0,
             cpuset: "0-1",
             network: "sandbox",
+            persistent_storage: None,
             disk_limit: None,
         };
         let without = container_spec(base());
@@ -1030,6 +1268,7 @@ mod tests {
             expires_at: 0,
             cpuset: "0-1",
             network: "sandbox",
+            persistent_storage: None,
             disk_limit: None,
         });
         let hc = &spec["HostConfig"];
@@ -1037,8 +1276,8 @@ mod tests {
         assert_eq!(hc["Memory"], hc["MemorySwap"]);
     }
 
-    /// Env is what carries the agent's identity, so it must reach the
-    /// container verbatim and in `KEY=value` form.
+    /// Caller env carries the agent identity and reaches the container in
+    /// `KEY=value` form alongside broker-owned lifecycle policy.
     #[test]
     fn environment_is_passed_through_as_key_value_pairs() {
         let mut env = std::collections::BTreeMap::new();
@@ -1053,6 +1292,7 @@ mod tests {
             expires_at: 0,
             cpuset: "0-0",
             network: "sandbox",
+            persistent_storage: None,
             disk_limit: None,
         });
         let got: Vec<&str> = spec["Env"]
@@ -1063,6 +1303,7 @@ mod tests {
             .collect();
         assert!(got.contains(&"BUZZ_RELAY_URL=wss://relay"));
         assert!(got.contains(&"A=1"));
+        assert!(got.contains(&"TINI_KILL_PROCESS_GROUP=1"));
     }
 
     /// An expiry label the reaper cannot parse would leave a sandbox running
@@ -1078,6 +1319,7 @@ mod tests {
             expires_at: 1_786_824_039,
             cpuset: "0-0",
             network: "sandbox",
+            persistent_storage: None,
             disk_limit: None,
         });
         let raw = spec["Labels"][LABEL_EXPIRES].as_str().expect("label");
@@ -1097,6 +1339,7 @@ mod tests {
             expires_at: 0,
             cpuset: "0-0",
             network: "buzz-sandboxes",
+            persistent_storage: None,
             disk_limit: None,
         });
         assert_eq!(spec["HostConfig"]["NetworkMode"], "buzz-sandboxes");
@@ -1116,6 +1359,7 @@ mod tests {
             expires_at: 0,
             cpuset: "0-0",
             network: "sandbox",
+            persistent_storage: None,
             disk_limit: None,
         });
         assert!(spec["Labels"].get(LABEL_MANAGER).is_none());
@@ -1193,6 +1437,9 @@ mod tests {
                 "buzz-browser",
                 "--new-window",
                 "--user-data-dir=/home/agent/.config/chromium",
+                "--restore-last-session",
+                "--no-first-run",
+                "--no-default-browser-check",
                 "--password-store=basic",
                 "--force-dark-mode",
                 "--enable-features=WebUIDarkMode",
@@ -1549,11 +1796,11 @@ mod tests {
         let existing = [
             ExistingSandbox {
                 owner: Some("someone-else"),
-                running: true,
+                may_use_storage: true,
             },
             ExistingSandbox {
                 owner: Some("owner-pk"),
-                running: true,
+                may_use_storage: true,
             },
         ];
         assert_eq!(
@@ -1563,10 +1810,10 @@ mod tests {
     }
 
     #[test]
-    fn create_dedup_ignores_stopped_sandboxes() {
+    fn create_dedup_ignores_terminal_sandboxes() {
         let existing = [ExistingSandbox {
             owner: Some("owner-pk"),
-            running: false,
+            may_use_storage: false,
         }];
         assert_eq!(
             existing_sandbox_for_owner(Some("owner-pk"), &existing),
@@ -1575,10 +1822,25 @@ mod tests {
     }
 
     #[test]
+    fn paused_restarting_and_created_states_still_reserve_storage() {
+        for state in [
+            None,
+            Some("created"),
+            Some("running"),
+            Some("paused"),
+            Some("restarting"),
+        ] {
+            assert!(container_state_may_use_storage(state), "state {state:?}");
+        }
+        assert!(!container_state_may_use_storage(Some("exited")));
+        assert!(!container_state_may_use_storage(Some("dead")));
+    }
+
+    #[test]
     fn create_dedup_ignores_other_owners() {
         let existing = [ExistingSandbox {
             owner: Some("someone-else"),
-            running: true,
+            may_use_storage: true,
         }];
         assert_eq!(
             existing_sandbox_for_owner(Some("owner-pk"), &existing),
@@ -1593,7 +1855,7 @@ mod tests {
     fn create_dedup_is_a_no_op_without_an_owner() {
         let existing = [ExistingSandbox {
             owner: None,
-            running: true,
+            may_use_storage: true,
         }];
         assert_eq!(existing_sandbox_for_owner(None, &existing), None);
     }
@@ -1603,11 +1865,11 @@ mod tests {
         let existing = [
             ExistingSandbox {
                 owner: Some("owner-pk"),
-                running: true,
+                may_use_storage: true,
             },
             ExistingSandbox {
                 owner: Some("owner-pk"),
-                running: true,
+                may_use_storage: true,
             },
         ];
         assert_eq!(

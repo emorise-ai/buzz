@@ -29,6 +29,9 @@ services:
       # Prefix allowlist. An unlisted image must never hold an agent key.
       BUZZ_SANDBOX_IMAGES: ${BUZZ_SANDBOX_IMAGES:-ghcr.io/block/buzz-sprig,buzz-sprig-dev}
       BUZZ_SANDBOX_NETWORK: ${BUZZ_SANDBOX_NETWORK:-buzz-sandboxes}
+      # Stable community boundary for named PC volumes. Choose it once and do
+      # not derive it from a hostname that may move.
+      BUZZ_SANDBOX_STORAGE_NAMESPACE: ${BUZZ_SANDBOX_STORAGE_NAMESPACE:?set a stable community storage namespace}
       BUZZ_SANDBOX_BIND: 0.0.0.0:9310
       # Writable-layer cap. Only settable on overlay2-over-XFS with pquota;
       # Matterhorn is ext4, so it stays unset there and disk is uncapped.

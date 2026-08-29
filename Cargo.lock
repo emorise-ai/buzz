@@ -1393,6 +1393,7 @@ dependencies = [
  "base64 0.22.1",
  "buzz-auth",
  "buzz-core",
+ "buzz-sdk",
  "chrono",
  "hex",
  "http-body-util",

@@ -62,11 +62,17 @@ struct AppState {
     viewer_base: Option<Arc<String>>,
     allowed_images: Arc<Vec<String>>,
     network: Arc<String>,
+    /// Stable community boundary for persistent agent storage. This must not
+    /// change merely because the broker or relay moves hosts.
+    storage_namespace: Arc<str>,
     /// Writable-layer cap (e.g. "30G"). None on filesystems that cannot
     /// enforce one — see `container_spec`.
     disk_limit: Option<Arc<str>>,
     host_cpus: usize,
     slot: Arc<std::sync::atomic::AtomicUsize>,
+    /// Serializes list/dedupe/create so simultaneous requests cannot mount one
+    /// persistent browser profile into two running containers.
+    create_lock: Arc<tokio::sync::Mutex<()>>,
     /// Live expiry per container id — the authority the reaper reads.
     ///
     /// Docker labels are immutable on a running container, so an extend cannot
@@ -133,6 +139,15 @@ async fn main() {
             error!(
                 "BUZZ_SANDBOX_RELAY_URL is required — the broker authorizes \
                  callers by asking the relay who is a member"
+            );
+            std::process::exit(1);
+        }
+    };
+    let storage_namespace = match std::env::var("BUZZ_SANDBOX_STORAGE_NAMESPACE") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            error!(
+                "BUZZ_SANDBOX_STORAGE_NAMESPACE is required — it is the stable community boundary for persistent PC data"
             );
             std::process::exit(1);
         }
@@ -220,12 +235,14 @@ async fn main() {
             .map(|v| Arc::new(v.trim_end_matches('/').to_string())),
         allowed_images: Arc::new(allowed_images),
         network: Arc::new(network),
+        storage_namespace: Arc::from(storage_namespace),
         disk_limit: std::env::var("BUZZ_SANDBOX_DISK")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .map(|s| Arc::from(s.trim())),
         host_cpus,
         slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        create_lock: Arc::new(tokio::sync::Mutex::new(())),
         expiry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         last_published_expiry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
@@ -395,6 +412,14 @@ fn bad_request(msg: impl Into<String>) -> axum::response::Response {
         .into_response()
 }
 
+fn forbidden(msg: impl Into<String>) -> axum::response::Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({"error": msg.into()})),
+    )
+        .into_response()
+}
+
 async fn create_sandbox(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -414,6 +439,26 @@ async fn create_sandbox(
     if let Err(e) = sandbox::image_allowed(&req.image, &state.allowed_images) {
         return bad_request(e);
     }
+    let effective_owner = match sandbox::effective_owner(&caller, req.owner.as_deref()) {
+        Ok(owner) => owner,
+        Err(e) => return forbidden(e),
+    };
+    if effective_owner != caller
+        && !state
+            .verifier
+            .is_published_agent_owner(&caller, &effective_owner)
+            .await
+    {
+        return forbidden(
+            "the agent's latest signed profile does not authorize this caller as its owner",
+        );
+    }
+
+    // Keep the existing-container check and creation atomic within this
+    // broker. Concurrent mounts of one Chromium profile corrupt session state;
+    // create is rare enough that a short global critical section is safer than
+    // a lifecycle-sensitive map of per-owner locks.
+    let create_guard = state.create_lock.lock().await;
 
     // Concurrency cap: the host runs production workloads alongside sandboxes,
     // so the broker refuses rather than letting the box be oversubscribed.
@@ -421,16 +466,20 @@ async fn create_sandbox(
     // need the same "what's currently running" list.
     let existing = match state.docker.list_managed(sandbox::MANAGED_LABEL).await {
         Ok(existing) => {
-            let running = existing
+            let active = existing
                 .iter()
-                .filter(|c| c.get("State").and_then(|s| s.as_str()) == Some("running"))
+                .filter(|c| {
+                    sandbox::container_state_may_use_storage(
+                        c.get("State").and_then(|s| s.as_str()),
+                    )
+                })
                 .count();
-            if running >= sandbox::MAX_CONCURRENT {
+            if active >= sandbox::MAX_CONCURRENT {
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
                     Json(serde_json::json!({
                         "error": format!(
-                            "sandbox limit reached ({running}/{}); stop one before creating another",
+                            "sandbox limit reached ({active}/{}); stop one before creating another",
                             sandbox::MAX_CONCURRENT
                         )
                     })),
@@ -454,14 +503,33 @@ async fn create_sandbox(
                 .get("Labels")
                 .and_then(|l| l.get(sandbox::LABEL_OWNER))
                 .and_then(|v| v.as_str()),
-            running: c.get("State").and_then(|s| s.as_str()) == Some("running"),
+            may_use_storage: sandbox::container_state_may_use_storage(
+                c.get("State").and_then(|s| s.as_str()),
+            ),
         })
         .collect();
-    if let Some(idx) = sandbox::existing_sandbox_for_owner(req.owner.as_deref(), &projections) {
+    if let Some(idx) =
+        sandbox::existing_sandbox_for_owner(Some(effective_owner.as_str()), &projections)
+    {
         return match sandbox_summary_response(&state, &existing[idx]).await {
             Ok(response) => response,
             Err(e) => internal(e),
         };
+    }
+
+    // A terminal container cannot touch its mounts again through the broker,
+    // but its stable Docker name would block recreation. Remove only terminal
+    // containers for this owner; named volumes deliberately survive.
+    for (entry, projection) in existing.iter().zip(&projections) {
+        if projection.owner == Some(effective_owner.as_str()) && !projection.may_use_storage {
+            if let Some(id) = entry.get("Id").and_then(|value| value.as_str()) {
+                if let Err(e) = state.docker.remove_container(id).await {
+                    return internal(format!(
+                        "could not clear terminal sandbox before recreate: {e}"
+                    ));
+                }
+            }
+        }
     }
 
     let limits = Limits::resolve(&req);
@@ -470,7 +538,24 @@ async fn create_sandbox(
         .slot
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let cpuset = sandbox::assign_cpuset(state.host_cpus, limits.cpus, slot);
-    let name = format!("buzz-sandbox-{}", short_id());
+    let persistent_storage =
+        sandbox::persistent_storage(&state.storage_namespace, &effective_owner);
+    // Stable names make Docker itself the cross-process create lock: two
+    // broker instances racing for one owner's PC cannot both create this name.
+    let name = format!("buzz-sandbox-{}", persistent_storage.storage_id);
+
+    // Volumes are created and ownership-checked before the container. A
+    // failure leaves no running partial sandbox; already-existing volumes are
+    // never rolled back because they may hold the agent's durable PC data.
+    for volume in &persistent_storage.volumes {
+        if let Err(e) = state
+            .docker
+            .ensure_volume(&volume.name, &volume.labels)
+            .await
+        {
+            return internal(e);
+        }
+    }
 
     // A bearer token for the sandbox's tool port.
     //
@@ -493,7 +578,7 @@ async fn create_sandbox(
         image: &req.image,
         limits,
         env: &env,
-        owner: req.owner.as_deref(),
+        owner: Some(&effective_owner),
         // The verified NIP-98 caller, not `req.owner`: when the desktop app
         // creates a box on an agent's behalf it signs as the human manager
         // while `owner` names the agent, so these two are deliberately
@@ -502,6 +587,7 @@ async fn create_sandbox(
         expires_at,
         cpuset: &cpuset,
         network: &state.network,
+        persistent_storage: Some(&persistent_storage),
         disk_limit: state.disk_limit.as_deref(),
     });
 
@@ -517,6 +603,7 @@ async fn create_sandbox(
         return internal(format!("container created but would not start: {e}"));
     }
     state.set_expiry(&id, expires_at);
+    drop(create_guard);
 
     // Where the agent's brain reaches this sandbox's tools.
     //
@@ -551,7 +638,7 @@ async fn create_sandbox(
                 image: &req.image,
                 // The agent's own key when given, else the caller's — either
                 // way the desktop can join this sandbox to an agent card.
-                owner: req.owner.as_deref().or(Some(caller.as_str())),
+                owner: Some(&effective_owner),
                 cpus: limits.cpus,
                 memory_mb: limits.memory_mb,
                 expires_at,
@@ -3195,21 +3282,6 @@ fn mint_tools_token() -> String {
     hex::encode(bytes)
 }
 
-fn short_id() -> String {
-    use rand::RngExt;
-    let mut rng = rand::rng();
-    (0..10)
-        .map(|_| {
-            let n: u8 = rng.random_range(0u8..36);
-            if n < 10 {
-                (b'0' + n) as char
-            } else {
-                (b'a' + n - 10) as char
-            }
-        })
-        .collect()
-}
-
 fn internal(e: impl std::fmt::Display) -> axum::response::Response {
     let msg = e.to_string();
     error!(error = %msg, "broker error");
@@ -3384,15 +3456,6 @@ mod tests {
     }
 
     #[test]
-    fn short_ids_are_url_safe_and_reasonably_unique() {
-        let a = short_id();
-        assert_eq!(a.len(), 10);
-        assert!(is_safe_id(&a));
-        let set: std::collections::HashSet<String> = (0..200).map(|_| short_id()).collect();
-        assert!(set.len() > 190, "ids collide too often");
-    }
-
-    #[test]
     fn summarize_reads_labels_and_strips_the_name_slash() {
         let c = serde_json::json!({
             "Id": "deadbeef",
@@ -3440,9 +3503,11 @@ mod router_tests {
             viewer_base: None,
             allowed_images: Arc::new(Vec::new()),
             network: Arc::new("bridge".to_string()),
+            storage_namespace: Arc::from("test-community"),
             disk_limit: None,
             host_cpus: 1,
             slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            create_lock: Arc::new(tokio::sync::Mutex::new(())),
             expiry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             last_published_expiry: Arc::new(
                 std::sync::Mutex::new(std::collections::HashMap::new()),

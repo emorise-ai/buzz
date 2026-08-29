@@ -125,6 +125,33 @@ impl Docker {
             })
     }
 
+    /// Create a named data volume if needed, then verify its ownership labels.
+    ///
+    /// Docker treats `POST /volumes/create` as idempotent by name, including
+    /// when two create requests race. It does not replace labels on an
+    /// existing volume, so the follow-up inspect is the security check: a
+    /// volume with the expected name but different labels is never mounted.
+    pub async fn ensure_volume(
+        &self,
+        name: &str,
+        labels: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        self.request(
+            hyper::Method::POST,
+            "/volumes/create",
+            Some(serde_json::json!({
+                "Name": name,
+                "Labels": labels,
+            })),
+        )
+        .await?;
+
+        let inspected = self
+            .request(hyper::Method::GET, &format!("/volumes/{name}"), None)
+            .await?;
+        validate_volume_labels(name, &inspected, labels)
+    }
+
     pub async fn create_container(
         &self,
         name: &str,
@@ -159,17 +186,20 @@ impl Docker {
             .await
     }
 
-    /// Force-remove a container and its anonymous volumes. Removing something
-    /// already gone is success — the caller's intent (it should not exist) is
-    /// satisfied either way, and a reaper racing a manual `docker rm` should
-    /// not report failure.
+    /// Force-remove a container and its anonymous volumes. Docker deliberately
+    /// retains named volumes even with `v=true`, so an agent's persistent home
+    /// and workspace survive stop and expiry. Removing something already gone
+    /// is success: the caller's intent is satisfied, and a reaper racing a
+    /// manual `docker rm` should not report failure.
     pub async fn remove_container(&self, id: &str) -> Result<(), String> {
+        // Ask the container to stop first so Chromium can flush its persistent
+        // SQLite/profile state. Docker applies the container's StopTimeout and
+        // kills only after the grace period; deletion remains the final cleanup.
+        let _ = self
+            .request(hyper::Method::POST, &stop_container_path(id), None)
+            .await;
         match self
-            .request(
-                hyper::Method::DELETE,
-                &format!("/containers/{id}?force=true&v=true"),
-                None,
-            )
+            .request(hyper::Method::DELETE, &remove_container_path(id), None)
             .await
         {
             Ok(_) => Ok(()),
@@ -496,6 +526,50 @@ impl Docker {
     }
 }
 
+fn remove_container_path(id: &str) -> String {
+    format!("/containers/{id}?force=true&v=true")
+}
+
+fn stop_container_path(id: &str) -> String {
+    format!("/containers/{id}/stop?t=60")
+}
+
+fn validate_volume_labels(
+    name: &str,
+    inspected: &serde_json::Value,
+    expected: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    if inspected.get("Driver").and_then(|value| value.as_str()) != Some("local") {
+        return Err(format!(
+            "refusing persistent volume {name}: expected Docker local volume driver"
+        ));
+    }
+    if inspected
+        .get("Options")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|options| !options.is_empty())
+    {
+        return Err(format!(
+            "refusing persistent volume {name}: driver options could map host storage"
+        ));
+    }
+    let actual = inspected
+        .get("Labels")
+        .and_then(serde_json::Value::as_object);
+    let mismatch = expected.iter().find(|(key, value)| {
+        actual
+            .and_then(|labels| labels.get(*key))
+            .and_then(|v| v.as_str())
+            != Some(value.as_str())
+    });
+    if let Some((key, _)) = mismatch {
+        return Err(format!(
+            "refusing persistent volume {name}: ownership label {key} is missing or mismatched"
+        ));
+    }
+    Ok(())
+}
+
 /// Read a hyper body frame by frame, accumulating at most `cap_bytes`.
 ///
 /// Once the cap is reached the accumulated buffer is truncated to exactly
@@ -620,6 +694,80 @@ mod tests {
     #[test]
     fn urlencode_leaves_unreserved_characters_alone() {
         assert_eq!(urlencode("abcXYZ019-_.~"), "abcXYZ019-_.~");
+    }
+
+    #[test]
+    fn volume_labels_accept_exact_or_additional_metadata() {
+        let expected = std::collections::BTreeMap::from([
+            ("com.buzz.sandbox.volume".to_string(), "1".to_string()),
+            (
+                "com.buzz.sandbox.volume-role".to_string(),
+                "home".to_string(),
+            ),
+        ]);
+        assert!(validate_volume_labels(
+            "buzz-pc-safe-home",
+            &serde_json::json!({"Labels": {
+                "com.buzz.sandbox.volume": "1",
+                "com.buzz.sandbox.volume-role": "home",
+                "operator.note": "retained"
+            }, "Driver": "local", "Options": {}}),
+            &expected,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn volume_labels_refuse_missing_or_mismatched_ownership() {
+        let expected = std::collections::BTreeMap::from([(
+            "com.buzz.sandbox.storage-id".to_string(),
+            "secret-expected-value".to_string(),
+        )]);
+        for inspected in [
+            serde_json::json!({"Labels": {}, "Driver": "local"}),
+            serde_json::json!({"Labels": {"com.buzz.sandbox.storage-id": "other"}, "Driver": "local"}),
+            serde_json::json!({"Driver": "local"}),
+        ] {
+            let error = validate_volume_labels("buzz-pc-safe-home", &inspected, &expected)
+                .expect_err("unowned volume must never be mounted");
+            assert!(error.contains("com.buzz.sandbox.storage-id"));
+            assert!(!error.contains("secret-expected-value"));
+        }
+    }
+
+    #[test]
+    fn removing_compute_requests_anonymous_cleanup_but_keeps_named_volumes() {
+        // Docker's `v=true` removes anonymous volumes only. The container spec
+        // uses explicitly named volumes, so this exact request preserves PC data.
+        assert_eq!(
+            stop_container_path("abc123"),
+            "/containers/abc123/stop?t=60"
+        );
+        assert_eq!(
+            remove_container_path("abc123"),
+            "/containers/abc123?force=true&v=true"
+        );
+    }
+
+    #[test]
+    fn volume_validation_refuses_nonlocal_or_optioned_drivers() {
+        let labels = std::collections::BTreeMap::new();
+        assert!(validate_volume_labels(
+            "volume",
+            &serde_json::json!({"Driver": "nfs", "Labels": {}}),
+            &labels,
+        )
+        .is_err());
+        assert!(validate_volume_labels(
+            "volume",
+            &serde_json::json!({
+                "Driver": "local",
+                "Options": {"type": "none", "o": "bind", "device": "/host"},
+                "Labels": {}
+            }),
+            &labels,
+        )
+        .is_err());
     }
 
     #[test]

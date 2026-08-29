@@ -34,6 +34,7 @@ rand = { workspace = true }
 # containers) small.
 hex = { workspace = true }
 sha2 = { workspace = true }
+buzz-sdk = { workspace = true }
 hyper = { version = "1", features = ["client", "http1"] }
 tower-service = "0.3"
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }

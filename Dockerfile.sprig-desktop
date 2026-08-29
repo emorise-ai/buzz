@@ -149,8 +149,10 @@ RUN set -eux; \
     echo "${ttyd_sha}  /usr/local/bin/ttyd" | sha256sum -c -; \
     chmod 0755 /usr/local/bin/ttyd
 
-# Chromium's profile and the VNC state live under the agent's home, which is
-# where a volume gets mounted — that is what makes a login survive a restart.
+# Chromium's profile and user files live under the agent's home, which is
+# mounted as a named volume. Buzz-owned desktop defaults live outside that
+# mount so the entrypoint can refresh exactly those files after an image update
+# without replacing unrelated files in the persistent home.
 RUN install -d -o agent -g agent \
       /home/agent/.config/chromium \
       /home/agent/.config/openbox \
@@ -161,23 +163,37 @@ RUN install -d -o agent -g agent \
       /home/agent/.local/share/applications \
       /home/agent/.themes/BuzzDark \
       /home/agent/.vnc \
-      /home/agent/Downloads
+      /home/agent/Downloads && \
+    install -d \
+      /usr/local/share/buzz-desktop/home/.config/openbox \
+      /usr/local/share/buzz-desktop/home/.config/gtk-3.0 \
+      /usr/local/share/buzz-desktop/home/.config/fontconfig \
+      /usr/local/share/buzz-desktop/home/.config/xfce4/terminal \
+      /usr/local/share/buzz-desktop/home/.config/tint2 \
+      /usr/local/share/buzz-desktop/home/.local/share/applications \
+      /usr/local/share/buzz-desktop/home/.themes/BuzzDark
 
 COPY --chmod=0755 scripts/sprig-desktop-browser.sh /usr/local/bin/buzz-browser
 COPY --chmod=0755 scripts/sprig-desktop-entrypoint.sh /usr/local/bin/sprig-desktop-entrypoint
 COPY --chmod=0755 scripts/sprig-desktop-supervise.sh /usr/local/bin/sprig-desktop-supervise
-COPY --chown=agent:agent scripts/sprig-desktop-openbox-rc.xml /home/agent/.config/openbox/rc.xml
-COPY --chown=agent:agent scripts/sprig-desktop-menu.xml /home/agent/.config/openbox/menu.xml
-COPY --chown=agent:agent scripts/sprig-desktop-start.html /home/agent/.buzz-start.html
-COPY --chown=agent:agent scripts/sprig-desktop-wallpaper.png /home/agent/.buzz-wallpaper.png
-COPY --chown=agent:agent scripts/sprig-desktop-theme/ /home/agent/.themes/BuzzDark/
-COPY --chown=agent:agent scripts/sprig-desktop-gtk3-settings.ini /home/agent/.config/gtk-3.0/settings.ini
-COPY --chown=agent:agent scripts/sprig-desktop-gtkrc-2.0 /home/agent/.gtkrc-2.0
-COPY --chown=agent:agent scripts/sprig-desktop-fontconfig.conf /home/agent/.config/fontconfig/fonts.conf
-COPY --chown=agent:agent scripts/sprig-desktop-picom.conf /home/agent/.config/picom.conf
-COPY --chown=agent:agent scripts/sprig-desktop-terminalrc /home/agent/.config/xfce4/terminal/terminalrc
-COPY --chown=agent:agent scripts/sprig-desktop-tint2rc /home/agent/.config/tint2/tint2rc
-COPY --chown=agent:agent scripts/sprig-desktop-thunar.desktop /home/agent/.local/share/applications/sprig-thunar.desktop
+COPY scripts/sprig-desktop-openbox-rc.xml /usr/local/share/buzz-desktop/home/.config/openbox/rc.xml
+COPY scripts/sprig-desktop-menu.xml /usr/local/share/buzz-desktop/home/.config/openbox/menu.xml
+COPY scripts/sprig-desktop-start.html /usr/local/share/buzz-desktop/home/.buzz-start.html
+COPY scripts/sprig-desktop-wallpaper.png /usr/local/share/buzz-desktop/home/.buzz-wallpaper.png
+COPY scripts/sprig-desktop-theme/ /usr/local/share/buzz-desktop/home/.themes/BuzzDark/
+COPY scripts/sprig-desktop-gtk3-settings.ini /usr/local/share/buzz-desktop/home/.config/gtk-3.0/settings.ini
+COPY scripts/sprig-desktop-gtkrc-2.0 /usr/local/share/buzz-desktop/home/.gtkrc-2.0
+COPY scripts/sprig-desktop-fontconfig.conf /usr/local/share/buzz-desktop/home/.config/fontconfig/fonts.conf
+COPY scripts/sprig-desktop-picom.conf /usr/local/share/buzz-desktop/home/.config/picom.conf
+COPY scripts/sprig-desktop-terminalrc /usr/local/share/buzz-desktop/home/.config/xfce4/terminal/terminalrc
+COPY scripts/sprig-desktop-tint2rc /usr/local/share/buzz-desktop/home/.config/tint2/tint2rc
+COPY scripts/sprig-desktop-thunar.desktop /usr/local/share/buzz-desktop/home/.local/share/applications/sprig-thunar.desktop
+
+# Seed the image directory for Docker's first-mount copy-up. The runtime
+# entrypoint repeats this targeted copy so reused homes receive updated Buzz
+# defaults while browser profiles, downloads, and arbitrary user files remain.
+RUN cp -a /usr/local/share/buzz-desktop/home/. /home/agent/ && \
+    chown -R agent:agent /home/agent
 
 USER agent
 WORKDIR /home/agent
