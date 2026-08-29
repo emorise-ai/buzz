@@ -1321,13 +1321,14 @@ async fn create_session_and_apply_model(
     );
 
     // Apply permission mode if not the agent's built-in default AND the agent
-    // advertises the requested mode in session/new. Agents that don't support
-    // the mode (e.g., goose crashes on unrecognized set_config_option values)
-    // are safely skipped — the harness auto-approves via handle_permission_request.
-    if !ctx.permission_mode.is_default()
-        && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
-    {
-        apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
+    // advertises an exact or provider-equivalent mode in session/new. Agents
+    // that don't support the mode (e.g., goose crashes on unrecognized
+    // set_config_option values) are safely skipped — the harness auto-approves
+    // via handle_permission_request.
+    if !ctx.permission_mode.is_default() {
+        if let Some(mode_wire) = resolve_permission_mode(&resp.raw, ctx.permission_mode) {
+            apply_permission_mode(&mut agent.acp, &resp.session_id, mode_wire).await?;
+        }
     }
 
     Ok(resp.session_id)
@@ -1602,6 +1603,32 @@ fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) 
         .unwrap_or(false)
 }
 
+/// Resolve Buzz's provider-neutral permission mode to a mode advertised by the
+/// active ACP adapter.
+///
+/// Codex ACP calls its unrestricted mode `agent-full-access`, while Claude ACP
+/// calls the equivalent mode `bypassPermissions`. Selecting the Codex alias is
+/// also what makes the adapter pass `networkAccess: true` to every turn; its
+/// ordinary `agent` mode otherwise overwrites Buzz's session-level
+/// `sandbox_workspace_write.network_access` configuration with `false`.
+fn resolve_permission_mode(
+    session_new_result: &serde_json::Value,
+    permission_mode: PermissionMode,
+) -> Option<&'static str> {
+    let requested = permission_mode.as_wire_str();
+    if agent_supports_mode(session_new_result, requested) {
+        return Some(requested);
+    }
+
+    if permission_mode == PermissionMode::BypassPermissions
+        && agent_supports_mode(session_new_result, "agent-full-access")
+    {
+        return Some("agent-full-access");
+    }
+
+    None
+}
+
 /// per-tool auto-approval in `handle_permission_request`.
 ///
 /// **Fatal exception:** if the agent process exits (e.g., goose crashes on
@@ -1609,9 +1636,8 @@ fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) 
 async fn apply_permission_mode(
     acp: &mut AcpClient,
     session_id: &str,
-    mode: &PermissionMode,
+    wire: &str,
 ) -> Result<(), AcpError> {
-    let wire = mode.as_wire_str();
     let result = tokio::time::timeout(PERMISSION_MODE_TIMEOUT, async {
         acp.session_set_config_option(session_id, "mode", wire)
             .await
@@ -4946,6 +4972,53 @@ mod tests {
             &session_new,
             PermissionMode::Auto.as_wire_str()
         ));
+    }
+
+    #[test]
+    fn resolve_permission_mode_prefers_exact_mode() {
+        let session_new = json!({
+            "modes": {
+                "availableModes": [
+                    { "id": "bypassPermissions" },
+                    { "id": "agent-full-access" }
+                ]
+            }
+        });
+
+        assert_eq!(
+            resolve_permission_mode(&session_new, PermissionMode::BypassPermissions),
+            Some("bypassPermissions")
+        );
+    }
+
+    #[test]
+    fn resolve_permission_mode_maps_bypass_to_codex_full_access() {
+        let session_new = json!({
+            "modes": {
+                "availableModes": [
+                    { "id": "read-only" },
+                    { "id": "agent" },
+                    { "id": "agent-full-access" }
+                ]
+            }
+        });
+
+        assert_eq!(
+            resolve_permission_mode(&session_new, PermissionMode::BypassPermissions),
+            Some("agent-full-access")
+        );
+    }
+
+    #[test]
+    fn resolve_permission_mode_does_not_broaden_other_modes() {
+        let session_new = json!({
+            "modes": { "availableModes": [{ "id": "agent-full-access" }] }
+        });
+
+        assert_eq!(
+            resolve_permission_mode(&session_new, PermissionMode::DontAsk),
+            None
+        );
     }
 
     #[test]
