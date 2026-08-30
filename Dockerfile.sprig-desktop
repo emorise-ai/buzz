@@ -175,6 +175,7 @@ RUN install -d -o agent -g agent \
 
 COPY --chmod=0755 scripts/sprig-desktop-browser.sh /usr/local/bin/buzz-browser
 COPY --chmod=0755 scripts/sprig-desktop-entrypoint.sh /usr/local/bin/sprig-desktop-entrypoint
+COPY --chmod=0755 scripts/sprig-desktop-profile-locks.sh /usr/local/bin/sprig-desktop-profile-locks.sh
 COPY --chmod=0755 scripts/sprig-desktop-supervise.sh /usr/local/bin/sprig-desktop-supervise
 COPY scripts/sprig-desktop-openbox-rc.xml /usr/local/share/buzz-desktop/home/.config/openbox/rc.xml
 COPY scripts/sprig-desktop-menu.xml /usr/local/share/buzz-desktop/home/.config/openbox/menu.xml
@@ -187,6 +188,7 @@ COPY scripts/sprig-desktop-fontconfig.conf /usr/local/share/buzz-desktop/home/.c
 COPY scripts/sprig-desktop-picom.conf /usr/local/share/buzz-desktop/home/.config/picom.conf
 COPY scripts/sprig-desktop-terminalrc /usr/local/share/buzz-desktop/home/.config/xfce4/terminal/terminalrc
 COPY scripts/sprig-desktop-tint2rc /usr/local/share/buzz-desktop/home/.config/tint2/tint2rc
+COPY scripts/sprig-desktop-browser.desktop /usr/local/share/buzz-desktop/home/.local/share/applications/sprig-browser.desktop
 COPY scripts/sprig-desktop-thunar.desktop /usr/local/share/buzz-desktop/home/.local/share/applications/sprig-thunar.desktop
 
 # Seed the image directory for Docker's first-mount copy-up. The runtime

@@ -228,6 +228,7 @@ CHROMIUM_PROFILE=/home/agent/.config/chromium
 
 launch_browser() {
     local session_args=()
+
     if [ -f "$CHROMIUM_PROFILE/Local State" ]; then
         # Do not append the Buzz start page here: an explicit URL would create
         # an extra tab alongside Chromium's restored persistent session.

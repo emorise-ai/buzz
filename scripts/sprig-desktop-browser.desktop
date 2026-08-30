@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Browser
+Comment=Open the persistent Buzz PC browser
+Exec=buzz-browser %U
+Icon=chromium
+Terminal=false
+Categories=Network;WebBrowser;

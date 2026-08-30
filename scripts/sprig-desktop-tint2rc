@@ -197,7 +197,7 @@ launcher_icon_theme = Yaru
 launcher_icon_theme_override = 0
 startup_notifications = 1
 launcher_tooltip = 1
-launcher_item_app = /usr/share/applications/chromium.desktop
+launcher_item_app = /home/agent/.local/share/applications/sprig-browser.desktop
 # Files uses a local override (see sprig-desktop-thunar.desktop), not the
 # system thunar.desktop directly — thunar.desktop's own Icon= says
 # "org.xfce.thunar", which Yaru does not ship (it only exists under
