@@ -8,6 +8,36 @@
 use crate::client::BuzzClient;
 use crate::error::CliError;
 
+const SELF_SERVICE_IMAGE: &str = "buzz-sprig-desktop";
+const SELF_SERVICE_MEMORY_MB: u64 = 8192;
+
+fn create_body(
+    image: String,
+    owner: &str,
+    ttl: u64,
+    cpus: Option<f64>,
+    memory_mb: Option<u64>,
+) -> serde_json::Value {
+    let default_memory = (image == SELF_SERVICE_IMAGE).then_some(SELF_SERVICE_MEMORY_MB);
+    let mut body = serde_json::json!({
+        "image": image,
+        "owner": owner,
+        "ttl_seconds": ttl,
+        "env": {
+            "BUZZ_DEV_MCP_BIND": "0.0.0.0:9320",
+            "BUZZ_DEV_MCP_OWNER": owner,
+            "BUZZ_DESKTOP_ENABLED": "1",
+        },
+    });
+    if let Some(cpus) = cpus {
+        body["cpus"] = serde_json::json!(cpus);
+    }
+    if let Some(memory_mb) = memory_mb.or(default_memory) {
+        body["memory_mb"] = serde_json::json!(memory_mb);
+    }
+    body
+}
+
 pub async fn dispatch(cmd: crate::SandboxCmd, client: &BuzzClient) -> Result<(), CliError> {
     match cmd {
         crate::SandboxCmd::Create {
@@ -22,22 +52,7 @@ pub async fn dispatch(cmd: crate::SandboxCmd, client: &BuzzClient) -> Result<(),
             // server plus a visible screen, with no second agent inside. The
             // owner env is what the in-sandbox tools server requires to serve.
             let owner = client.keys().public_key().to_hex();
-            let mut body = serde_json::json!({
-                "image": image,
-                "owner": owner,
-                "ttl_seconds": ttl,
-                "env": {
-                    "BUZZ_DEV_MCP_BIND": "0.0.0.0:9320",
-                    "BUZZ_DEV_MCP_OWNER": owner,
-                    "BUZZ_DESKTOP_ENABLED": "1",
-                },
-            });
-            if let Some(cpus) = cpus {
-                body["cpus"] = serde_json::json!(cpus);
-            }
-            if let Some(memory_mb) = memory_mb {
-                body["memory_mb"] = serde_json::json!(memory_mb);
-            }
+            let body = create_body(image, &owner, ttl, cpus, memory_mb);
             print_json(&client.sandbox_create(&broker.broker, &body).await?)
         }
         crate::SandboxCmd::List { broker } => {
@@ -227,4 +242,39 @@ fn print_json(value: &serde_json::Value) -> Result<(), CliError> {
         serde_json::to_string_pretty(value).map_err(|e| CliError::Other(e.to_string()))?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{create_body, SELF_SERVICE_IMAGE, SELF_SERVICE_MEMORY_MB};
+
+    #[test]
+    fn self_service_request_defaults_to_eight_gib() {
+        let body = create_body(SELF_SERVICE_IMAGE.to_string(), "owner", 1800, None, None);
+        assert_eq!(body["memory_mb"], SELF_SERVICE_MEMORY_MB);
+    }
+
+    #[test]
+    fn explicit_memory_overrides_self_service_default() {
+        let body = create_body(
+            SELF_SERVICE_IMAGE.to_string(),
+            "owner",
+            1800,
+            None,
+            Some(2048),
+        );
+        assert_eq!(body["memory_mb"], 2048);
+    }
+
+    #[test]
+    fn other_images_retain_broker_memory_default() {
+        let body = create_body(
+            "other-allowlisted-image".to_string(),
+            "owner",
+            1800,
+            None,
+            None,
+        );
+        assert!(body.get("memory_mb").is_none());
+    }
 }

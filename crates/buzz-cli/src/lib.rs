@@ -2999,6 +2999,46 @@ mod tests {
         assert_eq!(id, "explicit-id");
     }
 
+    #[test]
+    fn sandbox_create_leaves_self_service_memory_to_request_builder() {
+        let Cmd::Sandbox(SandboxCmd::Create { memory_mb, .. }) = Cli::try_parse_from([
+            "buzz",
+            "--relay",
+            "wss://x",
+            "sandbox",
+            "create",
+            "--broker",
+            "http://broker",
+        ])
+        .expect("sandbox create parses with defaults")
+        .command
+        else {
+            panic!("expected Sandbox(Create)");
+        };
+        assert_eq!(memory_mb, None);
+    }
+
+    #[test]
+    fn sandbox_create_preserves_explicit_memory_override() {
+        let Cmd::Sandbox(SandboxCmd::Create { memory_mb, .. }) = Cli::try_parse_from([
+            "buzz",
+            "--relay",
+            "wss://x",
+            "sandbox",
+            "create",
+            "--broker",
+            "http://broker",
+            "--memory-mb",
+            "2048",
+        ])
+        .expect("sandbox create parses with an explicit memory limit")
+        .command
+        else {
+            panic!("expected Sandbox(Create)");
+        };
+        assert_eq!(memory_mb, Some(2048));
+    }
+
     /// `BUZZ_SANDBOX_ID` is modeled as clap's `env` fallback landing in
     /// `explicit` before `require()` ever runs (clap resolves positional-or-env
     /// before the app sees the value) — so env-set beats self-detection too,

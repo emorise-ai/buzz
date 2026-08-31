@@ -3,10 +3,24 @@
 //! against `sandbox_viewer`'s own scope.
 
 use super::{
-    computer_window_hash_route, computer_window_label, to_base64url, validate_sandbox_id,
-    ComputerWindowParams,
+    computer_window_hash_route, computer_window_label, self_service_create_body, to_base64url,
+    validate_sandbox_id, ComputerWindowParams,
 };
 use base64::Engine;
+
+#[test]
+fn self_service_create_requests_eight_gib_without_changing_the_profile() {
+    let pubkey = "deadbeef".repeat(8);
+    let body = self_service_create_body(&pubkey);
+
+    assert_eq!(body["image"], "buzz-sprig-desktop");
+    assert_eq!(body["owner"], pubkey);
+    assert_eq!(body["ttl_seconds"], 1800);
+    assert_eq!(body["memory_mb"], 8192);
+    assert_eq!(body["env"]["BUZZ_DEV_MCP_BIND"], "0.0.0.0:9320");
+    assert_eq!(body["env"]["BUZZ_DEV_MCP_OWNER"], "deadbeef".repeat(8));
+    assert_eq!(body["env"]["BUZZ_DESKTOP_ENABLED"], "1");
+}
 
 #[test]
 fn reencodes_standard_base64_as_url_safe() {

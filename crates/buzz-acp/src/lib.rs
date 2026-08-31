@@ -4541,6 +4541,28 @@ mod agent_draft_prompt_tests {
             .contains("add them explicitly with `buzz channels add-member` only when authorized"));
         assert!(prompt.contains("never changes membership automatically"));
     }
+
+    #[test]
+    fn shared_base_prompt_requires_native_goals_for_multi_turn_delegation() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(
+            prompt.contains("Use native persistent goals for explicitly delegated multi-turn work")
+        );
+        assert!(prompt
+            .contains("create a concrete goal before publishing a pickup or progress message"));
+        assert!(prompt.contains(
+            "work first appeared finishable in one turn but you discover that delegated work will remain"
+        ));
+        assert!(prompt.contains("Keep that goal active through interim updates"));
+        assert!(prompt.contains("A progress message is not completion"));
+        assert!(prompt.contains("continue working without waiting for another prompt"));
+        assert!(prompt.contains("only after publishing the verified deliverable"));
+        assert!(prompt.contains("publish the concrete blocker and the input needed"));
+        assert!(prompt.contains("Do not create a persistent goal for a simple question"));
+        assert!(prompt.contains(
+            "steering, cancellation, pause, and resume instructions remain authoritative"
+        ));
+    }
 }
 
 #[cfg(test)]

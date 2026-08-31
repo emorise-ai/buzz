@@ -76,6 +76,7 @@ pub fn mint_sandbox_viewer_url(
 /// hardware. The broker clamps everything again on its side regardless.
 const SELF_SERVICE_IMAGE: &str = "buzz-sprig-desktop";
 const SELF_SERVICE_TTL_SECONDS: u64 = 1800;
+const SELF_SERVICE_MEMORY_MB: u64 = 8192;
 
 /// Path prefix the relay's reverse proxy forwards to the broker.
 const BROKER_PROXY_PREFIX: &str = "/sandbox-viewer";
@@ -106,6 +107,20 @@ fn is_hex_pubkey(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn self_service_create_body(agent_pubkey: &str) -> serde_json::Value {
+    serde_json::json!({
+        "image": SELF_SERVICE_IMAGE,
+        "owner": agent_pubkey,
+        "ttl_seconds": SELF_SERVICE_TTL_SECONDS,
+        "memory_mb": SELF_SERVICE_MEMORY_MB,
+        "env": {
+            "BUZZ_DEV_MCP_BIND": "0.0.0.0:9320",
+            "BUZZ_DEV_MCP_OWNER": agent_pubkey,
+            "BUZZ_DESKTOP_ENABLED": "1",
+        },
+    })
+}
+
 /// Create a sandbox owned by `agent_pubkey` — the app-side "Start computer".
 ///
 /// Returns the broker's create response. The UI does not need it to render:
@@ -132,16 +147,7 @@ pub async fn create_agent_sandbox(
     // Tools-only mode: a long-lived tools server plus a visible screen, no
     // second agent harness inside. The in-sandbox tools server refuses to
     // serve without knowing its owner.
-    let body = serde_json::json!({
-        "image": SELF_SERVICE_IMAGE,
-        "owner": agent_pubkey,
-        "ttl_seconds": SELF_SERVICE_TTL_SECONDS,
-        "env": {
-            "BUZZ_DEV_MCP_BIND": "0.0.0.0:9320",
-            "BUZZ_DEV_MCP_OWNER": agent_pubkey,
-            "BUZZ_DESKTOP_ENABLED": "1",
-        },
-    });
+    let body = self_service_create_body(&agent_pubkey);
     let bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
     let auth = build_nip98_auth_header(&Method::POST, &url, &bytes, &state)?;
     let response = state
