@@ -4548,11 +4548,12 @@ mod agent_draft_prompt_tests {
         assert!(
             prompt.contains("Use native persistent goals for explicitly delegated multi-turn work")
         );
-        assert!(prompt
-            .contains("create a concrete goal before publishing a pickup or progress message"));
+        assert!(prompt.contains("call the `create_goal` tool"));
+        assert!(prompt.contains("the native goal must actually be active"));
         assert!(prompt.contains(
             "work first appeared finishable in one turn but you discover that delegated work will remain"
         ));
+        assert!(prompt.contains("call `create_goal` before publishing any interim update"));
         assert!(prompt.contains("Keep that goal active through interim updates"));
         assert!(prompt.contains("A progress message is not completion"));
         assert!(prompt.contains("continue working without waiting for another prompt"));
