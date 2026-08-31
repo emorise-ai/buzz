@@ -179,6 +179,7 @@ RUN install -d -o agent -g agent \
 COPY --chmod=0755 scripts/sprig-desktop-browser.sh /usr/local/bin/buzz-browser
 COPY --chmod=0755 scripts/sprig-desktop-entrypoint.sh /usr/local/bin/sprig-desktop-entrypoint
 COPY --chmod=0755 scripts/sprig-desktop-profile-locks.sh /usr/local/bin/sprig-desktop-profile-locks.sh
+COPY --chmod=0755 scripts/sprig-desktop-webgl-policy.sh /usr/local/bin/sprig-desktop-webgl-policy.sh
 COPY --chmod=0755 scripts/sprig-desktop-supervise.sh /usr/local/bin/sprig-desktop-supervise
 COPY --chmod=0755 scripts/sprig-desktop-webgl-health.mjs /usr/local/bin/sprig-desktop-webgl-health.mjs
 COPY scripts/sprig-desktop-openbox-rc.xml /usr/local/share/buzz-desktop/home/.config/openbox/rc.xml

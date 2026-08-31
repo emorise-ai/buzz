@@ -16,6 +16,10 @@ if ! source "$SUPERVISOR_DIR/sprig-desktop-profile-locks.sh"; then
     log "browser process helper could not be loaded; the agent will run without a screen"
     exit 0
 fi
+if ! source "$SUPERVISOR_DIR/sprig-desktop-webgl-policy.sh"; then
+    log "WebGL recovery policy could not be loaded; the agent will run without a screen"
+    exit 0
+fi
 BROWSER_PROCESS_STATUS=0
 
 inspect_browser_processes() {
@@ -294,21 +298,26 @@ launch_browser() {
 browser_webgl_healthy() {
     if ! command -v node >/dev/null 2>&1; then
         BROWSER_HEALTH_OUTPUT="WebGL health unavailable: node is not installed"
-        return 2
+        return 3
     fi
     if [ ! -r "$WEBGL_HEALTH_SCRIPT" ]; then
         BROWSER_HEALTH_OUTPUT="WebGL health unavailable: ${WEBGL_HEALTH_SCRIPT} is missing"
-        return 2
+        return 3
     fi
-    if BROWSER_HEALTH_OUTPUT=$(node "$WEBGL_HEALTH_SCRIPT" "http://127.0.0.1:${CDP_PORT}" 2>&1); then
-        return 0
-    fi
-    return 1
+    local health_status=0
+    BROWSER_HEALTH_OUTPUT=$(node "$WEBGL_HEALTH_SCRIPT" "http://127.0.0.1:${CDP_PORT}" 2>&1) || health_status=$?
+    case "$health_status" in
+        0|1|2) return "$health_status" ;;
+        *)
+            BROWSER_HEALTH_OUTPUT="WebGL health unavailable: health process exited ${health_status}: ${BROWSER_HEALTH_OUTPUT}"
+            return 3
+            ;;
+    esac
 }
 
 wait_for_browser_health() {
     local deadline=$((SECONDS + WEBGL_STARTUP_TIMEOUT_SECONDS))
-    local health_status
+    local health_status=1
 
     while [ "$SECONDS" -lt "$deadline" ]; do
         health_status=0
@@ -318,13 +327,17 @@ wait_for_browser_health() {
                 log "browser ready; agent control on :${CDP_PORT}; ${BROWSER_HEALTH_OUTPUT}"
                 return 0
                 ;;
-            2)
+            3)
                 log "${BROWSER_HEALTH_OUTPUT}; renderer readiness cannot be established"
-                return 2
+                return 3
                 ;;
         esac
         sleep 0.5
     done
+    if [ "$health_status" -eq 2 ]; then
+        log "browser renderer health remained inconclusive: ${BROWSER_HEALTH_OUTPUT}"
+        return 2
+    fi
     log "browser renderer did not become healthy: ${BROWSER_HEALTH_OUTPUT}"
     return 1
 }
@@ -346,6 +359,7 @@ wait_for_browser_health || startup_health_status=$?
 case "$startup_health_status" in
     0) ;;
     1) restart_unhealthy_browser || true ;;
+    2) log "renderer recovery deferred because startup health remained inconclusive" ;;
     *) log "renderer recovery deferred because the health check is unavailable" ;;
 esac
 
@@ -362,23 +376,29 @@ while true; do
         launch_browser
         wait_for_browser_health || true
     elif [ "$BROWSER_PROCESS_STATUS" -ne 0 ]; then
+        BROWSER_HEALTH_FAILURES=0
         log "browser process inspection failed; recovery deferred"
     else
         runtime_health_status=0
         browser_webgl_healthy || runtime_health_status=$?
-        case "$runtime_health_status" in
-            0) BROWSER_HEALTH_FAILURES=0 ;;
-            2)
-                BROWSER_HEALTH_FAILURES=0
+        read -r runtime_health_action BROWSER_HEALTH_FAILURES <<< "$(buzz_runtime_webgl_policy \
+            "$runtime_health_status" \
+            "$BROWSER_HEALTH_FAILURES" \
+            "$WEBGL_RUNTIME_FAILURE_THRESHOLD")"
+        case "$runtime_health_action" in
+            healthy) ;;
+            inconclusive)
+                log "${BROWSER_HEALTH_OUTPUT}; renderer health inconclusive; retrying next interval"
+                ;;
+            unavailable)
                 log "${BROWSER_HEALTH_OUTPUT}; renderer recovery deferred"
                 ;;
-            *)
-                BROWSER_HEALTH_FAILURES=$((BROWSER_HEALTH_FAILURES + 1))
+            failure)
                 log "browser renderer health failure ${BROWSER_HEALTH_FAILURES}/${WEBGL_RUNTIME_FAILURE_THRESHOLD}: ${BROWSER_HEALTH_OUTPUT}"
-                if [ "$BROWSER_HEALTH_FAILURES" -ge "$WEBGL_RUNTIME_FAILURE_THRESHOLD" ]; then
-                    BROWSER_HEALTH_FAILURES=0
-                    restart_unhealthy_browser || true
-                fi
+                ;;
+            restart)
+                log "browser renderer health failure ${WEBGL_RUNTIME_FAILURE_THRESHOLD}/${WEBGL_RUNTIME_FAILURE_THRESHOLD}: ${BROWSER_HEALTH_OUTPUT}"
+                restart_unhealthy_browser || true
                 ;;
         esac
     fi

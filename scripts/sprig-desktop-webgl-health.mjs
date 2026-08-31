@@ -4,6 +4,15 @@ import { pathToFileURL } from "node:url";
 const DEFAULT_CDP_URL = "http://127.0.0.1:9222";
 const DEFAULT_TIMEOUT_MS = 2000;
 
+class CdpCommunicationError extends Error {}
+class CdpProtocolError extends Error {}
+
+export class HealthInconclusiveError extends Error {}
+
+export function healthExitCode(error) {
+  return error instanceof HealthInconclusiveError ? 2 : 1;
+}
+
 const PAGE_WEBGL_PROBE = `(() => {
   const probeCanvas = typeof OffscreenCanvas === "function"
     ? new OffscreenCanvas(1, 1)
@@ -32,26 +41,32 @@ function requireRecord(value, label) {
 
 function remainingMs(deadline, label) {
   const remaining = deadline - Date.now();
-  if (remaining <= 0) throw new Error(`${label} timed out`);
+  if (remaining <= 0) throw new CdpCommunicationError(`${label} timed out`);
   return remaining;
 }
 
 async function fetchJson(url, { fetchImpl, deadline, label }) {
   let response;
+  const signal = AbortSignal.timeout(remainingMs(deadline, label));
   try {
     response = await fetchImpl(url, {
-      signal: AbortSignal.timeout(remainingMs(deadline, label)),
+      signal,
     });
   } catch (error) {
-    throw new Error(
+    throw new CdpCommunicationError(
       `${label} is unreachable: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
   if (!response.ok)
-    throw new Error(`${label} returned HTTP ${response.status}`);
+    throw new CdpCommunicationError(
+      `${label} returned HTTP ${response.status}`,
+    );
   try {
     return await response.json();
   } catch {
+    if (signal.aborted) {
+      throw new CdpCommunicationError(`${label} timed out`);
+    }
     throw new Error(`${label} returned malformed JSON`);
   }
 }
@@ -140,7 +155,7 @@ export function openCdpSocket(url, { WebSocketImpl, deadline }) {
       socket = new WebSocketImpl(url);
     } catch (error) {
       reject(
-        new Error(
+        new CdpCommunicationError(
           `CDP websocket could not be created: ${error instanceof Error ? error.message : String(error)}`,
         ),
       );
@@ -159,17 +174,17 @@ export function openCdpSocket(url, { WebSocketImpl, deadline }) {
     };
     const onError = () => {
       cleanup();
-      reject(new Error("CDP websocket connection failed"));
+      reject(new CdpCommunicationError("CDP websocket connection failed"));
     };
     const onClose = () => {
       cleanup();
-      reject(new Error("CDP websocket closed before opening"));
+      reject(new CdpCommunicationError("CDP websocket closed before opening"));
     };
     const timeout = setTimeout(
       () => {
         cleanup();
         socket.close();
-        reject(new Error("CDP websocket connection timed out"));
+        reject(new CdpCommunicationError("CDP websocket connection timed out"));
       },
       remainingMs(deadline, "CDP websocket connection"),
     );
@@ -201,7 +216,9 @@ export function requestCdp(socket, method, params, { deadline, requestId }) {
       cleanup();
       if (message.error) {
         reject(
-          new Error(`CDP ${method} failed: ${JSON.stringify(message.error)}`),
+          new CdpProtocolError(
+            `CDP ${method} failed: ${JSON.stringify(message.error)}`,
+          ),
         );
       } else {
         resolve(message.result);
@@ -209,16 +226,20 @@ export function requestCdp(socket, method, params, { deadline, requestId }) {
     };
     const onError = () => {
       cleanup();
-      reject(new Error(`CDP ${method} websocket failed`));
+      reject(new CdpCommunicationError(`CDP ${method} websocket failed`));
     };
     const onClose = () => {
       cleanup();
-      reject(new Error(`CDP ${method} websocket closed before responding`));
+      reject(
+        new CdpCommunicationError(
+          `CDP ${method} websocket closed before responding`,
+        ),
+      );
     };
     const timeout = setTimeout(
       () => {
         cleanup();
-        reject(new Error(`CDP ${method} timed out`));
+        reject(new CdpCommunicationError(`CDP ${method} timed out`));
       },
       remainingMs(deadline, `CDP ${method}`),
     );
@@ -231,7 +252,7 @@ export function requestCdp(socket, method, params, { deadline, requestId }) {
     } catch (error) {
       cleanup();
       reject(
-        new Error(
+        new CdpCommunicationError(
           `CDP ${method} request failed: ${error instanceof Error ? error.message : String(error)}`,
         ),
       );
@@ -284,40 +305,62 @@ export async function readCdpHealthState(
     browserSocket.close();
   }
 
-  const targets = await fetchJson(`${cdpUrl}/json/list`, {
-    fetchImpl,
-    deadline,
-    label: "CDP target endpoint",
-  });
-  const pageTargets = Array.isArray(targets)
-    ? targets.filter(
-        (target) =>
-          target?.type === "page" &&
-          typeof target.webSocketDebuggerUrl === "string",
-      )
-    : [];
-  const pageTarget = selectWebglProbeTarget(pageTargets);
-  if (!pageTarget) throw new Error("CDP has no inspectable page target");
+  // Only a browser-wide result can establish that the renderer itself is
+  // healthy. Once that boundary has passed, failure to schedule work on a
+  // busy CAD page is inconclusive rather than evidence of a GPU failure.
+  evaluateGpuHealth(systemInfo);
 
-  const pageSocket = await openCdpSocket(pageTarget.webSocketDebuggerUrl, {
-    WebSocketImpl,
-    deadline,
-  });
-  let evaluation;
   try {
-    evaluation = await requestCdp(
-      pageSocket,
-      "Runtime.evaluate",
-      { expression: PAGE_WEBGL_PROBE, returnByValue: true },
-      { deadline, requestId: 2 },
+    const targets = await fetchJson(`${cdpUrl}/json/list`, {
+      fetchImpl,
+      deadline,
+      label: "CDP target endpoint",
+    });
+    if (!Array.isArray(targets)) {
+      throw new Error("CDP target response is missing or malformed");
+    }
+    const pageTargets = targets.filter(
+      (target) =>
+        target?.type === "page" &&
+        typeof target.webSocketDebuggerUrl === "string",
     );
-  } finally {
-    pageSocket.close();
+    const pageTarget = selectWebglProbeTarget(pageTargets);
+    if (!pageTarget) {
+      throw new CdpCommunicationError("CDP has no inspectable page target");
+    }
+
+    const pageSocket = await openCdpSocket(pageTarget.webSocketDebuggerUrl, {
+      WebSocketImpl,
+      deadline,
+    });
+    let evaluation;
+    try {
+      evaluation = await requestCdp(
+        pageSocket,
+        "Runtime.evaluate",
+        { expression: PAGE_WEBGL_PROBE, returnByValue: true },
+        { deadline, requestId: 2 },
+      );
+    } finally {
+      pageSocket.close();
+    }
+    if (evaluation?.exceptionDetails) {
+      throw new HealthInconclusiveError(
+        "browser GPU is healthy but the page WebGL probe threw an exception",
+      );
+    }
+    return { systemInfo, pageProbe: evaluation?.result?.value };
+  } catch (error) {
+    if (
+      error instanceof CdpCommunicationError ||
+      error instanceof CdpProtocolError
+    ) {
+      throw new HealthInconclusiveError(
+        `browser GPU is healthy but the page WebGL probe could not answer: ${error.message}`,
+      );
+    }
+    throw error;
   }
-  if (evaluation?.exceptionDetails) {
-    throw new Error("page WebGL probe threw an exception");
-  }
-  return { systemInfo, pageProbe: evaluation?.result?.value };
 }
 
 export async function checkWebglHealth(cdpUrl = DEFAULT_CDP_URL, dependencies) {
@@ -338,7 +381,7 @@ async function main() {
     process.stderr.write(
       `${error instanceof Error ? error.message : String(error)}\n`,
     );
-    process.exitCode = 1;
+    process.exitCode = healthExitCode(error);
   }
 }
 
