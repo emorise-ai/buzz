@@ -26,11 +26,35 @@ else
 fi
 
 CHROMIUM_PROFILE=/home/agent/.config/chromium
+declare -a BROWSER_ARGUMENTS=()
 for argument in "$@"; do
     case "$argument" in
-        --user-data-dir=*) CHROMIUM_PROFILE=${argument#--user-data-dir=} ;;
+        # Keep only the final requested profile and append it exactly once.
+        # Cleanup and Chromium must agree on the same effective directory.
+        --user-data-dir=*)
+            CHROMIUM_PROFILE=${argument#--user-data-dir=}
+            continue
+            ;;
+        # Renderer selection belongs to this shared boundary. Discard stale
+        # or caller-supplied policy that could replace or disable WebGL before
+        # adding the image's known-good Mesa path below.
+        --use-gl=* | --use-angle=* | --enable-unsafe-swiftshader | --ignore-gpu-blocklist) continue ;;
+        --disable-gpu | --disable-gpu=* | --disable-webgl | --disable-webgl=* | --disable-webgl2 | --disable-webgl2=*) continue ;;
+        --disable-3d-apis | --disable-3d-apis=* | --disable-software-rasterizer | --disable-software-rasterizer=* | --disable-gpu-compositing | --disable-gpu-compositing=*) continue ;;
     esac
+    BROWSER_ARGUMENTS+=("$argument")
 done
+
+# Xvfb exposes no DRI device. ANGLE's OpenGL backend therefore resolves through
+# Mesa's llvmpipe software renderer, which keeps a WebGL2 context alive under
+# Onshape's workload. Keep these arguments here so supervisor, broker, dock,
+# and Openbox launches cannot drift to SwiftShader or disable WebGL.
+BROWSER_ARGUMENTS+=(
+    --user-data-dir="$CHROMIUM_PROFILE"
+    --use-gl=angle
+    --use-angle=gl
+    --ignore-gpu-blocklist
+)
 
 # Every browser entry point uses this wrapper. Serialize the short transition
 # from stale-lock cleanup until the new browser process is visible, so a dock,
@@ -42,7 +66,7 @@ browser_status=0
 buzz_browser_process_running || browser_status=$?
 if [ "$browser_status" -eq 0 ]; then
     flock -u 9
-    exec "$BROWSER_COMMAND" "$@"
+    exec "$BROWSER_COMMAND" "${BROWSER_ARGUMENTS[@]}"
 fi
 
 recovery_status=0
@@ -51,13 +75,13 @@ if [ "$recovery_status" -eq 1 ]; then
     # A browser appeared between the process check and recovery. Do not touch
     # its profile; let Chromium route this request to the live instance.
     flock -u 9
-    exec "$BROWSER_COMMAND" "$@"
+    exec "$BROWSER_COMMAND" "${BROWSER_ARGUMENTS[@]}"
 fi
 if [ "$recovery_status" -ne 0 ]; then
     echo "[desktop] profile-lock recovery was incomplete; Chromium will validate the profile" >&2
 fi
 
-"$BROWSER_COMMAND" "$@" &
+"$BROWSER_COMMAND" "${BROWSER_ARGUMENTS[@]}" &
 browser_pid=$!
 for _ in $(seq 1 100); do
     if buzz_browser_process_running; then

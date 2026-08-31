@@ -1,0 +1,296 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  checkWebglHealth,
+  evaluateGpuHealth,
+  evaluatePageWebglProbe,
+  openCdpSocket,
+  readCdpHealthState,
+  requestCdp,
+} from "./sprig-desktop-webgl-health.mjs";
+
+function healthySystemInfo() {
+  return {
+    gpu: {
+      auxAttributes: {
+        displayType: "ANGLE_OPENGL",
+        glRenderer:
+          "ANGLE (Mesa/X.org, llvmpipe (LLVM 15.0.6 128 bits), OpenGL 4.5 (Core Profile) Mesa 22.3.6)",
+        processCrashCount: 0,
+      },
+      featureStatus: { webgl: "enabled" },
+    },
+  };
+}
+
+function healthyPageProbe() {
+  return {
+    offscreenCanvas: true,
+    webgl2: true,
+    probeContextLost: false,
+    floatColorBuffer: true,
+    floatTextureLinear: true,
+  };
+}
+
+class MockSocket {
+  listeners = new Map();
+
+  addEventListener(name, listener) {
+    const listeners = this.listeners.get(name) ?? [];
+    listeners.push(listener);
+    this.listeners.set(name, listeners);
+  }
+
+  removeEventListener(name, listener) {
+    this.listeners.set(
+      name,
+      (this.listeners.get(name) ?? []).filter(
+        (candidate) => candidate !== listener,
+      ),
+    );
+  }
+
+  emit(name, event = {}) {
+    for (const listener of [...(this.listeners.get(name) ?? [])])
+      listener(event);
+  }
+
+  close() {}
+
+  send() {}
+}
+
+test("accepts the proven GPU and page-level WebGL2 state", () => {
+  assert.equal(evaluateGpuHealth(healthySystemInfo()).webgl, "enabled");
+  assert.equal(evaluatePageWebglProbe(healthyPageProbe()).webgl2, true);
+});
+
+test("rejects disabled WebGL and a crashed GPU process", () => {
+  const disabled = healthySystemInfo();
+  disabled.gpu.featureStatus.webgl = "unavailable_software";
+  assert.throws(() => evaluateGpuHealth(disabled), /WebGL is not enabled/);
+
+  const crashed = healthySystemInfo();
+  crashed.gpu.auxAttributes.processCrashCount = 2;
+  assert.throws(() => evaluateGpuHealth(crashed), /crashed 2 time/);
+});
+
+test("rejects a renderer that drifted away from ANGLE OpenGL and llvmpipe", () => {
+  const wrongBackend = healthySystemInfo();
+  wrongBackend.gpu.auxAttributes.displayType = "ANGLE_VULKAN";
+  assert.throws(
+    () => evaluateGpuHealth(wrongBackend),
+    /unexpected Chromium GL backend/,
+  );
+
+  const wrongRenderer = healthySystemInfo();
+  wrongRenderer.gpu.auxAttributes.glRenderer =
+    "ANGLE (Google, Vulkan SwiftShader)";
+  assert.throws(
+    () => evaluateGpuHealth(wrongRenderer),
+    /unexpected Chromium WebGL renderer/,
+  );
+});
+
+test("rejects absent WebGL2 and each required float extension", () => {
+  const absent = healthyPageProbe();
+  absent.webgl2 = false;
+  assert.throws(
+    () => evaluatePageWebglProbe(absent),
+    /create a WebGL2 context/,
+  );
+
+  const noColorBuffer = healthyPageProbe();
+  noColorBuffer.floatColorBuffer = false;
+  assert.throws(
+    () => evaluatePageWebglProbe(noColorBuffer),
+    /EXT_color_buffer_float/,
+  );
+
+  const noFloatLinear = healthyPageProbe();
+  noFloatLinear.floatTextureLinear = false;
+  assert.throws(
+    () => evaluatePageWebglProbe(noFloatLinear),
+    /OES_texture_float_linear/,
+  );
+});
+
+test("rejects a missing isolated canvas or lost probe context", () => {
+  const missingOffscreen = healthyPageProbe();
+  missingOffscreen.offscreenCanvas = false;
+  assert.throws(
+    () => evaluatePageWebglProbe(missingOffscreen),
+    /lacks OffscreenCanvas/,
+  );
+
+  const lostProbe = healthyPageProbe();
+  lostProbe.probeContextLost = true;
+  assert.throws(
+    () => evaluatePageWebglProbe(lostProbe),
+    /probe context is lost/,
+  );
+});
+
+test("rejects malformed GPU and page probe state", () => {
+  assert.throws(() => evaluateGpuHealth({ gpu: null }), /missing or malformed/);
+  const invalidCount = healthySystemInfo();
+  invalidCount.gpu.auxAttributes.processCrashCount = "0";
+  assert.throws(
+    () => evaluateGpuHealth(invalidCount),
+    /invalid GPU-process crash count/,
+  );
+});
+
+test("websocket connection rejects timeout, error, and early close", async (t) => {
+  await t.test("timeout", async () => {
+    await assert.rejects(
+      openCdpSocket("ws://timeout", {
+        WebSocketImpl: class extends MockSocket {},
+        deadline: Date.now() + 20,
+      }),
+      /connection timed out/,
+    );
+  });
+
+  for (const [event, expected] of [
+    ["error", /connection failed/],
+    ["close", /closed before opening/],
+  ]) {
+    await t.test(event, async () => {
+      class Socket extends MockSocket {
+        constructor() {
+          super();
+          queueMicrotask(() => this.emit(event));
+        }
+      }
+      await assert.rejects(
+        openCdpSocket(`ws://${event}`, {
+          WebSocketImpl: Socket,
+          deadline: Date.now() + 100,
+        }),
+        expected,
+      );
+    });
+  }
+});
+
+test("CDP request rejects timeout, socket error, close, malformed JSON, and protocol error", async (t) => {
+  const request = (socket, deadline = Date.now() + 100) =>
+    requestCdp(socket, "SystemInfo.getInfo", {}, { deadline, requestId: 7 });
+
+  await t.test("timeout", async () => {
+    await assert.rejects(
+      request(new MockSocket(), Date.now() + 20),
+      /timed out/,
+    );
+  });
+
+  for (const [event, expected] of [
+    ["error", /websocket failed/],
+    ["close", /closed before responding/],
+  ]) {
+    await t.test(event, async () => {
+      class Socket extends MockSocket {
+        send() {
+          queueMicrotask(() => this.emit(event));
+        }
+      }
+      await assert.rejects(request(new Socket()), expected);
+    });
+  }
+
+  await t.test("malformed JSON", async () => {
+    class Socket extends MockSocket {
+      send() {
+        queueMicrotask(() => this.emit("message", { data: "{" }));
+      }
+    }
+    await assert.rejects(request(new Socket()), /returned malformed JSON/);
+  });
+
+  await t.test("CDP protocol error", async () => {
+    class Socket extends MockSocket {
+      send() {
+        queueMicrotask(() =>
+          this.emit("message", {
+            data: JSON.stringify({
+              id: 7,
+              error: { code: -1, message: "failed" },
+            }),
+          }),
+        );
+      }
+    }
+    await assert.rejects(request(new Socket()), /SystemInfo.getInfo failed/);
+  });
+});
+
+test("CDP HTTP endpoint errors and malformed JSON are explicit", async () => {
+  await assert.rejects(
+    readCdpHealthState("http://127.0.0.1:9222", {
+      fetchImpl: async () => {
+        throw new Error("connection refused");
+      },
+      WebSocketImpl: class {},
+    }),
+    /is unreachable: connection refused/,
+  );
+  await assert.rejects(
+    readCdpHealthState("http://127.0.0.1:9222", {
+      fetchImpl: async () => ({ ok: false, status: 503 }),
+      WebSocketImpl: class {},
+    }),
+    /returned HTTP 503/,
+  );
+  await assert.rejects(
+    readCdpHealthState("http://127.0.0.1:9222", {
+      fetchImpl: async () => ({
+        ok: true,
+        json: async () => {
+          throw new Error("bad JSON");
+        },
+      }),
+      WebSocketImpl: class {},
+    }),
+    /returned malformed JSON/,
+  );
+});
+
+test("checkWebglHealth probes SystemInfo and an actual page target", async () => {
+  class ScriptedWebSocket extends MockSocket {
+    constructor(url) {
+      super();
+      this.url = url;
+      queueMicrotask(() => this.emit("open"));
+    }
+
+    send(message) {
+      const request = JSON.parse(message);
+      const result =
+        request.method === "SystemInfo.getInfo"
+          ? healthySystemInfo()
+          : { result: { value: healthyPageProbe() } };
+      queueMicrotask(() =>
+        this.emit("message", {
+          data: JSON.stringify({ id: request.id, result }),
+        }),
+      );
+    }
+  }
+
+  const fetchImpl = async (url) => ({
+    ok: true,
+    json: async () =>
+      url.endsWith("/json/version")
+        ? { webSocketDebuggerUrl: "ws://browser" }
+        : [{ type: "page", webSocketDebuggerUrl: "ws://page" }],
+  });
+  const health = await checkWebglHealth("http://127.0.0.1:9222", {
+    fetchImpl,
+    WebSocketImpl: ScriptedWebSocket,
+  });
+  assert.equal(health.webgl, "enabled");
+  assert.equal(health.pageProbe.floatColorBuffer, true);
+});

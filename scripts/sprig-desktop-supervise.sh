@@ -10,16 +10,49 @@ set -uo pipefail
 
 log() { echo "[desktop] $*" >&2; }
 
-shutdown_desktop() {
-    log "shutdown requested; asking Chromium to flush its persistent profile"
+SUPERVISOR_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/sprig-desktop-profile-locks.sh
+if ! source "$SUPERVISOR_DIR/sprig-desktop-profile-locks.sh"; then
+    log "browser process helper could not be loaded; the agent will run without a screen"
+    exit 0
+fi
+BROWSER_PROCESS_STATUS=0
+
+inspect_browser_processes() {
+    BROWSER_PROCESS_STATUS=0
+    buzz_browser_process_running || BROWSER_PROCESS_STATUS=$?
+}
+
+stop_browser_gracefully() {
+    inspect_browser_processes
+    if [ "$BROWSER_PROCESS_STATUS" -eq 1 ]; then
+        return 0
+    fi
+    if [ "$BROWSER_PROCESS_STATUS" -ne 0 ]; then
+        log "could not inspect Chromium processes; refusing to start a competing profile owner"
+        return 1
+    fi
+
     pkill -TERM -x chrome >/dev/null 2>&1 || true
     pkill -TERM -x chromium >/dev/null 2>&1 || true
     for _ in $(seq 1 50); do
-        if ! pgrep -x chrome >/dev/null 2>&1 && ! pgrep -x chromium >/dev/null 2>&1; then
-            break
+        inspect_browser_processes
+        if [ "$BROWSER_PROCESS_STATUS" -eq 1 ]; then
+            return 0
+        fi
+        if [ "$BROWSER_PROCESS_STATUS" -ne 0 ]; then
+            log "could not inspect Chromium processes during graceful shutdown"
+            return 1
         fi
         sleep 0.2
     done
+    log "Chromium did not exit after its graceful shutdown window"
+    return 1
+}
+
+shutdown_desktop() {
+    log "shutdown requested; asking Chromium to flush its persistent profile"
+    stop_browser_gracefully || true
     exit 0
 }
 trap shutdown_desktop TERM INT
@@ -30,6 +63,10 @@ trap shutdown_desktop TERM INT
 : "${DESKTOP_PORT:=6080}"
 : "${CDP_PORT:=9222}"
 : "${TERMINAL_PORT:=7681}"
+: "${WEBGL_HEALTH_SCRIPT:=/usr/local/bin/sprig-desktop-webgl-health.mjs}"
+: "${WEBGL_STARTUP_TIMEOUT_SECONDS:=35}"
+: "${WEBGL_HEALTH_INTERVAL_SECONDS:=15}"
+: "${WEBGL_RUNTIME_FAILURE_THRESHOLD:=2}"
 # Homepage the browser opens on. Set BUZZ_DESKTOP_HOME to change it. Defaults
 # to a local dark start page rather than about:blank — about:blank renders
 # white even under --force-dark-mode (it's a Chromium-internal page, not a
@@ -212,19 +249,16 @@ fi
 # visible wallpaper margin, a normal title bar, and room to see Thunar or
 # the terminal alongside it reads as a real desktop instead. 1700x950 with
 # generous margin on a 1920x1080 screen: ((1920-1700)/2, (1080-950)/2).
-# buzz-browser resolves to Google Chrome on amd64 and Chromium elsewhere;
-# both accept this flag set, and both get the same profile dir so a switch
-# of binary never orphans the human's logins.
+# buzz-browser prefers Chromium on every architecture and retains a fallback
+# only for older diagnostic images. Both binaries accept this flag set and use
+# the same profile directory, so the fallback never orphans the human's logins.
 #
-# --use-gl=angle --use-angle=swiftshader-webgl / --enable-unsafe-swiftshader /
-# --ignore-gpu-blocklist: there is no GPU or DRI device in this container (see
-# the picom --backend xrender note above), so Chromium's default GPU checks
-# blocklist this environment and WebGL reports "not enabled" to pages (e.g.
-# Onshape, Figma, any three.js/WebGL app) even though the CPU has plenty of
-# headroom to software-render it via SwiftShader. These flags force Chromium
-# onto its CPU-rasterized WebGL path instead of trying (and failing) to find
-# real GPU hardware.
+# Renderer selection is deliberately owned by buzz-browser. It applies the
+# same ANGLE-over-Mesa llvmpipe policy to this supervised browser and every
+# alternate launch path that shares the persistent profile.
 CHROMIUM_PROFILE=/home/agent/.config/chromium
+BROWSER_HEALTH_OUTPUT=""
+BROWSER_HEALTH_FAILURES=0
 
 launch_browser() {
     local session_args=()
@@ -253,35 +287,100 @@ launch_browser() {
         --window-position=110,65 \
         --no-sandbox \
         --test-type \
-        --use-gl=angle \
-        --use-angle=swiftshader-webgl \
-        --enable-unsafe-swiftshader \
-        --ignore-gpu-blocklist \
         "${session_args[@]}" \
         >>/tmp/chromium.log 2>&1 &
 }
 
+browser_webgl_healthy() {
+    if ! command -v node >/dev/null 2>&1; then
+        BROWSER_HEALTH_OUTPUT="WebGL health unavailable: node is not installed"
+        return 2
+    fi
+    if [ ! -r "$WEBGL_HEALTH_SCRIPT" ]; then
+        BROWSER_HEALTH_OUTPUT="WebGL health unavailable: ${WEBGL_HEALTH_SCRIPT} is missing"
+        return 2
+    fi
+    if BROWSER_HEALTH_OUTPUT=$(node "$WEBGL_HEALTH_SCRIPT" "http://127.0.0.1:${CDP_PORT}" 2>&1); then
+        return 0
+    fi
+    return 1
+}
+
+wait_for_browser_health() {
+    local deadline=$((SECONDS + WEBGL_STARTUP_TIMEOUT_SECONDS))
+    local health_status
+
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        health_status=0
+        browser_webgl_healthy || health_status=$?
+        case "$health_status" in
+            0)
+                log "browser ready; agent control on :${CDP_PORT}; ${BROWSER_HEALTH_OUTPUT}"
+                return 0
+                ;;
+            2)
+                log "${BROWSER_HEALTH_OUTPUT}; renderer readiness cannot be established"
+                return 2
+                ;;
+        esac
+        sleep 0.5
+    done
+    log "browser renderer did not become healthy: ${BROWSER_HEALTH_OUTPUT}"
+    return 1
+}
+
+restart_unhealthy_browser() {
+    log "browser renderer unhealthy: ${BROWSER_HEALTH_OUTPUT}; restarting Chromium gracefully"
+    if ! stop_browser_gracefully; then
+        log "renderer recovery deferred because Chromium did not exit cleanly"
+        return 1
+    fi
+    launch_browser
+    wait_for_browser_health
+}
+
 : >/tmp/chromium.log
 launch_browser
-
-for _ in $(seq 1 60); do
-    if curl -sS --max-time 1 "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1; then
-        log "browser ready; agent control on :${CDP_PORT}"
-        break
-    fi
-    sleep 0.5
-done
+startup_health_status=0
+wait_for_browser_health || startup_health_status=$?
+case "$startup_health_status" in
+    0) ;;
+    1) restart_unhealthy_browser || true ;;
+    *) log "renderer recovery deferred because the health check is unavailable" ;;
+esac
 
 # --- keep it alive ------------------------------------------------------
 # A crashed browser is the one failure worth repairing automatically: the agent
 # may be mid-task, and a human may be about to take over. Everything else is
 # left alone — restarting X under a live session would be worse than the fault.
 while true; do
-    sleep 15
-    # Chrome's process name is "chrome", Chromium's is "chromium" — check both.
-    if ! pgrep -x chrome >/dev/null 2>&1 && ! pgrep -x chromium >/dev/null 2>&1; then
+    sleep "$WEBGL_HEALTH_INTERVAL_SECONDS"
+    inspect_browser_processes
+    if [ "$BROWSER_PROCESS_STATUS" -eq 1 ]; then
         log "browser exited; restarting"
+        BROWSER_HEALTH_FAILURES=0
         launch_browser
+        wait_for_browser_health || true
+    elif [ "$BROWSER_PROCESS_STATUS" -ne 0 ]; then
+        log "browser process inspection failed; recovery deferred"
+    else
+        runtime_health_status=0
+        browser_webgl_healthy || runtime_health_status=$?
+        case "$runtime_health_status" in
+            0) BROWSER_HEALTH_FAILURES=0 ;;
+            2)
+                BROWSER_HEALTH_FAILURES=0
+                log "${BROWSER_HEALTH_OUTPUT}; renderer recovery deferred"
+                ;;
+            *)
+                BROWSER_HEALTH_FAILURES=$((BROWSER_HEALTH_FAILURES + 1))
+                log "browser renderer health failure ${BROWSER_HEALTH_FAILURES}/${WEBGL_RUNTIME_FAILURE_THRESHOLD}: ${BROWSER_HEALTH_OUTPUT}"
+                if [ "$BROWSER_HEALTH_FAILURES" -ge "$WEBGL_RUNTIME_FAILURE_THRESHOLD" ]; then
+                    BROWSER_HEALTH_FAILURES=0
+                    restart_unhealthy_browser || true
+                fi
+                ;;
+        esac
     fi
     if command -v ttyd >/dev/null 2>&1 && ! pgrep -x ttyd >/dev/null 2>&1; then
         log "ttyd exited; restarting"

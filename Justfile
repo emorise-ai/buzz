@@ -315,6 +315,8 @@ test-unit:
     set -euo pipefail
     ./scripts/test-ensure-local-relay-key.sh
     ./scripts/test-sprig-desktop-profile-locks.sh
+    ./scripts/test-sprig-desktop-webgl-config.sh
+    node --test ./scripts/test-sprig-desktop-webgl-health.mjs
     if command -v cargo-nextest &>/dev/null; then
         cargo nextest run -p buzz-core -p buzz-auth --lib
         cargo nextest run -p buzz-voice --lib

@@ -106,6 +106,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       fonts-liberation \
       fonts-noto-color-emoji \
       gnome-themes-extra \
+      libegl-mesa0 \
+      libgl1-mesa-dri \
+      libgles2 \
       novnc \
       openbox \
       picom \
@@ -177,6 +180,7 @@ COPY --chmod=0755 scripts/sprig-desktop-browser.sh /usr/local/bin/buzz-browser
 COPY --chmod=0755 scripts/sprig-desktop-entrypoint.sh /usr/local/bin/sprig-desktop-entrypoint
 COPY --chmod=0755 scripts/sprig-desktop-profile-locks.sh /usr/local/bin/sprig-desktop-profile-locks.sh
 COPY --chmod=0755 scripts/sprig-desktop-supervise.sh /usr/local/bin/sprig-desktop-supervise
+COPY --chmod=0755 scripts/sprig-desktop-webgl-health.mjs /usr/local/bin/sprig-desktop-webgl-health.mjs
 COPY scripts/sprig-desktop-openbox-rc.xml /usr/local/share/buzz-desktop/home/.config/openbox/rc.xml
 COPY scripts/sprig-desktop-menu.xml /usr/local/share/buzz-desktop/home/.config/openbox/menu.xml
 COPY scripts/sprig-desktop-start.html /usr/local/share/buzz-desktop/home/.buzz-start.html

@@ -8,21 +8,23 @@
 # no local Chrome or Chromium process is running.
 
 buzz_browser_process_running() {
+    local process_rows
+    local process_state
     local process_name
-    local status
 
-    for process_name in chrome chromium; do
-        pgrep -x "$process_name" >/dev/null 2>&1
-        status=$?
-        case "$status" in
-            0) return 0 ;;
-            1) ;;
-            *)
-                echo "[desktop] could not inspect browser processes; refusing profile-lock recovery" >&2
-                return 2
+    if ! process_rows=$(ps -eo stat=,comm= 2>/dev/null); then
+        echo "[desktop] could not inspect browser processes; refusing profile-lock recovery" >&2
+        return 2
+    fi
+    while read -r process_state process_name; do
+        case "$process_name" in
+            chrome | chromium)
+                # A zombie has exited and cannot own or mutate the persistent
+                # profile; PID 1 may take a moment to reap it in a container.
+                [[ "$process_state" == Z* ]] || return 0
                 ;;
         esac
-    done
+    done <<<"$process_rows"
     return 1
 }
 

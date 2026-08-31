@@ -8,14 +8,11 @@ source "$SCRIPT_DIR/sprig-desktop-profile-locks.sh"
 TEST_ROOT=$(mktemp -d)
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
-BROWSER_PROCESS=""
-PGREP_ERROR=0
-declare -a PGREP_NAMES=()
-pgrep() {
-    local process_name="${2:-}"
-    PGREP_NAMES+=("$process_name")
-    [ "$PGREP_ERROR" -eq 0 ] || return 2
-    [ "$process_name" = "$BROWSER_PROCESS" ]
+PS_ROWS=""
+PS_ERROR=0
+ps() {
+    [ "$PS_ERROR" -eq 0 ] || return 2
+    printf '%s\n' "$PS_ROWS"
 }
 
 fail() {
@@ -75,14 +72,14 @@ mkdir -p "$live_profile"
 for artifact in SingletonLock SingletonSocket SingletonCookie; do
     printf 'live\n' >"$live_profile/$artifact"
 done
-BROWSER_PROCESS="chrome"
+PS_ROWS="S chrome"
 if buzz_recover_chromium_profile_locks "$live_profile"; then
     fail "live browser should prevent profile-lock recovery"
 else
     status=$?
     [ "$status" -eq 1 ] || fail "expected live-browser status 1, got $status"
 fi
-BROWSER_PROCESS=""
+PS_ROWS=""
 for artifact in SingletonLock SingletonSocket SingletonCookie; do
     assert_exists "$live_profile/$artifact"
 done
@@ -91,29 +88,36 @@ echo "ok - a live browser prevents cleanup"
 chromium_profile="$TEST_ROOT/chromium-profile"
 mkdir -p "$chromium_profile"
 printf 'live\n' >"$chromium_profile/SingletonLock"
-BROWSER_PROCESS="chromium"
+PS_ROWS="S chromium"
 if buzz_recover_chromium_profile_locks "$chromium_profile"; then
     fail "live Chromium should prevent profile-lock recovery"
 fi
-BROWSER_PROCESS=""
+PS_ROWS=""
 assert_exists "$chromium_profile/SingletonLock"
-[[ " ${PGREP_NAMES[*]} " == *" chrome "* ]] || fail "chrome process name was not checked"
-[[ " ${PGREP_NAMES[*]} " == *" chromium "* ]] || fail "chromium process name was not checked"
 echo "ok - exact Chrome and Chromium process names both prevent cleanup"
 
 error_profile="$TEST_ROOT/process-error-profile"
 mkdir -p "$error_profile"
 printf 'keep\n' >"$error_profile/SingletonLock"
-PGREP_ERROR=1
+PS_ERROR=1
 if buzz_recover_chromium_profile_locks "$error_profile"; then
     fail "process-inspection failure should prevent profile-lock recovery"
 else
     status=$?
     [ "$status" -eq 2 ] || fail "expected process-inspection status 2, got $status"
 fi
-PGREP_ERROR=0
+PS_ERROR=0
 assert_exists "$error_profile/SingletonLock"
 echo "ok - process-inspection errors fail closed"
+
+zombie_profile="$TEST_ROOT/zombie-profile"
+mkdir -p "$zombie_profile"
+printf 'stale\n' >"$zombie_profile/SingletonLock"
+PS_ROWS="Z chromium"
+buzz_recover_chromium_profile_locks "$zombie_profile"
+PS_ROWS=""
+assert_missing "$zombie_profile/SingletonLock"
+echo "ok - an exited zombie cannot reserve or block recovery of the persistent profile"
 
 directory_profile="$TEST_ROOT/directory-profile"
 mkdir -p "$directory_profile/SingletonLock"
