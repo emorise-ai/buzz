@@ -115,6 +115,24 @@ export function evaluatePageWebglProbe(probeResult) {
   return probe;
 }
 
+export function selectWebglProbeTarget(pageTargets) {
+  const isOnshape = (target) => /(^|\.)onshape\.com\//i.test(target.url ?? "");
+  // A CAD document can keep its main thread busy for many seconds while it
+  // tessellates and uploads geometry. Running the synthetic probe in that
+  // thread turns healthy Onshape loading into a false timeout and causes the
+  // supervisor to restart the browser. Probe a lightweight sibling page when
+  // one exists; SystemInfo.getInfo still observes the browser-wide GPU process
+  // and its crash counter, which is the failure boundary we recover.
+  return (
+    pageTargets.find(
+      (target) =>
+        !isOnshape(target) && /^(https?|file|chrome):/i.test(target.url ?? ""),
+    ) ??
+    pageTargets.find((target) => !isOnshape(target)) ??
+    pageTargets[0]
+  );
+}
+
 export function openCdpSocket(url, { WebSocketImpl, deadline }) {
   return new Promise((resolve, reject) => {
     let socket;
@@ -278,12 +296,7 @@ export async function readCdpHealthState(
           typeof target.webSocketDebuggerUrl === "string",
       )
     : [];
-  const pageTarget =
-    pageTargets.find((target) =>
-      /(^|\.)onshape\.com\//i.test(target.url ?? ""),
-    ) ??
-    pageTargets.find((target) => /^(https?|file):/i.test(target.url ?? "")) ??
-    pageTargets[0];
+  const pageTarget = selectWebglProbeTarget(pageTargets);
   if (!pageTarget) throw new Error("CDP has no inspectable page target");
 
   const pageSocket = await openCdpSocket(pageTarget.webSocketDebuggerUrl, {

@@ -8,6 +8,7 @@ import {
   openCdpSocket,
   readCdpHealthState,
   requestCdp,
+  selectWebglProbeTarget,
 } from "./sprig-desktop-webgl-health.mjs";
 
 function healthySystemInfo() {
@@ -141,6 +142,19 @@ test("rejects malformed GPU and page probe state", () => {
     () => evaluateGpuHealth(invalidCount),
     /invalid GPU-process crash count/,
   );
+});
+
+test("probes a lightweight page instead of Onshape's busy CAD thread", () => {
+  const onshape = {
+    url: "https://cad.onshape.com/documents/abc",
+    webSocketDebuggerUrl: "ws://onshape",
+  };
+  const startPage = {
+    url: "file:///home/agent/.buzz-start.html",
+    webSocketDebuggerUrl: "ws://start",
+  };
+  assert.equal(selectWebglProbeTarget([onshape, startPage]), startPage);
+  assert.equal(selectWebglProbeTarget([onshape]), onshape);
 });
 
 test("websocket connection rejects timeout, error, and early close", async (t) => {
