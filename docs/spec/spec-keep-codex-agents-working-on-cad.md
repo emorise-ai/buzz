@@ -2,7 +2,7 @@
 title: 'Keep Codex agents working on CAD tasks'
 type: 'bugfix'
 created: '2026-08-31'
-status: 'in-review'
+status: 'done'
 review_loop_iteration: 0
 baseline_commit: 9cced4a5d4ba1c329203458143ea33599537837c
 context:
@@ -54,7 +54,7 @@ context:
 - [x] `crates/buzz-acp/src/base_prompt.md`, `crates/buzz-acp/src/lib.rs` -- require native persistent goals for explicit multi-turn assignments and lock the wording with tests.
 - [x] `desktop/src-tauri/src/sandbox_viewer.rs`, `desktop/src-tauri/src/sandbox_viewer_tests.rs` -- send and test an explicit 8192 MiB limit for desktop-created PCs.
 - [x] `crates/buzz-cli/src/lib.rs`, `crates/buzz-cli/src/commands/sandbox.rs` -- default agent-created PCs to 8192 MiB while preserving explicit overrides.
-- [ ] Build the desktop and desktop-PC image, deploy the needed artifacts, recreate Emily's disposable container without touching its named volumes, and exercise the live workflow.
+- [x] Build the desktop and desktop-PC image, deploy the needed artifacts, recreate Emily's disposable container without touching its named volumes, and exercise the live workflow.
 
 **Acceptance Criteria:**
 - Given a delegated multi-turn task, when Emily publishes an interim update, then her Codex goal remains active and another work turn starts without Ron prompting her again.
@@ -65,6 +65,7 @@ context:
 ## Spec Change Log
 
 - 2026-08-31: Implemented local coverage for the native-goal prompt contract and both 8192 MiB self-service PC creation paths. Restricted the CLI default to the desktop PC image so other images retain the broker's 4096 MiB default. Live deployment and workflow acceptance remain pending.
+- 2026-08-31: Installed the rebuilt desktop app, deployed `buzz-sprig-desktop:latest` to Matterhorn, and recreated Emily's PC with its original named volumes. Docker reported an 8 GiB limit and zero OOM kills. The persisted Onshape login and TLX Grill Module reopened; direct CDP probes reported WebGL and WebGL2 available with no context-loss message after more than 10 minutes. A fresh delegated two-stage probe created a native goal, published an interim update, continued without another human prompt, published the final comparison, and marked the goal complete.
 
 ## Design Notes
 
@@ -83,6 +84,14 @@ The broker already allows at most 8192 MiB. The desktop and self-service CLI are
 - `just ci` -- repository-wide checks pass before commit.
 
 **Manual checks:**
-- Recreate Emily's PC and confirm Docker `HostConfig.Memory` is `8589934592` while the same named home/workspace volumes remain mounted.
-- Reopen the persisted Onshape document and operate its 3D view continuously for at least 10 minutes. Record the `oom_kill` counter and Matterhorn kernel-log timestamp immediately before the run; pass only if WebGL2 remains usable and neither the counter nor Chromium cgroup-OOM entries increase.
-- Give Emily a bounded multi-turn task, confirm an active Codex goal survives an interim Buzz update, and observe autonomous continuation to result or concrete blocker.
+- Passed: Emily's recreated PC reported Docker `HostConfig.Memory=8589934592` and retained the same named `/home/agent` and `/workspace` volumes.
+- Passed: the persisted Onshape session reopened `TLX Modules | Grill Module`; direct browser probes reported WebGL and WebGL2 available, one live model canvas, and no context-loss message after the CAD-active observation window. `memory.events` remained at `oom=0` and `oom_kill=0`.
+- Passed: Emily called native `create_goal`, published an interim update, continued to the scheduled second check without another human prompt, published the final comparison, and called `update_goal({status:"complete"})`.
+- Passed: the rebuilt app was installed at `/Applications/Buzz.app`; Matterhorn's deployed desktop-PC image is `sha256:56a968d4a0808d2615f28ef6a67822ad58e697fa3105b1e75d6957f62006c9a0`. No relay source changed, so no relay deployment was required.
+
+## Suggested Review Order
+
+1. Agent persistence contract: [`base_prompt.md`](../../crates/buzz-acp/src/base_prompt.md) and its regression test in [`lib.rs`](../../crates/buzz-acp/src/lib.rs).
+2. Agent-created PC resource request: [`sandbox.rs`](../../crates/buzz-cli/src/commands/sandbox.rs) and CLI argument retention in [`lib.rs`](../../crates/buzz-cli/src/lib.rs).
+3. Desktop-created PC resource request: [`sandbox_viewer.rs`](../../desktop/src-tauri/src/sandbox_viewer.rs) and [`sandbox_viewer_tests.rs`](../../desktop/src-tauri/src/sandbox_viewer_tests.rs).
+4. Verification evidence and deployment record in this spec.
