@@ -16,7 +16,9 @@ use reqwest::Method;
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::app_state::AppState;
-use crate::relay::build_nip98_auth_header;
+use crate::relay::{build_nip98_auth_header, build_nip98_auth_header_for_hash};
+
+const SANDBOX_FILE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 type CmdResult<T> = Result<T, String>;
 
@@ -621,11 +623,6 @@ pub async fn sandbox_fs_download(
         let text = response.text().await.unwrap_or_default();
         return Err(broker_error(status.as_u16(), &text));
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("could not read the downloaded file: {e}"))?;
-
     let downloads_dir = dirs::download_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
         .ok_or_else(|| "could not determine the Downloads directory".to_string())?;
@@ -638,7 +635,42 @@ pub async fn sandbox_fs_download(
         .filter(|s| !s.is_empty())
         .unwrap_or("download");
     let dest = unique_destination(&downloads_dir, file_name);
-    std::fs::write(&dest, &bytes).map_err(|e| format!("could not save the file: {e}"))?;
+    if response
+        .content_length()
+        .is_some_and(|size| size > SANDBOX_FILE_MAX_BYTES)
+    {
+        return Err("file is larger than the 1 GiB transfer limit".to_string());
+    }
+    let temp = tempfile::NamedTempFile::new_in(&downloads_dir)
+        .map_err(|e| format!("could not create the download file: {e}"))?;
+    let clone = temp
+        .reopen()
+        .map_err(|e| format!("could not open the download file: {e}"))?;
+    let mut output = tokio::fs::File::from_std(clone);
+    use tokio::io::AsyncWriteExt;
+    let mut response = response;
+    let mut size = 0_u64;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("could not read the downloaded file: {e}"))?
+    {
+        size = size.saturating_add(chunk.len() as u64);
+        if size > SANDBOX_FILE_MAX_BYTES {
+            return Err("file is larger than the 1 GiB transfer limit".to_string());
+        }
+        output
+            .write_all(&chunk)
+            .await
+            .map_err(|e| format!("could not save the file: {e}"))?;
+    }
+    output
+        .flush()
+        .await
+        .map_err(|e| format!("could not finish saving the file: {e}"))?;
+    drop(output);
+    temp.persist(&dest)
+        .map_err(|e| format!("could not save the file: {}", e.error))?;
 
     Ok(dest.to_string_lossy().to_string())
 }
@@ -679,22 +711,54 @@ pub async fn sandbox_fs_upload(
 ) -> CmdResult<()> {
     let id = validate_sandbox_id(&sandbox_id)?;
     let dest_path = validate_sandbox_path(&dest_path)?;
-    let bytes =
-        std::fs::read(&local_path).map_err(|e| format!("could not read the local file: {e}"))?;
-    if bytes.len() > 64 * 1024 * 1024 {
-        return Err("file is larger than the 64 MiB upload limit".to_string());
+    let mut file = tokio::fs::File::open(&local_path)
+        .await
+        .map_err(|e| format!("could not read the local file: {e}"))?;
+    let size = file
+        .metadata()
+        .await
+        .map_err(|e| format!("could not inspect the local file: {e}"))?
+        .len();
+    if size > SANDBOX_FILE_MAX_BYTES {
+        return Err("file is larger than the 1 GiB transfer limit".to_string());
     }
     let url = format!(
         "{}/sandboxes/{id}/fs/file?path={}",
         broker_base(&state),
         encode_query_value(dest_path)
     );
-    let auth = build_nip98_auth_header(&Method::PUT, &url, &bytes, &state)?;
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|e| format!("could not hash the local file: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    file.rewind()
+        .await
+        .map_err(|e| format!("could not rewind the local file: {e}"))?;
+    let auth = build_nip98_auth_header_for_hash(
+        &Method::PUT,
+        &url,
+        &hex::encode(hasher.finalize()),
+        &state,
+    )?;
     let response = state
         .http_client
         .put(&url)
         .header("Authorization", auth)
-        .body(bytes)
+        .header("Content-Type", "application/octet-stream")
+        .header("Content-Length", size)
+        .body(reqwest::Body::wrap_stream(
+            tokio_util::io::ReaderStream::new(file),
+        ))
         .send()
         .await
         .map_err(|e| format!("could not reach the sandbox broker: {e}"))?;

@@ -23,8 +23,11 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use http_body_util::BodyExt;
 use sandbox::{CreateRequest, Limits, SandboxSummary};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tracing::{error, info, warn};
 
 /// Port a sandbox serves its tool surface on, when it serves one.
@@ -383,18 +386,20 @@ fn build_router(state: AppState) -> Router {
         // Raise the request-body cap above axum's 2 MB default. File uploads
         // (`fs/file`) and teach-a-task recording audio (`recording/stop`) both
         // legitimately send tens of MB, and both already enforce their own
-        // 50-64 MiB caps with clear errors — but axum's default rejected anything
+        // large file transfers, and both enforce their own clear limits — but
+        // axum's default rejected anything
         // over 2 MB first with a terse 413 before those checks ran, so a
         // recording of more than a few seconds failed to save. Sized just
-        // above the app-level caps so those remain the real limit.
+        // above the app-level caps so those remain the real limit. Bodies are
+        // streamed; this is a byte ceiling, not a memory allocation.
         .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
         .with_state(state)
 }
 
-/// Router-wide request-body cap. Above the 64 MiB `fs/file` and 50 MiB recording-audio
+/// Router-wide request-body cap. Above the 1 GiB `fs/file` and 50 MiB recording-audio
 /// caps so the handlers' own size checks (with actionable messages) are what a
 /// caller hits, not axum's default 2 MB limit.
-const BODY_LIMIT_BYTES: usize = 65 * 1024 * 1024;
+const BODY_LIMIT_BYTES: usize = 1025 * 1024 * 1024;
 
 /// Unauthenticated: it reports only that the process is up, so a health probe
 /// does not need a credential.
@@ -1402,11 +1407,10 @@ async fn republish_expiry(
 /// sandbox with the same privilege the agent process itself has.
 const FS_EXEC_USER: &str = "10001:10001";
 
-/// Cap on a file upload body. Large enough for source files and small
-/// artifacts, small enough that a caller cannot use the file API to fill the
-/// host's disk in one request — the TTL reaper and concurrency cap bound
-/// sandbox count and lifetime, not bytes written per call.
-const FS_MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+/// Cap on one file transfer. Large CAD artifacts fit, while the broker streams
+/// every byte through bounded buffers so this never becomes a RAM allocation.
+const FS_MAX_TRANSFER_BYTES: u64 = 1024 * 1024 * 1024;
+const FS_TAR_OVERHEAD_BYTES: u64 = 1024 * 1024;
 
 /// One entry of a directory listing, as emitted by the in-container `python3
 /// -c` scan and reported back to the caller.
@@ -1557,8 +1561,8 @@ async fn fs_download(
         return response;
     }
 
-    let tar_bytes = match state.docker.get_archive(&id, &q.path).await {
-        Ok(b) => b,
+    let mut stream = match state.docker.get_archive_stream(&id, &q.path).await {
+        Ok(stream) => stream,
         Err(e) if e.contains("404") || e.to_lowercase().contains("no such") => {
             return (
                 StatusCode::NOT_FOUND,
@@ -1569,54 +1573,101 @@ async fn fs_download(
         Err(e) => return internal(e),
     };
 
-    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
-    let entries = match archive.entries() {
-        Ok(e) => e,
-        Err(e) => return internal(format!("could not read archive: {e}")),
+    let tar_file = match tempfile::NamedTempFile::new() {
+        Ok(file) => file,
+        Err(e) => return internal(format!("could not create download spool: {e}")),
     };
-    for entry in entries {
-        let mut entry = match entry {
-            Ok(e) => e,
-            Err(e) => return internal(format!("could not read archive entry: {e}")),
+    let tar_clone = match tar_file.as_file().try_clone() {
+        Ok(file) => file,
+        Err(e) => return internal(format!("could not open download spool: {e}")),
+    };
+    let mut tar_out = tokio::fs::File::from_std(tar_clone);
+    let mut tar_size = 0_u64;
+    while let Some(frame) = stream.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(e) => return internal(format!("could not read Docker archive: {e}")),
         };
-        let is_dir = entry.header().entry_type().is_dir();
-        if is_dir {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "path is a directory, not a file"})),
-            )
-                .into_response();
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        tar_size = tar_size.saturating_add(data.len() as u64);
+        if tar_size > FS_MAX_TRANSFER_BYTES + FS_TAR_OVERHEAD_BYTES {
+            return payload_too_large();
+        }
+        if let Err(e) = tar_out.write_all(&data).await {
+            return internal(format!("could not spool Docker archive: {e}"));
+        }
+    }
+    drop(tar_out);
+
+    let output = match tempfile::NamedTempFile::new() {
+        Ok(file) => file,
+        Err(e) => return internal(format!("could not create download file: {e}")),
+    };
+    let tar_path = tar_file.path().to_owned();
+    let output_path = output.path().to_owned();
+    let extracted = tokio::task::spawn_blocking(move || -> Result<u64, String> {
+        let mut archive = tar::Archive::new(
+            std::fs::File::open(tar_path).map_err(|e| format!("could not open archive: {e}"))?,
+        );
+        let mut entries = archive
+            .entries()
+            .map_err(|e| format!("could not read archive: {e}"))?;
+        let Some(entry) = entries.next() else {
+            return Err("no such path".to_string());
+        };
+        let mut entry = entry.map_err(|e| format!("could not read archive entry: {e}"))?;
+        if entry.header().entry_type().is_dir() {
+            return Err("path is a directory, not a file".to_string());
         }
         if !entry.header().entry_type().is_file() {
-            continue;
+            return Err("path is not a regular file".to_string());
         }
-        let mut bytes = Vec::new();
-        if let Err(e) = std::io::Read::read_to_end(&mut entry, &mut bytes) {
-            return internal(format!("could not read file contents: {e}"));
+        let size = entry.size();
+        if size > FS_MAX_TRANSFER_BYTES {
+            return Err("file exceeds the 1 GiB transfer limit".to_string());
         }
-        let filename = std::path::Path::new(&q.path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("download");
-        return (
-            [
-                (
-                    axum::http::header::CONTENT_TYPE,
-                    "application/octet-stream".to_string(),
-                ),
-                (
-                    axum::http::header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{filename}\""),
-                ),
-            ],
-            bytes,
-        )
-            .into_response();
-    }
-
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(output_path)
+            .map_err(|e| format!("could not open download file: {e}"))?;
+        std::io::copy(&mut entry, &mut out).map_err(|e| format!("could not extract file: {e}"))?;
+        Ok(size)
+    })
+    .await;
+    let size = match extracted {
+        Ok(Ok(size)) => size,
+        Ok(Err(e)) if e == "path is a directory, not a file" => {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({"error": e}))).into_response()
+        }
+        Ok(Err(e)) => return internal(e),
+        Err(e) => return internal(format!("archive extraction task failed: {e}")),
+    };
+    let std_file = match output.reopen() {
+        Ok(file) => file,
+        Err(e) => return internal(format!("could not reopen download file: {e}")),
+    };
+    let file = tokio::fs::File::from_std(std_file);
+    let filename = std::path::Path::new(&q.path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("download");
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
     (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({"error": "no such path"})),
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/octet-stream".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+            (axum::http::header::CONTENT_LENGTH, size.to_string()),
+        ],
+        body,
     )
         .into_response()
 }
@@ -1627,30 +1678,78 @@ async fn fs_upload(
     Path(id): Path<String>,
     RawQuery(raw): RawQuery,
     Query(q): Query<FsPathQuery>,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
-    if body.len() > FS_MAX_UPLOAD_BYTES {
+    if headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|size| size > FS_MAX_TRANSFER_BYTES)
+    {
+        return payload_too_large();
+    }
+    if !is_safe_id(&id) {
+        return bad_request("malformed sandbox id");
+    }
+    let signed_path = format!("/sandboxes/{id}/fs/file?{}", raw.unwrap_or_default());
+    let (pubkey, expected_hash) =
+        match state
+            .verifier
+            .verify_streaming_body(&headers, "PUT", &signed_path)
+        {
+            Ok(result) => result,
+            Err(e) => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": e})),
+                )
+                    .into_response()
+            }
+        };
+    if !state.verifier.is_member(&pubkey).await {
+        return forbidden("not a member of this Buzz community — sandboxes are only for members");
+    }
+    if let Err(e) = sandbox::validate_fs_path(&q.path) {
+        return bad_request(e);
+    }
+
+    let spool = match tempfile::NamedTempFile::new() {
+        Ok(file) => file,
+        Err(e) => return internal(format!("could not create upload spool: {e}")),
+    };
+    let spool_clone = match spool.as_file().try_clone() {
+        Ok(file) => file,
+        Err(e) => return internal(format!("could not open upload spool: {e}")),
+    };
+    let mut out = tokio::fs::File::from_std(spool_clone);
+    let mut stream = body.into_data_stream();
+    use futures_util::StreamExt;
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => return bad_request(format!("could not read upload: {e}")),
+        };
+        size = size.saturating_add(chunk.len() as u64);
+        if size > FS_MAX_TRANSFER_BYTES {
+            return payload_too_large();
+        }
+        hasher.update(&chunk);
+        if let Err(e) = out.write_all(&chunk).await {
+            return internal(format!("could not spool upload: {e}"));
+        }
+    }
+    if hasher.finalize().as_slice() != expected_hash {
         return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "error": format!("upload exceeds the {FS_MAX_UPLOAD_BYTES}-byte limit")
-            })),
+            StatusCode::UNAUTHORIZED,
+            Json(
+                serde_json::json!({"error": "upload body does not match its signed payload hash"}),
+            ),
         )
             .into_response();
     }
-    if let Err(response) = authorize_fs(
-        &state,
-        &headers,
-        "PUT",
-        &format!("/sandboxes/{id}/fs/file?{}", raw.unwrap_or_default()),
-        &body,
-        &id,
-        &q.path,
-    )
-    .await
-    {
-        return response;
-    }
+    drop(out);
 
     let path = std::path::Path::new(&q.path);
     let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
@@ -1675,13 +1774,53 @@ async fn fs_upload(
         return internal(format!("could not prepare parent directory: {e}"));
     }
 
-    let tar_bytes = match build_single_file_tar(filename, &body) {
-        Ok(b) => b,
-        Err(e) => return internal(format!("could not build upload archive: {e}")),
+    let input_path = spool.path().to_owned();
+    let tar_file = match tempfile::NamedTempFile::new() {
+        Ok(file) => file,
+        Err(e) => return internal(format!("could not create upload archive: {e}")),
+    };
+    let tar_path = tar_file.path().to_owned();
+    let filename = filename.to_string();
+    let built = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let input =
+            std::fs::File::open(input_path).map_err(|e| format!("could not reopen upload: {e}"))?;
+        let output = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(tar_path)
+            .map_err(|e| format!("could not open upload archive: {e}"))?;
+        let mut builder = tar::Builder::new(output);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_uid(10001);
+        header.set_gid(10001);
+        header.set_mtime(chrono::Utc::now().timestamp() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, filename, input)
+            .map_err(|e| format!("could not build upload archive: {e}"))?;
+        builder
+            .finish()
+            .map_err(|e| format!("could not finish upload archive: {e}"))
+    })
+    .await;
+    match built {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return internal(e),
+        Err(e) => return internal(format!("archive build task failed: {e}")),
+    }
+    let tar_size = match tar_file.as_file().metadata() {
+        Ok(meta) => meta.len(),
+        Err(e) => return internal(format!("could not inspect upload archive: {e}")),
+    };
+    let tar_input = match tar_file.reopen() {
+        Ok(file) => tokio::fs::File::from_std(file),
+        Err(e) => return internal(format!("could not reopen upload archive: {e}")),
     };
     if let Err(e) = state
         .docker
-        .put_archive(&id, &parent.to_string_lossy(), tar_bytes)
+        .put_archive_file(&id, &parent.to_string_lossy(), tar_input, tar_size)
         .await
     {
         return internal(e);
@@ -1704,6 +1843,14 @@ fn build_single_file_tar(filename: &str, contents: &[u8]) -> std::io::Result<Vec
     header.set_cksum();
     builder.append_data(&mut header, filename, contents)?;
     builder.into_inner()
+}
+
+fn payload_too_large() -> axum::response::Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(serde_json::json!({"error": "file exceeds the 1 GiB transfer limit"})),
+    )
+        .into_response()
 }
 
 async fn fs_rename(

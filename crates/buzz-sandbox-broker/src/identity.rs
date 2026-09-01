@@ -60,6 +60,23 @@ pub struct Verifier {
 }
 
 impl Verifier {
+    fn auth_json(headers: &axum::http::HeaderMap) -> Result<String, String> {
+        let raw = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Nostr "))
+            .ok_or_else(|| {
+                "missing NIP-98 auth: sign the request with your Buzz identity \
+                 (Authorization: Nostr <base64 event>)"
+                    .to_string()
+            })?;
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(raw.trim())
+            .map_err(|_| "auth header is not valid base64".to_string())?;
+        String::from_utf8(bytes).map_err(|_| "auth header is not valid UTF-8".to_string())
+    }
+
     pub fn new(
         relay_url: String,
         public_url: String,
@@ -93,23 +110,7 @@ impl Verifier {
         path: &str,
         body: &[u8],
     ) -> Result<String, String> {
-        let raw = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Nostr "))
-            .ok_or_else(|| {
-                "missing NIP-98 auth: sign the request with your Buzz identity \
-                 (Authorization: Nostr <base64 event>)"
-                    .to_string()
-            })?;
-
-        let json = {
-            use base64::Engine;
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(raw.trim())
-                .map_err(|_| "auth header is not valid base64".to_string())?;
-            String::from_utf8(bytes).map_err(|_| "auth header is not valid UTF-8".to_string())?
-        };
+        let json = Self::auth_json(headers)?;
 
         // The signature binds one exact URL; try each configured origin. All
         // checks are local, so the cost of a short list is nil, and the error
@@ -142,6 +143,53 @@ impl Verifier {
         }
 
         Ok(pubkey.to_hex())
+    }
+
+    /// Verify a request before its body is streamed and return the SHA-256
+    /// digest the signed NIP-98 event commits to. The caller must compare this
+    /// digest after consuming the bounded stream.
+    pub fn verify_streaming_body(
+        &self,
+        headers: &axum::http::HeaderMap,
+        method: &str,
+        path: &str,
+    ) -> Result<(String, [u8; 32]), String> {
+        let json = Self::auth_json(headers)?;
+        let mut pubkey = None;
+        let mut last_err = String::from("no public URL configured");
+        for base in &self.public_urls {
+            let url = format!("{base}{path}");
+            match buzz_auth::verify_nip98_event(&json, &url, method, None) {
+                Ok(pk) => {
+                    pubkey = Some(pk);
+                    break;
+                }
+                Err(e) => last_err = format!("NIP-98 verification failed: {e}"),
+            }
+        }
+        let Some(pubkey) = pubkey else {
+            return Err(last_err);
+        };
+        let event: serde_json::Value =
+            serde_json::from_str(&json).map_err(|_| "auth event is not JSON".to_string())?;
+        let payload = event
+            .get("tags")
+            .and_then(|tags| tags.as_array())
+            .and_then(|tags| {
+                tags.iter().find_map(|tag| {
+                    let tag = tag.as_array()?;
+                    (tag.first()?.as_str()? == "payload")
+                        .then(|| tag.get(1)?.as_str())
+                        .flatten()
+                })
+            })
+            .ok_or_else(|| "streaming upload auth is missing its payload hash".to_string())?;
+        let decoded = hex::decode(payload)
+            .map_err(|_| "streaming upload payload hash is not valid hex".to_string())?;
+        let digest: [u8; 32] = decoded
+            .try_into()
+            .map_err(|_| "streaming upload payload hash must be SHA-256".to_string())?;
+        Ok((pubkey.to_hex(), digest))
     }
 
     /// Verify a signed viewer token minted by the desktop app.
@@ -474,6 +522,65 @@ mod tests {
             .verify(&HeaderMap::new(), "POST", "/sandboxes", b"{}")
             .unwrap_err();
         assert!(err.contains("missing NIP-98"), "got: {err}");
+    }
+
+    #[test]
+    fn streaming_auth_returns_the_signature_bound_payload_hash() {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let v = verifier();
+        let keys = nostr::Keys::generate();
+        let path = "/sandboxes/abc123/fs/file?path=%2Fworkspace%2Fmodel.glb";
+        let url = format!("https://broker.example{path}");
+        let expected = Sha256::digest(b"large-file-contents");
+        let tags = vec![
+            nostr::Tag::parse(["u", &url]).unwrap(),
+            nostr::Tag::parse(["method", "PUT"]).unwrap(),
+            nostr::Tag::parse(["payload", &hex::encode(expected)]).unwrap(),
+        ];
+        let event = nostr::EventBuilder::new(nostr::Kind::HttpAuth, "")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_string(&event).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Nostr {encoded}")).unwrap(),
+        );
+
+        let (pubkey, digest) = v
+            .verify_streaming_body(&headers, "PUT", path)
+            .expect("signed streaming request");
+        assert_eq!(pubkey, keys.public_key().to_hex());
+        assert_eq!(digest.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn streaming_auth_requires_a_payload_commitment() {
+        use base64::Engine;
+        let v = verifier();
+        let keys = nostr::Keys::generate();
+        let path = "/sandboxes/abc123/fs/file?path=%2Fworkspace%2Fmodel.glb";
+        let url = format!("https://broker.example{path}");
+        let event = nostr::EventBuilder::new(nostr::Kind::HttpAuth, "")
+            .tags([
+                nostr::Tag::parse(["u", &url]).unwrap(),
+                nostr::Tag::parse(["method", "PUT"]).unwrap(),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_string(&event).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Nostr {encoded}")).unwrap(),
+        );
+
+        let error = v.verify_streaming_body(&headers, "PUT", path).unwrap_err();
+        assert!(error.contains("missing its payload hash"), "got: {error}");
     }
 
     #[test]

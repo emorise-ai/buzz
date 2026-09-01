@@ -240,17 +240,19 @@ async fn dispatch_files(
             output,
         } => {
             let id = sandbox.require()?;
-            let bytes = client
-                .sandbox_files_download(&broker.broker, &id, &remote_path)
-                .await?;
             let path = output.unwrap_or_else(|| default_download_path(&remote_path));
-            std::fs::write(&path, &bytes).map_err(|e| {
-                CliError::Other(format!("failed to write downloaded file to {path}: {e}"))
-            })?;
+            let bytes = client
+                .sandbox_files_download_to(
+                    &broker.broker,
+                    &id,
+                    &remote_path,
+                    std::path::Path::new(&path),
+                )
+                .await?;
             print_json(&serde_json::json!({
                 "path": path,
                 "remote_path": remote_path,
-                "bytes": bytes.len(),
+                "bytes": bytes,
             }))
         }
         crate::SandboxFilesCmd::Put {
@@ -260,12 +262,18 @@ async fn dispatch_files(
             sandbox,
         } => {
             let id = sandbox.require()?;
-            let bytes = std::fs::read(&local_path).map_err(|e| {
-                CliError::Other(format!("failed to read local file {local_path}: {e}"))
-            })?;
-            let size = bytes.len();
+            let size = std::fs::metadata(&local_path)
+                .map_err(|e| {
+                    CliError::Other(format!("failed to inspect local file {local_path}: {e}"))
+                })?
+                .len();
             client
-                .sandbox_files_upload(&broker.broker, &id, &remote_path, bytes)
+                .sandbox_files_upload(
+                    &broker.broker,
+                    &id,
+                    &remote_path,
+                    std::path::Path::new(&local_path),
+                )
                 .await?;
             print_json(&serde_json::json!({
                 "path": remote_path,

@@ -446,7 +446,11 @@ impl Docker {
     ///
     /// Docker's archive endpoint always returns a tar even for one file — the
     /// caller (`main.rs`) unpacks the single entry it expects.
-    pub async fn get_archive(&self, id: &str, path: &str) -> Result<Vec<u8>, String> {
+    pub async fn get_archive_stream(
+        &self,
+        id: &str,
+        path: &str,
+    ) -> Result<hyper::body::Incoming, String> {
         let encoded = urlencode(path);
         let uri = hyperlocal_uri(
             &self.socket,
@@ -464,13 +468,13 @@ impl Docker {
             .await
             .map_err(|e| format!("could not reach the docker daemon: {e}"))?;
         let status = resp.status();
-        let bytes = resp
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| format!("could not read the docker response: {e}"))?
-            .to_bytes();
         if !status.is_success() {
+            let bytes = resp
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| format!("could not read the docker response: {e}"))?
+                .to_bytes();
             let detail = serde_json::from_slice::<serde_json::Value>(&bytes)
                 .ok()
                 .and_then(|v| {
@@ -481,12 +485,28 @@ impl Docker {
                 .unwrap_or_else(|| String::from_utf8_lossy(&bytes).trim().to_string());
             return Err(format!("docker returned {status}: {detail}"));
         }
-        Ok(bytes.to_vec())
+        Ok(resp.into_body())
+    }
+
+    /// Collect a small Docker archive for legacy screenshot/recording paths.
+    /// Large file transfers use `get_archive_stream` directly.
+    pub async fn get_archive(&self, id: &str, path: &str) -> Result<Vec<u8>, String> {
+        let body = self.get_archive_stream(id, path).await?;
+        body.collect()
+            .await
+            .map(|collected| collected.to_bytes().to_vec())
+            .map_err(|e| format!("could not read the docker response: {e}"))
     }
 
     /// Upload a tar stream (built by the caller with [`tar`]) into `id` at
     /// `dir` — the directory the tar's paths are relative to.
-    pub async fn put_archive(&self, id: &str, dir: &str, tar_bytes: Vec<u8>) -> Result<(), String> {
+    pub async fn put_archive_file(
+        &self,
+        id: &str,
+        dir: &str,
+        file: tokio::fs::File,
+        size: u64,
+    ) -> Result<(), String> {
         let encoded = urlencode(dir);
         let uri = hyperlocal_uri(
             &self.socket,
@@ -497,10 +517,16 @@ impl Docker {
             .method(hyper::Method::PUT)
             .uri(uri)
             .header(hyper::header::CONTENT_TYPE, "application/x-tar")
-            .body(Full::new(Bytes::from(tar_bytes)))
+            .header(hyper::header::CONTENT_LENGTH, size)
+            .body(axum::body::Body::from_stream(
+                tokio_util::io::ReaderStream::new(file),
+            ))
             .map_err(|e| format!("could not build the docker request: {e}"))?;
-        let resp = self
-            .client
+        let client: Client<UnixConnector, axum::body::Body> = Client::builder(TokioExecutor::new())
+            .build(UnixConnector {
+                socket: self.socket.clone(),
+            });
+        let resp = client
             .request(req)
             .await
             .map_err(|e| format!("could not reach the docker daemon: {e}"))?;
@@ -523,6 +549,20 @@ impl Docker {
             return Err(format!("docker returned {status}: {detail}"));
         }
         Ok(())
+    }
+
+    /// Upload a small in-memory archive for recording audio. Large file
+    /// transfers use `put_archive_file`.
+    pub async fn put_archive(&self, id: &str, dir: &str, bytes: Vec<u8>) -> Result<(), String> {
+        let temp = tempfile::NamedTempFile::new()
+            .map_err(|e| format!("could not create archive spool: {e}"))?;
+        std::fs::write(temp.path(), &bytes)
+            .map_err(|e| format!("could not write archive spool: {e}"))?;
+        let file = tokio::fs::File::open(temp.path())
+            .await
+            .map_err(|e| format!("could not open archive spool: {e}"))?;
+        self.put_archive_file(id, dir, file, bytes.len() as u64)
+            .await
     }
 }
 

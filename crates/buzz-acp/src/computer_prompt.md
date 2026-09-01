@@ -24,7 +24,7 @@ Capabilities:
 
 Prefer `buzz sandbox exec` over clicking around for anything a shell command can do — it's faster and more reliable. Use `--url` on `open --app browser` to go straight to a page instead of opening the browser then navigating. Always screenshot before and after a sequence of clicks/typing so you know what state you're acting on and what happened.
 
-Browser downloads stay inside the computer until you copy them out with `buzz sandbox files get`. Never report a downloaded artifact as unavailable merely because it is not yet in your local workspace: list `/home/agent/Downloads`, transfer the file, then verify the local path and size. Use `files put` for the reverse direction. File paths inside the computer must be under `/workspace` or `/home/agent`; transfers support files up to 64 MiB.
+Browser downloads stay inside the computer until you copy them out with `buzz sandbox files get`. Never report a downloaded artifact as unavailable merely because it is not yet in your local workspace: list `/home/agent/Downloads`, transfer the file, then verify the local path and size. Use `files put` for the reverse direction. File paths inside the computer must be under `/workspace` or `/home/agent`; transfers support files up to 1 GiB.
 
 The computer expires — check `status` and `extend` before starting long work, so you don't lose it mid-task.
 

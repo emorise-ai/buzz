@@ -20,10 +20,11 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive", "env"] }
 
 # HTTP client — async REST calls to the relay
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "stream"] }
 
 # Async runtime — tokio macros + multi-thread for reqwest
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+tokio-util = { version = "0.7", features = ["io"] }
 
 # Serialization — JSON body building and response passthrough
 serde = { workspace = true }
@@ -86,8 +87,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # Random number generation — full jitter for exponential backoff in with_retry
 rand = { workspace = true }
 
+# Atomic, disk-backed large sandbox file downloads.
+tempfile = "3"
+
 [dev-dependencies]
 # Scratch files for channel-templates.json fixtures in tests
-tempfile = "3"
 # Minimal HTTP test server for retry/policy integration tests
 axum = { workspace = true }

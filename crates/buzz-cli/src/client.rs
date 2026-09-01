@@ -87,6 +87,16 @@ fn sign_nip98(
     url: &str,
     body: Option<&[u8]>,
 ) -> Result<String, CliError> {
+    let payload_hash = body.map(|bytes| hex::encode(Sha256::digest(bytes)));
+    sign_nip98_payload_hash(keys, method, url, payload_hash.as_deref())
+}
+
+fn sign_nip98_payload_hash(
+    keys: &Keys,
+    method: &str,
+    url: &str,
+    payload_hash: Option<&str>,
+) -> Result<String, CliError> {
     let mut tags = vec![
         Tag::parse(["u", url]).map_err(|e| CliError::Other(format!("tag error: {e}")))?,
         Tag::parse(["method", method]).map_err(|e| CliError::Other(format!("tag error: {e}")))?,
@@ -94,10 +104,9 @@ fn sign_nip98(
         Tag::parse(["nonce", &uuid::Uuid::new_v4().to_string()])
             .map_err(|e| CliError::Other(format!("tag error: {e}")))?,
     ];
-    if let Some(b) = body {
-        let hash = hex::encode(Sha256::digest(b));
+    if let Some(hash) = payload_hash {
         tags.push(
-            Tag::parse(["payload", &hash])
+            Tag::parse(["payload", hash])
                 .map_err(|e| CliError::Other(format!("tag error: {e}")))?,
         );
     }
@@ -529,6 +538,7 @@ pub struct BuzzClient {
 }
 
 impl BuzzClient {
+    const SANDBOX_FILE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
     /// Create a new client pointing at `relay_url`.
     ///
     /// Timeout defaults are tuned for degraded WAN links and can be overridden
@@ -2791,15 +2801,77 @@ impl BuzzClient {
     }
 
     /// Download one file from the sandbox filesystem.
-    pub async fn sandbox_files_download(
+    pub async fn sandbox_files_download_to(
         &self,
         broker_url: &str,
         id: &str,
         path: &str,
-    ) -> Result<Vec<u8>, CliError> {
+        destination: &std::path::Path,
+    ) -> Result<u64, CliError> {
         let url = sandbox_file_url(broker_url, id, "/fs/file", path)?;
-        self.broker_call_binary(reqwest::Method::GET, &url, None, "application/octet-stream")
+        let auth = sign_nip98(&self.keys, "GET", &url, None)?;
+        let mut resp = self
+            .http
+            .get(&url)
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        if !(200..=299).contains(&status) {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(match status {
+                401 | 403 => CliError::Auth(broker_detail(status, &text)),
+                404 => CliError::NotFound(broker_detail(status, &text)),
+                400 | 413 => CliError::Usage(broker_detail(status, &text)),
+                409 => CliError::Conflict(broker_detail(status, &text)),
+                _ => CliError::Relay { status, body: text },
+            });
+        }
+        if resp
+            .content_length()
+            .is_some_and(|size| size > Self::SANDBOX_FILE_MAX_BYTES)
+        {
+            return Err(CliError::Usage(
+                "file exceeds the 1 GiB transfer limit".to_string(),
+            ));
+        }
+        let parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let temp = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|e| CliError::Other(format!("failed to create download file: {e}")))?;
+        let clone = temp
+            .reopen()
+            .map_err(|e| CliError::Other(format!("failed to open download file: {e}")))?;
+        let mut output = tokio::fs::File::from_std(clone);
+        use tokio::io::AsyncWriteExt;
+        let mut size = 0_u64;
+        while let Some(chunk) = resp.chunk().await? {
+            size = size.saturating_add(chunk.len() as u64);
+            if size > Self::SANDBOX_FILE_MAX_BYTES {
+                return Err(CliError::Usage(
+                    "file exceeds the 1 GiB transfer limit".to_string(),
+                ));
+            }
+            output
+                .write_all(&chunk)
+                .await
+                .map_err(|e| CliError::Other(format!("failed to write downloaded file: {e}")))?;
+        }
+        output
+            .flush()
             .await
+            .map_err(|e| CliError::Other(format!("failed to finish downloaded file: {e}")))?;
+        drop(output);
+        temp.persist(destination).map_err(|e| {
+            CliError::Other(format!(
+                "failed to save downloaded file to {}: {}",
+                destination.display(),
+                e.error
+            ))
+        })?;
+        Ok(size)
     }
 
     /// Upload one file into the sandbox filesystem.
@@ -2808,17 +2880,69 @@ impl BuzzClient {
         broker_url: &str,
         id: &str,
         path: &str,
-        bytes: Vec<u8>,
+        local_path: &std::path::Path,
     ) -> Result<serde_json::Value, CliError> {
         let url = sandbox_file_url(broker_url, id, "/fs/file", path)?;
-        let (_, text) = self
-            .broker_call_with_content_type(
-                reqwest::Method::PUT,
-                &url,
-                Some(bytes),
-                "application/octet-stream",
-            )
+        let mut file = tokio::fs::File::open(local_path).await.map_err(|e| {
+            CliError::Other(format!(
+                "failed to read local file {}: {e}",
+                local_path.display()
+            ))
+        })?;
+        let size = file
+            .metadata()
+            .await
+            .map_err(|e| {
+                CliError::Other(format!(
+                    "failed to inspect local file {}: {e}",
+                    local_path.display()
+                ))
+            })?
+            .len();
+        if size > Self::SANDBOX_FILE_MAX_BYTES {
+            return Err(CliError::Usage(
+                "file exceeds the 1 GiB transfer limit".to_string(),
+            ));
+        }
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .await
+                .map_err(|e| CliError::Other(format!("failed to hash local file: {e}")))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        file.rewind()
+            .await
+            .map_err(|e| CliError::Other(format!("failed to rewind local file: {e}")))?;
+        let hash = hex::encode(hasher.finalize());
+        let auth = sign_nip98_payload_hash(&self.keys, "PUT", &url, Some(&hash))?;
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+        let resp = self
+            .http
+            .put(&url)
+            .header(reqwest::header::AUTHORIZATION, auth)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .header(reqwest::header::CONTENT_LENGTH, size)
+            .body(body)
+            .send()
             .await?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if !(200..=299).contains(&status) {
+            return Err(match status {
+                401 | 403 => CliError::Auth(broker_detail(status, &text)),
+                404 => CliError::NotFound(broker_detail(status, &text)),
+                400 | 413 => CliError::Usage(broker_detail(status, &text)),
+                409 => CliError::Conflict(broker_detail(status, &text)),
+                _ => CliError::Relay { status, body: text },
+            });
+        }
         parse_broker_json(&text)
     }
 

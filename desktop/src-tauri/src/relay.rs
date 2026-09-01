@@ -134,7 +134,25 @@ pub fn build_nip98_auth_header_for_keys(
     body: &[u8],
 ) -> Result<String, String> {
     let payload_hash = hex::encode(Sha256::digest(body));
+    build_nip98_auth_header_for_keys_and_hash(keys, method, url, &payload_hash)
+}
 
+pub fn build_nip98_auth_header_for_hash(
+    method: &Method,
+    url: &str,
+    payload_hash: &str,
+    state: &AppState,
+) -> Result<String, String> {
+    let keys = state.keys.lock().map_err(|error| error.to_string())?;
+    build_nip98_auth_header_for_keys_and_hash(&keys, method, url, payload_hash)
+}
+
+fn build_nip98_auth_header_for_keys_and_hash(
+    keys: &Keys,
+    method: &Method,
+    url: &str,
+    payload_hash: &str,
+) -> Result<String, String> {
     // Nonce ensures unique event IDs even for identical requests in the same second.
     // Without this, rapid-fire calls (e.g. query → submit → re-query) with the same
     // body produce identical NIP-98 event hashes and trigger relay replay detection.
@@ -144,7 +162,7 @@ pub fn build_nip98_auth_header_for_keys(
         Tag::parse(vec!["u", url]).map_err(|error| format!("url tag failed: {error}"))?,
         Tag::parse(vec!["method", method.as_str()])
             .map_err(|error| format!("method tag failed: {error}"))?,
-        Tag::parse(vec!["payload", &payload_hash])
+        Tag::parse(vec!["payload", payload_hash])
             .map_err(|error| format!("payload tag failed: {error}"))?,
         Tag::parse(vec!["nonce", &nonce_hex])
             .map_err(|error| format!("nonce tag failed: {error}"))?,
