@@ -207,6 +207,7 @@ export function SandboxViewerDialog({
             <SandboxStage
               ref={stageRef}
               viewerUrl={viewerUrl}
+              rawViewerUrl={rawViewerUrl}
               sandboxId={sandboxId}
               sandboxName={sandboxName}
               agentDisplayName={agentDisplayName}

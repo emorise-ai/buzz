@@ -12203,6 +12203,24 @@ export function maybeInstallE2eTauriMocks() {
         const separator = url.includes("?") ? "&" : "?";
         return `${url}${separator}t=mock-token`;
       }
+      case "create_agent_sandbox": {
+        const owner =
+          (payload as { agentPubkey?: string } | null)?.agentPubkey ??
+          "mock-owner";
+        return {
+          id: `mock-sandbox-${owner.slice(0, 8)}`,
+          name: `buzz-sandbox-${owner.slice(0, 8)}`,
+          image: "buzz-sprig-desktop",
+          cpus: 2,
+          memory_mb: 8192,
+          expires_at: Math.floor(Date.now() / 1000) + 1_800,
+          viewer_url:
+            "data:text/html,%3Chtml%3E%3Cbody%3EBuzz%20PC%3C/body%3E%3C/html%3E",
+        };
+      }
+      case "destroy_agent_sandbox":
+      case "open_computer_window":
+        return null;
       case "get_os_idle_seconds":
         // e2e runs headless with no OS idle API; the presence hook falls back
         // to in-app activity tracking.

@@ -122,6 +122,39 @@ impl AppState {
     }
 }
 
+/// The live expiry for a Docker list entry. The broker's in-memory value wins
+/// after an extend; the immutable label is the crash-recovery fallback.
+fn listed_sandbox_expiry(state: &AppState, entry: &serde_json::Value) -> Option<i64> {
+    let id = entry.get("Id").and_then(|value| value.as_str());
+    id.and_then(|id| state.expiry_of(id)).or_else(|| {
+        entry
+            .get("Labels")
+            .and_then(|labels| labels.get(sandbox::LABEL_EXPIRES))
+            .and_then(|value| value.as_str())
+            .and_then(|value| value.parse::<i64>().ok())
+    })
+}
+
+/// Whether a listed container is a live, viewable computer suitable for reuse
+/// and for the host concurrency count.
+fn listed_sandbox_is_usable(state: &AppState, entry: &serde_json::Value, now: i64) -> bool {
+    sandbox::existing_sandbox_is_usable(
+        entry.get("State").and_then(|value| value.as_str()),
+        listed_sandbox_expiry(state, entry),
+        now,
+    )
+}
+
+/// Public desktop URL advertised in lifecycle events and create responses.
+fn sandbox_viewer_url(state: &AppState, sandbox_id: &str) -> Option<String> {
+    state.viewer_base.as_ref().map(|base| {
+        format!(
+            "{base}/sandboxes/{}/desktop",
+            &sandbox_id[..12.min(sandbox_id.len())]
+        )
+    })
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -460,34 +493,13 @@ async fn create_sandbox(
     // a lifecycle-sensitive map of per-owner locks.
     let create_guard = state.create_lock.lock().await;
 
-    // Concurrency cap: the host runs production workloads alongside sandboxes,
-    // so the broker refuses rather than letting the box be oversubscribed.
-    // Fetched once and reused below for the per-owner dedupe check — both
-    // need the same "what's currently running" list.
+    // Fetch once for both per-owner convergence and the concurrency cap. The
+    // owner reuse decision deliberately runs before the cap: asking for the
+    // computer that already occupies one of the full host's slots creates no
+    // new load and must remain idempotent at capacity.
+    let now = chrono::Utc::now().timestamp();
     let existing = match state.docker.list_managed(sandbox::MANAGED_LABEL).await {
-        Ok(existing) => {
-            let active = existing
-                .iter()
-                .filter(|c| {
-                    sandbox::container_state_may_use_storage(
-                        c.get("State").and_then(|s| s.as_str()),
-                    )
-                })
-                .count();
-            if active >= sandbox::MAX_CONCURRENT {
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(serde_json::json!({
-                        "error": format!(
-                            "sandbox limit reached ({active}/{}); stop one before creating another",
-                            sandbox::MAX_CONCURRENT
-                        )
-                    })),
-                )
-                    .into_response();
-            }
-            existing
-        }
+        Ok(existing) => existing,
         Err(e) => return internal(e),
     };
 
@@ -503,9 +515,7 @@ async fn create_sandbox(
                 .get("Labels")
                 .and_then(|l| l.get(sandbox::LABEL_OWNER))
                 .and_then(|v| v.as_str()),
-            may_use_storage: sandbox::container_state_may_use_storage(
-                c.get("State").and_then(|s| s.as_str()),
-            ),
+            usable: listed_sandbox_is_usable(&state, c, now),
         })
         .collect();
     if let Some(idx) =
@@ -517,11 +527,11 @@ async fn create_sandbox(
         };
     }
 
-    // A terminal container cannot touch its mounts again through the broker,
-    // but its stable Docker name would block recreation. Remove only terminal
+    // An expired or non-running container is not a usable computer, and its
+    // stable Docker name would block recreation. Remove only unusable
     // containers for this owner; named volumes deliberately survive.
     for (entry, projection) in existing.iter().zip(&projections) {
-        if projection.owner == Some(effective_owner.as_str()) && !projection.may_use_storage {
+        if projection.owner == Some(effective_owner.as_str()) && !projection.usable {
             if let Some(id) = entry.get("Id").and_then(|value| value.as_str()) {
                 if let Err(e) = state.docker.remove_container(id).await {
                     return internal(format!(
@@ -532,8 +542,28 @@ async fn create_sandbox(
         }
     }
 
+    // No usable computer exists for this owner, so this call will consume a
+    // new slot. Count only computers that are actually usable: expired and
+    // non-running residue neither serves a human nor blocks recovery.
+    let active = existing
+        .iter()
+        .filter(|c| listed_sandbox_is_usable(&state, c, now))
+        .count();
+    if active >= sandbox::MAX_CONCURRENT {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": format!(
+                    "sandbox limit reached ({active}/{}); stop one before creating another",
+                    sandbox::MAX_CONCURRENT
+                )
+            })),
+        )
+            .into_response();
+    }
+
     let limits = Limits::resolve(&req);
-    let expires_at = chrono::Utc::now().timestamp() + limits.ttl_seconds as i64;
+    let expires_at = now + limits.ttl_seconds as i64;
     let slot = state
         .slot
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -627,10 +657,7 @@ async fn create_sandbox(
     // Best-effort: a sandbox that runs unannounced is a display gap, not a
     // failure, so this never affects the response.
     if let Some(publisher) = state.publisher.as_ref() {
-        let viewer = state
-            .viewer_base
-            .as_ref()
-            .map(|base| format!("{base}/sandboxes/{}/desktop", &id[..12.min(id.len())]));
+        let viewer = sandbox_viewer_url(&state, &id);
         publisher
             .sandbox_created(events::SandboxFacts {
                 sandbox_id: &id,
@@ -668,6 +695,7 @@ async fn create_sandbox(
             "ttl_seconds": limits.ttl_seconds,
             "cpuset": cpuset,
             "expires_at": expires_at,
+            "viewer_url": sandbox_viewer_url(&state, &id),
             // Absent when the container's IP could not be read; a caller that
             // needs remote tools should treat that as "not drivable" rather
             // than guessing an address.
@@ -738,6 +766,17 @@ async fn sandbox_summary_response(
     });
     let tools_url =
         sandbox_ip(&inspect, &state.network).map(|ip| format!("http://{ip}:{TOOLS_PORT}/mcp"));
+    let viewer_url = sandbox_viewer_url(state, &full_id);
+
+    // A create call is convergent, not merely idempotent: when Docker already
+    // has a usable computer, refresh the relay facts as well. This repairs a
+    // missed initial 48200 and gives every listening client the same current
+    // expiry/viewer facts as a genuinely new create.
+    if let Some(expires_at) = expires_at {
+        let owner = inspect_label(&inspect, sandbox::LABEL_OWNER);
+        republish_expiry(state, &inspect, &full_id, owner.as_deref(), expires_at).await;
+        state.set_last_published_expiry(&full_id, expires_at);
+    }
 
     info!(sandbox = %full_id, "create request matched an existing sandbox for its owner");
 
@@ -751,6 +790,7 @@ async fn sandbox_summary_response(
             "memory_mb": memory_mb,
             "cpuset": cpuset,
             "expires_at": expires_at,
+            "viewer_url": viewer_url,
             "tools_url": tools_url,
             // No secret to hand back — see this function's doc comment.
             "tools_token": serde_json::Value::Null,
@@ -1136,14 +1176,14 @@ async fn delete_sandbox(
     if !is_safe_id(&id) {
         return bad_request("malformed sandbox id");
     }
-    if let Err(response) =
-        authorize(&state, &headers, "DELETE", &format!("/sandboxes/{id}"), b"").await
+    let caller = match authorize(&state, &headers, "DELETE", &format!("/sandboxes/{id}"), b"").await
     {
-        return response;
-    }
+        Ok(pubkey) => pubkey,
+        Err(response) => return response,
+    };
     // Refuse to remove anything this broker did not create, even if the caller
     // knows its id.
-    let owner = match state.docker.inspect_container(&id).await {
+    let (full_id, owner) = match state.docker.inspect_container(&id).await {
         Ok(v) if !is_managed(&v) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -1152,29 +1192,44 @@ async fn delete_sandbox(
                 .into_response()
         }
         Ok(v) => {
+            let owner = inspect_label(&v, sandbox::LABEL_OWNER);
+            let manager = inspect_label(&v, sandbox::LABEL_MANAGER);
+            if !sandbox::is_owner_or_manager(&caller, owner.as_deref(), manager.as_deref()) {
+                return forbidden("only the sandbox's owner or manager may stop it");
+            }
             // Track state by the full container id even when the caller used a
             // name or prefix alias.
-            if let Some(full) = v.get("Id").and_then(|x| x.as_str()) {
-                state.forget_expiry(full);
-            }
-            inspect_label(&v, sandbox::LABEL_OWNER)
+            let full_id = v
+                .get("Id")
+                .and_then(|x| x.as_str())
+                .unwrap_or(&id)
+                .to_string();
+            state.forget_expiry(&full_id);
+            (full_id, owner)
         }
         Err(e) if e.contains("404") || e.to_lowercase().contains("no such container") => {
-            // Already gone is success: the caller's intent is satisfied.
+            // Already gone is success, but still publish a tombstone. The
+            // broker can no longer recover the owner label, so this is
+            // deliberately ownerless; clients correlate it by `d`. Without
+            // it, retrying Stop after a missed reaper event returned 204 while
+            // every stale client continued to show the dead computer forever.
+            if let Some(publisher) = state.publisher.as_ref() {
+                publisher.sandbox_destroyed(&id, None, "destroyed").await;
+            }
             return (StatusCode::NO_CONTENT, ()).into_response();
         }
         Err(e) => return internal(e),
     };
-    match state.docker.remove_container(&id).await {
+    match state.docker.remove_container(&full_id).await {
         Ok(()) => {
             if let Some(publisher) = state.publisher.as_ref() {
                 // The owner rides along so the desktop can clear the right
                 // agent's card without correlating ids itself.
                 publisher
-                    .sandbox_destroyed(&id, owner.as_deref(), "destroyed")
+                    .sandbox_destroyed(&full_id, owner.as_deref(), "destroyed")
                     .await;
             }
-            info!(sandbox = %id, "sandbox destroyed");
+            info!(sandbox = %full_id, "sandbox destroyed");
             (StatusCode::NO_CONTENT, ()).into_response()
         }
         Err(e) => internal(e),
@@ -1326,12 +1381,7 @@ async fn republish_expiry(
         .and_then(|v| v.as_i64())
         .map(|b| (b / (1024 * 1024)) as u64)
         .unwrap_or(0);
-    let viewer = state.viewer_base.as_ref().map(|base| {
-        format!(
-            "{base}/sandboxes/{}/desktop",
-            &full_id[..12.min(full_id.len())]
-        )
-    });
+    let viewer = sandbox_viewer_url(state, full_id);
     publisher
         .sandbox_created(events::SandboxFacts {
             sandbox_id: full_id,
@@ -2768,10 +2818,23 @@ const VIEWER_PAGE: &str = r##"<!doctype html>
     const rfb = new RFB(document.getElementById("screen"), url);
     rfb.scaleViewport = true;
     rfb.background = "#101014";
-    rfb.addEventListener("connect", () => { retry = 0; });
+    rfb.addEventListener("connect", () => {
+      retry = 0;
+      if (window.parent !== window) {
+        window.parent.postMessage({ type: "buzz:viewer-connected" }, "*");
+      }
+    });
     rfb.addEventListener("disconnect", () => {
-      // Quiet backoff; a token past its window keeps failing until the
-      // viewer is reopened from Buzz, which mints a fresh one.
+      if (window.parent !== window) {
+        // The signed path token is deliberately short-lived. The Buzz shell
+        // can mint a replacement without asking the user to close/reopen the
+        // screen, so hand reconnect ownership back to it after every drop.
+        window.parent.postMessage({ type: "buzz:viewer-disconnected" }, "*");
+        window.parent.postMessage({ type: "buzz:viewer-refresh-request" }, "*");
+        return;
+      }
+      // Standalone browser tabs have no signer to ask. Retry within the
+      // current token window; reopening from Buzz remains their reauth path.
       retry += 1;
       if (retry <= 30) setTimeout(connect, Math.min(1000 * retry, 5000));
     });
@@ -2784,6 +2847,19 @@ const VIEWER_PAGE: &str = r##"<!doctype html>
 </body>
 </html>
 "##;
+
+#[cfg(test)]
+mod viewer_page_tests {
+    use super::VIEWER_PAGE;
+
+    #[test]
+    fn embedded_viewer_reports_connection_state_and_requests_fresh_auth() {
+        assert!(VIEWER_PAGE.contains("buzz:viewer-connected"));
+        assert!(VIEWER_PAGE.contains("buzz:viewer-disconnected"));
+        assert!(VIEWER_PAGE.contains("buzz:viewer-refresh-request"));
+        assert!(VIEWER_PAGE.contains("window.parent !== window"));
+    }
+}
 
 /// A label from a container *inspect* payload (labels live under
 /// `Config.Labels` there, unlike the flat `Labels` of a list entry).
@@ -3472,6 +3548,36 @@ mod tests {
         assert_eq!(s.name, "buzz-sandbox-abc");
         assert_eq!(s.owner.as_deref(), Some("tyler"));
         assert_eq!(s.expires_at, Some(1750000000));
+    }
+
+    #[test]
+    fn listed_usability_requires_running_and_prefers_live_expiry() {
+        let state = router_tests::test_state();
+        let entry = serde_json::json!({
+            "Id": "deadbeef",
+            "State": "running",
+            "Labels": { "com.buzz.sandbox.expires-at": "900" }
+        });
+
+        // The immutable label is expired, but an authenticated keepalive or
+        // extend moved the live broker authority forward.
+        state.set_expiry("deadbeef", 1_100);
+        assert!(listed_sandbox_is_usable(&state, &entry, 1_000));
+
+        // Once the live authority expires, a still-running Docker process is
+        // residue to replace, not a computer create may hand back.
+        state.set_expiry("deadbeef", 1_000);
+        assert!(!listed_sandbox_is_usable(&state, &entry, 1_000));
+    }
+
+    #[test]
+    fn viewer_url_matches_the_short_id_route_published_to_clients() {
+        let mut state = router_tests::test_state();
+        state.viewer_base = Some(Arc::new("https://relay.example/sandbox-viewer".to_string()));
+        assert_eq!(
+            sandbox_viewer_url(&state, "1234567890abcdef").as_deref(),
+            Some("https://relay.example/sandbox-viewer/sandboxes/1234567890ab/desktop")
+        );
     }
 }
 

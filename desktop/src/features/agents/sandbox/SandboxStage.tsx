@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Monitor, X } from "lucide-react";
+import { Loader2, Monitor, RefreshCw, X } from "lucide-react";
 
 import {
   copyTextToSystemClipboard,
@@ -8,6 +8,7 @@ import {
 
 import { SandboxFilesView } from "./SandboxFilesView";
 import { sandboxHeartbeat, shouldSendHeartbeat } from "./sandboxHeartbeat";
+import { mintViewerUrl } from "./mintViewerUrl";
 import { useContainedAspectBox } from "./useContainedAspectBox";
 
 /** The sandbox screen is a fixed 1920x1080 remote desktop. */
@@ -46,6 +47,9 @@ export const SandboxStage = React.forwardRef<
   SandboxStageHandle,
   {
     viewerUrl: string;
+    /** Bare broker viewer URL used to renew a short-lived signed viewer URL
+     * after noVNC disconnects. Data/mock viewers may omit it. */
+    rawViewerUrl?: string;
     sandboxId: string;
     sandboxName: string | null;
     agentDisplayName: string | null;
@@ -60,6 +64,7 @@ export const SandboxStage = React.forwardRef<
 >(function SandboxStage(
   {
     viewerUrl,
+    rawViewerUrl,
     sandboxId,
     agentDisplayName,
     expired,
@@ -76,6 +81,34 @@ export const SandboxStage = React.forwardRef<
     React.useState<HTMLDivElement | null>(null);
   const stageBox = useContainedAspectBox(stageContainer, SCREEN_ASPECT_RATIO);
   const iframeRef = React.useRef<HTMLIFrameElement | null>(null);
+  const refreshableViewerUrl =
+    rawViewerUrl?.startsWith("https://") || rawViewerUrl?.startsWith("http://")
+      ? rawViewerUrl
+      : null;
+  const [frameUrl, setFrameUrl] = React.useState(viewerUrl);
+  const [connectionState, setConnectionState] = React.useState<
+    "connecting" | "connected" | "reconnecting" | "failed"
+  >("connecting");
+  const refreshInFlight = React.useRef(false);
+
+  React.useEffect(() => {
+    setFrameUrl(viewerUrl);
+    setConnectionState(refreshableViewerUrl ? "connecting" : "connected");
+    refreshInFlight.current = false;
+  }, [refreshableViewerUrl, viewerUrl]);
+
+  const refreshViewer = React.useCallback(async () => {
+    if (!refreshableViewerUrl || refreshInFlight.current) return;
+    refreshInFlight.current = true;
+    setConnectionState("reconnecting");
+    try {
+      setFrameUrl(await mintViewerUrl(refreshableViewerUrl));
+    } catch {
+      setConnectionState("failed");
+    } finally {
+      refreshInFlight.current = false;
+    }
+  }, [refreshableViewerUrl]);
 
   React.useImperativeHandle(
     ref,
@@ -126,10 +159,16 @@ export const SandboxStage = React.forwardRef<
       const frame = iframeRef.current;
       // Only listen to our own viewer frame.
       if (!frame || event.source !== frame.contentWindow) return;
-      const data = event.data as { type?: unknown; text?: unknown } | null;
-      if (!data || typeof data.type !== "string") return;
+      if (
+        typeof event.data !== "object" ||
+        event.data === null ||
+        typeof Reflect.get(event.data, "type") !== "string"
+      ) {
+        return;
+      }
+      const type = Reflect.get(event.data, "type");
 
-      if (data.type === "buzz:clipboard-request") {
+      if (type === "buzz:clipboard-request") {
         void readTextFromSystemClipboard()
           .then((text) => {
             if (!text) return;
@@ -145,19 +184,36 @@ export const SandboxStage = React.forwardRef<
         return;
       }
 
+      if (type === "buzz:viewer-connected") {
+        setConnectionState("connected");
+        return;
+      }
+
+      if (type === "buzz:viewer-disconnected") {
+        setConnectionState("reconnecting");
+        return;
+      }
+
+      if (type === "buzz:viewer-refresh-request") {
+        void refreshViewer();
+        return;
+      }
+
       if (
-        data.type === "buzz:clipboard-copy" &&
-        typeof data.text === "string"
+        type === "buzz:clipboard-copy" &&
+        typeof Reflect.get(event.data, "text") === "string"
       ) {
-        void copyTextToSystemClipboard(data.text).catch(() => {
-          // Copying out of the VM is best-effort; a failure here must not
-          // disturb the live view.
-        });
+        void copyTextToSystemClipboard(Reflect.get(event.data, "text")).catch(
+          () => {
+            // Copying out of the VM is best-effort; a failure here must not
+            // disturb the live view.
+          },
+        );
       }
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [expired]);
+  }, [expired, refreshViewer]);
 
   const title = agentDisplayName
     ? `${agentDisplayName}'s computer`
@@ -195,14 +251,46 @@ export const SandboxStage = React.forwardRef<
           }
         >
           <iframe
-            key={viewerUrl}
+            key={frameUrl}
             ref={iframeRef}
-            src={viewerUrl}
+            src={frameUrl}
             title={title}
             className="h-full w-full border-0"
             sandbox="allow-scripts allow-same-origin allow-forms"
             allow="clipboard-read; clipboard-write"
           />
+          {connectionState !== "connected" && refreshableViewerUrl ? (
+            <div
+              className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 bg-background/90 text-center"
+              data-testid="sandbox-connection-state"
+            >
+              {connectionState === "failed" ? (
+                <>
+                  <Monitor className="h-8 w-8 text-muted-foreground" />
+                  <p className="text-sm font-medium text-foreground">
+                    Screen connection lost
+                  </p>
+                  <button
+                    type="button"
+                    className="flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-xs text-foreground hover:bg-muted"
+                    onClick={() => void refreshViewer()}
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    Retry
+                  </button>
+                </>
+              ) : (
+                <>
+                  <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+                  <p className="text-sm font-medium text-foreground">
+                    {connectionState === "connecting"
+                      ? "Connecting to computer…"
+                      : "Reconnecting to computer…"}
+                  </p>
+                </>
+              )}
+            </div>
+          ) : null}
           {!userInControl ? (
             <button
               type="button"

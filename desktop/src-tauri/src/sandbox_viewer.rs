@@ -170,7 +170,14 @@ pub async fn create_agent_sandbox(
     // The sandbox exists (id known) before we touch the agent record, so a
     // freshly-spawned agent always gets a valid id to attach to.
     if let Some(sandbox_id) = parsed.get("id").and_then(|v| v.as_str()) {
-        attach_sandbox_to_local_agent(&app, &agent_pubkey, sandbox_id).await?;
+        // Creation already succeeded remotely. A local record/restamp failure
+        // must not turn that success into a misleading "Start failed" in the
+        // UI or discard the response needed to show and stop the new PC.
+        if let Err(error) = attach_sandbox_to_local_agent(&app, &agent_pubkey, sandbox_id).await {
+            eprintln!(
+                "buzz-desktop: sandbox {sandbox_id} was created for agent {agent_pubkey}, but local attachment failed: {error}"
+            );
+        }
     } else {
         eprintln!(
             "buzz-desktop: sandbox broker create response had no string `id`; agent {agent_pubkey} was not attached"

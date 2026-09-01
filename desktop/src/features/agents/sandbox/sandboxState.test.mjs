@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { reconstructAgentSandbox } from "./sandboxState.ts";
+import {
+  reconstructAgentSandbox,
+  sandboxFromCreateResponse,
+} from "./sandboxState.ts";
 
 const OWNER = "a".repeat(64);
 
@@ -103,4 +106,35 @@ test("an event with no d tag is ignored", () => {
   const event = created("s1");
   event.tags = event.tags.filter((t) => t[0] !== "d");
   assert.equal(reconstructAgentSandbox([event]), null);
+});
+
+test("a create response becomes immediate sandbox state", () => {
+  assert.deepEqual(
+    sandboxFromCreateResponse(
+      {
+        id: "created-now",
+        name: "buzz-sandbox-created-now",
+        image: "buzz-sprig-desktop",
+        cpus: 4,
+        memory_mb: 8192,
+        expires_at: 12_345,
+      },
+      1_234,
+    ),
+    {
+      id: "created-now",
+      name: "buzz-sandbox-created-now",
+      image: "buzz-sprig-desktop",
+      cpus: 4,
+      memoryMb: 8192,
+      expiresAt: 12_345,
+      viewerUrl: null,
+      createdAt: 1_234,
+    },
+  );
+});
+
+test("a malformed create response is not inserted into UI state", () => {
+  assert.equal(sandboxFromCreateResponse({ name: "missing-id" }), null);
+  assert.equal(sandboxFromCreateResponse(null), null);
 });

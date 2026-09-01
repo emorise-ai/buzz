@@ -154,6 +154,11 @@ test.describe("agent sandbox preview screenshots", () => {
     await page
       .locator(`[data-testid="managed-agent-${AGENT_PUBKEY}"]`)
       .screenshot({ path: `${SHOTS}/05-card-indicator.png` });
+
+    // The corner control opens the computer directly; it must not fall
+    // through to the card's full-size profile button.
+    await indicator.click();
+    await expect(page.getByTestId("user-profile-panel")).toHaveCount(0);
   });
 
   // Shot 04: a destroyed sandbox removes the card entirely.
@@ -221,5 +226,27 @@ test.describe("agent sandbox preview screenshots", () => {
       path: `${SHOTS}/06-activity-to-full-view.png`,
       fullPage: true,
     });
+  });
+
+  test("07-expired-card-control-replaces-the-machine-immediately", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await page.getByTestId("open-agents-view").click();
+    await expect(
+      page.getByRole("button", { name: "Tyler Agent agent profile" }),
+    ).toBeVisible({ timeout: 10_000 });
+    await emitSandbox(page, {
+      viewerUrl: MOCK_VIEWER,
+      expiresAt: Math.floor(Date.now() / 1000) - 1,
+    });
+
+    const indicator = page.getByTestId(
+      `agent-sandbox-indicator-${AGENT_PUBKEY}`,
+    );
+    await expect(indicator).toHaveAttribute("aria-label", "Start computer");
+    await indicator.click();
+    await expect(indicator).toHaveAttribute("aria-label", "Open computer");
+    await expect(page.getByTestId("user-profile-panel")).toHaveCount(0);
   });
 });

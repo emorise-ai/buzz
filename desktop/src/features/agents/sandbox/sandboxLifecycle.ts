@@ -1,6 +1,9 @@
 import { invokeTauri } from "@/shared/api/tauri";
 import { markComputerEverAssigned } from "./computerEverAssignedStore";
+import { removeSandboxById, upsertSandboxForOwner } from "./agentSandboxStore";
 import { openComputerPanel } from "./computerPanelStore";
+import { sandboxFromCreateResponse } from "./sandboxState";
+import type { AgentSandbox } from "./sandboxState";
 
 /**
  * Self-service sandbox lifecycle from the app: "Start computer" / "Stop
@@ -8,19 +11,28 @@ import { openComputerPanel } from "./computerPanelStore";
  * user's key; the sandbox's owner is the agent, so the agent's own
  * `buzz sandbox` commands govern the same machine.
  *
- * Neither call updates UI state directly — the broker announces the change as
- * kind:48200/48201 events the app is already subscribed to, so the preview
- * follows through the normal event path.
+ * Successful command responses update the local store immediately, then the
+ * broker's kind:48200/48201 events reconcile that state through the normal
+ * durable event path. This keeps the UI honest when an event is delayed or an
+ * idempotent stop finds that the machine is already gone.
  */
-export async function createAgentSandbox(agentPubkey: string): Promise<void> {
-  await invokeTauri("create_agent_sandbox", { agentPubkey });
+export async function createAgentSandbox(
+  agentPubkey: string,
+): Promise<AgentSandbox | null> {
+  const response = await invokeTauri<unknown>("create_agent_sandbox", {
+    agentPubkey,
+  });
+  const sandbox = sandboxFromCreateResponse(response);
+  if (sandbox) upsertSandboxForOwner(agentPubkey, sandbox);
   // Mark eagerly rather than waiting for the 48200 round-trip: the caller
   // just started this agent's computer, so "ever had one" is already true.
   markComputerEverAssigned(agentPubkey);
+  return sandbox;
 }
 
 export async function destroyAgentSandbox(sandboxId: string): Promise<void> {
   await invokeTauri("destroy_agent_sandbox", { sandboxId });
+  removeSandboxById(sandboxId);
 }
 
 /**
@@ -32,7 +44,27 @@ export async function destroyAgentSandbox(sandboxId: string): Promise<void> {
  * event flips `useAgentSandbox` truthy. Throws on failure — callers surface
  * that via a toast, matching `AgentSandboxPreview`'s existing pattern.
  */
-export async function startAndOpenComputer(agentPubkey: string): Promise<void> {
+export async function startAndOpenComputer(
+  agentPubkey: string,
+): Promise<AgentSandbox | null> {
   openComputerPanel(agentPubkey);
-  await createAgentSandbox(agentPubkey);
+  return createAgentSandbox(agentPubkey);
+}
+
+/** Replace an expired/stale machine, preserving its durable volumes. */
+export async function restartAndOpenComputer(
+  agentPubkey: string,
+  sandboxId: string,
+): Promise<AgentSandbox | null> {
+  openComputerPanel(agentPubkey);
+  return restartComputer(agentPubkey, sandboxId);
+}
+
+/** Replace an expired/stale machine without choosing a presentation surface. */
+export async function restartComputer(
+  agentPubkey: string,
+  sandboxId: string,
+): Promise<AgentSandbox | null> {
+  await destroyAgentSandbox(sandboxId);
+  return createAgentSandbox(agentPubkey);
 }

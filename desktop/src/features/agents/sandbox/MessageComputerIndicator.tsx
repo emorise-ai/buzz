@@ -2,10 +2,15 @@ import { Monitor } from "lucide-react";
 import { toast } from "sonner";
 
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
+import { useNow } from "@/shared/lib/useNow";
 import { useAgentSandbox } from "./useAgentSandbox";
 import { useHasEverHadComputer } from "./computerEverAssignedStore";
 import { toggleComputerPanel } from "./computerPanelStore";
-import { startAndOpenComputer } from "./sandboxLifecycle";
+import {
+  restartAndOpenComputer,
+  startAndOpenComputer,
+} from "./sandboxLifecycle";
+import { isSandboxExpired } from "./sandboxCountdown";
 
 /**
  * Small clickable "this agent has a computer" glyph for the message list,
@@ -25,10 +30,14 @@ export function MessageComputerIndicator({
   agentPubkey: string;
 }) {
   const sandbox = useAgentSandbox(agentPubkey);
+  const now = useNow(1_000);
   const everHadComputer = useHasEverHadComputer(agentPubkey);
   if (!sandbox && !everHadComputer) return null;
 
-  const isLive = Boolean(sandbox);
+  const expired = Boolean(
+    sandbox?.expiresAt != null && isSandboxExpired(sandbox.expiresAt, now),
+  );
+  const isLive = Boolean(sandbox) && !expired;
   const label = isLive ? "Open computer" : "Start computer";
 
   function handleClick() {
@@ -36,7 +45,11 @@ export function MessageComputerIndicator({
       toggleComputerPanel(agentPubkey);
       return;
     }
-    startAndOpenComputer(agentPubkey).catch((err) => {
+    const action =
+      expired && sandbox
+        ? restartAndOpenComputer(agentPubkey, sandbox.id)
+        : startAndOpenComputer(agentPubkey);
+    action.catch((err) => {
       console.error(
         "[MessageComputerIndicator] startAndOpenComputer failed:",
         err,

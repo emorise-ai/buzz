@@ -921,13 +921,20 @@ pub fn is_owner_or_manager(caller: &str, owner: Option<&str>, manager: Option<&s
 /// Docker socket.
 pub struct ExistingSandbox<'a> {
     pub owner: Option<&'a str>,
-    pub may_use_storage: bool,
+    pub usable: bool,
 }
 
-/// Whether a Docker container state can currently or subsequently touch its
-/// mounted persistent volumes without first being recreated.
-pub fn container_state_may_use_storage(state: Option<&str>) -> bool {
-    !matches!(state, Some("exited" | "dead"))
+/// Whether an existing container is a computer a caller can use right now.
+///
+/// Only a running container whose live expiry is still in the future is
+/// reusable. Treating `created`, `paused`, or `restarting` as reusable made a
+/// convergent create call hand back a machine that could not show a screen;
+/// treating a running-but-expired container as reusable handed back the very
+/// computer the caller was trying to replace during the reaper's next-tick
+/// window. An absent expiry is also unusable: every broker-created sandbox has
+/// one, so missing it means the lifecycle record is incomplete, never immortal.
+pub fn existing_sandbox_is_usable(state: Option<&str>, expires_at: Option<i64>, now: i64) -> bool {
+    state == Some("running") && expires_at.is_some_and(|expiry| expiry > now)
 }
 
 /// Should `create_sandbox` reuse an existing container instead of making a
@@ -952,7 +959,7 @@ pub fn existing_sandbox_for_owner(
     let owner = owner?;
     existing
         .iter()
-        .position(|s| s.may_use_storage && s.owner == Some(owner))
+        .position(|s| s.usable && s.owner == Some(owner))
 }
 
 /// Is this image allowed to hold an agent's private key?
@@ -1796,11 +1803,11 @@ mod tests {
         let existing = [
             ExistingSandbox {
                 owner: Some("someone-else"),
-                may_use_storage: true,
+                usable: true,
             },
             ExistingSandbox {
                 owner: Some("owner-pk"),
-                may_use_storage: true,
+                usable: true,
             },
         ];
         assert_eq!(
@@ -1813,7 +1820,7 @@ mod tests {
     fn create_dedup_ignores_terminal_sandboxes() {
         let existing = [ExistingSandbox {
             owner: Some("owner-pk"),
-            may_use_storage: false,
+            usable: false,
         }];
         assert_eq!(
             existing_sandbox_for_owner(Some("owner-pk"), &existing),
@@ -1822,25 +1829,40 @@ mod tests {
     }
 
     #[test]
-    fn paused_restarting_and_created_states_still_reserve_storage() {
+    fn only_running_unexpired_sandboxes_are_usable() {
+        let now = 1_000;
+        assert!(existing_sandbox_is_usable(
+            Some("running"),
+            Some(now + 1),
+            now
+        ));
         for state in [
             None,
             Some("created"),
-            Some("running"),
             Some("paused"),
             Some("restarting"),
+            Some("exited"),
+            Some("dead"),
         ] {
-            assert!(container_state_may_use_storage(state), "state {state:?}");
+            assert!(
+                !existing_sandbox_is_usable(state, Some(now + 1), now),
+                "state {state:?}"
+            );
         }
-        assert!(!container_state_may_use_storage(Some("exited")));
-        assert!(!container_state_may_use_storage(Some("dead")));
+        assert!(!existing_sandbox_is_usable(Some("running"), Some(now), now));
+        assert!(!existing_sandbox_is_usable(
+            Some("running"),
+            Some(now - 1),
+            now
+        ));
+        assert!(!existing_sandbox_is_usable(Some("running"), None, now));
     }
 
     #[test]
     fn create_dedup_ignores_other_owners() {
         let existing = [ExistingSandbox {
             owner: Some("someone-else"),
-            may_use_storage: true,
+            usable: true,
         }];
         assert_eq!(
             existing_sandbox_for_owner(Some("owner-pk"), &existing),
@@ -1855,7 +1877,7 @@ mod tests {
     fn create_dedup_is_a_no_op_without_an_owner() {
         let existing = [ExistingSandbox {
             owner: None,
-            may_use_storage: true,
+            usable: true,
         }];
         assert_eq!(existing_sandbox_for_owner(None, &existing), None);
     }
@@ -1865,11 +1887,11 @@ mod tests {
         let existing = [
             ExistingSandbox {
                 owner: Some("owner-pk"),
-                may_use_storage: true,
+                usable: true,
             },
             ExistingSandbox {
                 owner: Some("owner-pk"),
-                may_use_storage: true,
+                usable: true,
             },
         ];
         assert_eq!(

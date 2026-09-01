@@ -87,15 +87,11 @@ impl Publisher {
     /// somebody's decision, and a card that cannot tell them apart invites the
     /// wrong conclusion when an agent's computer disappears.
     pub async fn sandbox_destroyed(&self, sandbox_id: &str, owner: Option<&str>, reason: &str) {
-        let mut tags = vec![
-            Tag::parse(["d", sandbox_id]).ok(),
-            Tag::parse(["reason", reason]).ok(),
-        ];
-        if let Some(owner) = owner {
-            tags.push(Tag::parse(["p", owner]).ok());
-        }
-        self.publish(KIND_SANDBOX_DESTROYED, tags.into_iter().flatten().collect())
-            .await;
+        self.publish(
+            KIND_SANDBOX_DESTROYED,
+            sandbox_destroyed_tags(sandbox_id, owner, reason),
+        )
+        .await;
     }
 
     /// The latest announced expiry for one sandbox, from the relay.
@@ -235,6 +231,21 @@ impl Publisher {
     }
 }
 
+/// Tags for one destruction tombstone. Kept pure so the already-gone DELETE
+/// path can be pinned without a live relay: owner is optional by design because
+/// Docker is the owner-label authority and an idempotent retry may arrive after
+/// the container (and therefore that label) has disappeared.
+fn sandbox_destroyed_tags(sandbox_id: &str, owner: Option<&str>, reason: &str) -> Vec<Tag> {
+    let mut tags = vec![
+        Tag::parse(["d", sandbox_id]).ok(),
+        Tag::parse(["reason", reason]).ok(),
+    ];
+    if let Some(owner) = owner {
+        tags.push(Tag::parse(["p", owner]).ok());
+    }
+    tags.into_iter().flatten().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +283,19 @@ mod tests {
         let a = Publisher::new("wss://r.example", keys.clone()).unwrap();
         let b = Publisher::new("wss://r.example", keys).unwrap();
         assert_eq!(a.pubkey_hex(), b.pubkey_hex());
+    }
+
+    #[test]
+    fn already_gone_tombstone_keeps_id_and_omits_unknown_owner() {
+        let tags = sandbox_destroyed_tags("deadbeef", None, "destroyed");
+        let rendered: Vec<Vec<String>> = tags
+            .iter()
+            .map(|tag| tag.as_slice().iter().map(ToString::to_string).collect())
+            .collect();
+        assert!(rendered.contains(&vec!["d".into(), "deadbeef".into()]));
+        assert!(rendered.contains(&vec!["reason".into(), "destroyed".into()]));
+        assert!(!rendered
+            .iter()
+            .any(|tag| tag.first().map(String::as_str) == Some("p")));
     }
 }

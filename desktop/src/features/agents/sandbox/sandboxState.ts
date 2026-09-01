@@ -33,6 +33,43 @@ export type AgentSandbox = {
   createdAt: number;
 };
 
+function optionalString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function optionalNumber(value: unknown): number | null {
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * Turn the broker's successful create/reuse response into immediate UI state.
+ * The relay announcement remains the durable authority, but rendering must not
+ * depend on that second network round-trip: an already-running reused machine
+ * may have no fresh 48200 to replay at all.
+ */
+export function sandboxFromCreateResponse(
+  value: unknown,
+  createdAt = Math.floor(Date.now() / 1000),
+): AgentSandbox | null {
+  if (!value || typeof value !== "object") return null;
+  const field = (name: string): unknown => Reflect.get(value, name);
+  const id = field("id");
+  if (typeof id !== "string" || id.length === 0) return null;
+
+  return {
+    id,
+    name: optionalString(field("name")),
+    image: optionalString(field("image")),
+    cpus: optionalNumber(field("cpus")),
+    memoryMb: optionalNumber(field("memory_mb")),
+    expiresAt: optionalNumber(field("expires_at")),
+    viewerUrl: optionalString(field("viewer_url")),
+    createdAt,
+  };
+}
+
 function tag(event: RelayEvent, name: string): string | null {
   const found = event.tags.find((t) => t[0] === name);
   return found?.[1] ?? null;

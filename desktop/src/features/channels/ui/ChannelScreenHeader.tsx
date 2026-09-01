@@ -15,7 +15,11 @@ import {
   toggleComputerPanel,
   useComputerPanel,
 } from "@/features/agents/sandbox/computerPanelStore";
-import { startAndOpenComputer } from "@/features/agents/sandbox/sandboxLifecycle";
+import {
+  restartAndOpenComputer,
+  startAndOpenComputer,
+} from "@/features/agents/sandbox/sandboxLifecycle";
+import { isSandboxExpired } from "@/features/agents/sandbox/sandboxCountdown";
 import { toast } from "sonner";
 import {
   DEFAULT_HOVER_PROFILE_STATUS_GEOMETRY,
@@ -26,6 +30,7 @@ import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { Button } from "@/shared/ui/button";
 import type { Channel, PresenceStatus } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { useNow } from "@/shared/lib/useNow";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import {
   toggleTerminalPanel,
@@ -118,6 +123,11 @@ export function ChannelScreenHeader({
       ? activeDmHeaderParticipants[0].pubkey
       : null;
   const dmCounterpartSandbox = useAgentSandbox(dmCounterpartPubkey);
+  const now = useNow(1_000);
+  const dmCounterpartSandboxExpired = Boolean(
+    dmCounterpartSandbox?.expiresAt != null &&
+      isSandboxExpired(dmCounterpartSandbox.expiresAt, now),
+  );
   const dmCounterpartEverHadComputer =
     useHasEverHadComputer(dmCounterpartPubkey);
   const computerPanel = useComputerPanel();
@@ -131,7 +141,10 @@ export function ChannelScreenHeader({
   // (expired/stopped) → dim "asleep" button that starts a new one; live →
   // bright button that opens the existing preview.
   const computerButton =
-    activeChannel && dmCounterpartPubkey && dmCounterpartSandbox ? (
+    activeChannel &&
+    dmCounterpartPubkey &&
+    dmCounterpartSandbox &&
+    !dmCounterpartSandboxExpired ? (
       <Button
         data-testid="channel-computer-button"
         aria-label={
@@ -145,13 +158,22 @@ export function ChannelScreenHeader({
       >
         <Monitor />
       </Button>
-    ) : activeChannel && dmCounterpartPubkey && dmCounterpartEverHadComputer ? (
+    ) : activeChannel &&
+      dmCounterpartPubkey &&
+      (dmCounterpartEverHadComputer || dmCounterpartSandboxExpired) ? (
       <Button
         aria-label="Start computer"
         className="opacity-50 hover:opacity-80"
         data-testid="channel-computer-button"
         onClick={() => {
-          startAndOpenComputer(dmCounterpartPubkey).catch((err) => {
+          const action =
+            dmCounterpartSandboxExpired && dmCounterpartSandbox
+              ? restartAndOpenComputer(
+                  dmCounterpartPubkey,
+                  dmCounterpartSandbox.id,
+                )
+              : startAndOpenComputer(dmCounterpartPubkey);
+          action.catch((err) => {
             console.error(
               "[ChannelScreenHeader] startAndOpenComputer failed:",
               err,

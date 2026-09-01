@@ -834,6 +834,8 @@ export const ChannelPane = React.memo(function ChannelPane({
           />
         ) : replaceThreadWithIdleAuxiliary && idleAuxiliarySurface ? (
           idleAuxiliarySurface
+        ) : computerPanel.surface ? (
+          wrapAux(computerPanel.surface, "computer-preview-panel")
         ) : threadHeadMessage ? (
           (() => {
             const panel = (
@@ -923,8 +925,6 @@ export const ChannelPane = React.memo(function ChannelPane({
             );
             return wrapThreadPanel(panel);
           })()
-        ) : computerPanel.surface ? (
-          wrapAux(computerPanel.surface, "computer-preview-panel")
         ) : activeChannel && selectedAgent ? (
           (() => {
             const effectiveAgentSessionChannelId =

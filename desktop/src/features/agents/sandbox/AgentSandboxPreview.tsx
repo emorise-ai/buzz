@@ -36,6 +36,8 @@ export function AgentSandboxPreview({ agentPubkey }: { agentPubkey: string }) {
   const [opening, setOpening] = React.useState(false);
   const [starting, setStarting] = React.useState(false);
   const [stopping, setStopping] = React.useState(false);
+  const expired =
+    sandbox?.expiresAt != null && isSandboxExpired(sandbox.expiresAt, now);
 
   // The 48200 announcement flips `sandbox` on; until then the button spins.
   React.useEffect(() => {
@@ -47,6 +49,7 @@ export function AgentSandboxPreview({ agentPubkey }: { agentPubkey: string }) {
     if (starting) return;
     setStarting(true);
     try {
+      if (sandbox && expired) await destroyAgentSandbox(sandbox.id);
       await createAgentSandbox(agentPubkey);
       // Success shows up as the preview itself, via the relay event.
     } catch (err) {
@@ -58,7 +61,7 @@ export function AgentSandboxPreview({ agentPubkey }: { agentPubkey: string }) {
     }
   }
 
-  if (!sandbox) {
+  if (!sandbox || expired) {
     return (
       <div className="mt-2">
         <button
@@ -80,22 +83,53 @@ export function AgentSandboxPreview({ agentPubkey }: { agentPubkey: string }) {
             <Monitor className="h-4 w-4 shrink-0 text-muted-foreground" />
           )}
           <span className="text-sm text-muted-foreground">
-            {starting ? "Starting computer…" : "Start a computer"}
+            {starting
+              ? "Starting computer…"
+              : expired
+                ? "Computer expired — start a new one"
+                : "Start a computer"}
           </span>
         </button>
+        {sandbox ? (
+          <button
+            type="button"
+            data-testid={`agent-sandbox-stop-${agentPubkey}`}
+            disabled={stopping || starting}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (stopping) return;
+              setStopping(true);
+              destroyAgentSandbox(sandbox.id).catch((err) => {
+                console.error("[AgentSandboxPreview] destroy failed:", err);
+                toast.error(
+                  err instanceof Error
+                    ? err.message
+                    : "Could not stop the computer.",
+                );
+                setStopping(false);
+              });
+            }}
+            className="mt-1 flex items-center gap-1 text-2xs text-muted-foreground transition-colors hover:text-destructive disabled:opacity-60"
+          >
+            {stopping ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <Power className="h-3 w-3" />
+            )}
+            {stopping ? "Stopping…" : "Stop expired computer"}
+          </button>
+        ) : null}
       </div>
     );
   }
 
-  const expired =
-    sandbox.expiresAt !== null && isSandboxExpired(sandbox.expiresAt, now);
   const remaining =
     sandbox.expiresAt !== null
       ? formatSandboxRemaining(sandbox.expiresAt, now)
       : null;
   const memoryGb =
     sandbox.memoryMb !== null ? (sandbox.memoryMb / 1024).toFixed(1) : null;
-  const canOpen = Boolean(sandbox.viewerUrl) && !expired;
+  const canOpen = Boolean(sandbox.viewerUrl);
 
   // Mint a fresh signed link at the instant of opening — the token is only
   // valid briefly, so it must not be minted ahead of time.

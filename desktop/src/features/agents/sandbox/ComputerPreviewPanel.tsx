@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ExternalLink, Maximize2, Monitor } from "lucide-react";
+import { ExternalLink, Loader2, Maximize2, Monitor, Power } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -24,6 +24,10 @@ import { openComputerWindow } from "./openComputerWindow";
 import { SandboxStage } from "./SandboxStage";
 import { SandboxViewerDialog } from "./SandboxViewerDialog";
 import { consumeComputerViewerRequest } from "./computerPanelStore";
+import {
+  destroyAgentSandbox,
+  restartAndOpenComputer,
+} from "./sandboxLifecycle";
 
 /**
  * Live sidebar view of an agent's computer, opened from the Computer button
@@ -61,6 +65,8 @@ export function ComputerPreviewPanel({
   const [mintedUrl, setMintedUrl] = React.useState<string | null>(null);
   const [minting, setMinting] = React.useState(false);
   const [viewerOpen, setViewerOpen] = React.useState(false);
+  const [stopping, setStopping] = React.useState(false);
+  const [restarting, setRestarting] = React.useState(false);
 
   const viewerUrl = sandbox?.viewerUrl ?? null;
 
@@ -122,6 +128,36 @@ export function ComputerPreviewPanel({
     }
   }
 
+  async function handleStop() {
+    if (!sandbox || stopping) return;
+    setStopping(true);
+    try {
+      await destroyAgentSandbox(sandbox.id);
+      setStopping(false);
+    } catch (err) {
+      console.error("[ComputerPreviewPanel] stop failed:", err);
+      toast.error(
+        err instanceof Error ? err.message : "Could not stop the computer.",
+      );
+      setStopping(false);
+    }
+  }
+
+  async function handleRestart() {
+    if (!sandbox || restarting) return;
+    setRestarting(true);
+    try {
+      await restartAndOpenComputer(ownerPubkey, sandbox.id);
+      setRestarting(false);
+    } catch (err) {
+      console.error("[ComputerPreviewPanel] restart failed:", err);
+      toast.error(
+        err instanceof Error ? err.message : "Could not restart the computer.",
+      );
+      setRestarting(false);
+    }
+  }
+
   return (
     <>
       <AuxiliaryPanel
@@ -159,6 +195,26 @@ export function ComputerPreviewPanel({
             <AuxiliaryPanelHeaderActions includeCloseAction>
               {sandbox ? (
                 <>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        data-testid="computer-preview-stop"
+                        aria-label="Stop computer"
+                        disabled={stopping || restarting}
+                        onClick={() => void handleStop()}
+                      >
+                        {stopping ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Power className="h-4 w-4" />
+                        )}
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Stop computer</TooltipContent>
+                  </Tooltip>
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button
@@ -209,9 +265,34 @@ export function ComputerPreviewPanel({
                 {everHadComputer ? "Starting computer…" : "No computer running"}
               </p>
             </div>
+          ) : expired ? (
+            <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">
+              <Monitor className="h-8 w-8 text-muted-foreground" />
+              <div>
+                <p className="text-sm font-medium text-foreground">
+                  Computer expired
+                </p>
+                <p className="mt-1 text-2xs text-muted-foreground">
+                  Start a fresh machine with the same persistent files.
+                </p>
+              </div>
+              <Button
+                data-testid="computer-preview-restart"
+                disabled={restarting || stopping}
+                onClick={() => void handleRestart()}
+                size="sm"
+                type="button"
+              >
+                {restarting ? (
+                  <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
+                ) : null}
+                {restarting ? "Starting…" : "Start new computer"}
+              </Button>
+            </div>
           ) : mintedUrl ? (
             <SandboxStage
               viewerUrl={mintedUrl}
+              rawViewerUrl={sandbox.viewerUrl ?? undefined}
               sandboxId={sandbox.id}
               sandboxName={sandbox.name}
               agentDisplayName={agentDisplayName}

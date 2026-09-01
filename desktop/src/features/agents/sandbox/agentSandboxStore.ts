@@ -1,5 +1,6 @@
 import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
+import { KIND_SANDBOX_DESTROYED } from "@/shared/constants/kinds";
 import { markComputerEverAssigned } from "./computerEverAssignedStore";
 import { reconstructAgentSandbox, type AgentSandbox } from "./sandboxState";
 
@@ -20,9 +21,19 @@ import { reconstructAgentSandbox, type AgentSandbox } from "./sandboxState";
 let seenEvents = new Map<string, RelayEvent>();
 // Reconstructed current sandbox per owner pubkey (lowercased). Absent = none.
 let sandboxByOwner = new Map<string, AgentSandbox>();
+// Immediate command-response state. This bridges the gap until the relay's
+// lifecycle announcement arrives, and is essential when create reuses an
+// already-running sandbox without publishing a fresh event.
+let commandSandboxByOwner = new Map<string, AgentSandbox>();
+// Successful DELETE is authoritative even when the broker says "already gone"
+// and therefore has no destruction event to publish. Tombstones stop retained
+// historical 48200 events from resurrecting that stale machine locally.
+let locallyRemovedSandboxIds = new Set<string>();
 const listeners = new Set<() => void>();
 let unsubscribe: (() => void) | null = null;
 let starting = false;
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+let retryAttempt = 0;
 // Bumped on reset so an in-flight subscribe callback from the old community is
 // ignored once a new one begins.
 let generation = 0;
@@ -42,7 +53,12 @@ function notify() {
  *  affect another's. */
 function recompute() {
   const byOwner = new Map<string, RelayEvent[]>();
+  const destroyedIds = new Set<string>();
   for (const event of seenEvents.values()) {
+    if (event.kind === KIND_SANDBOX_DESTROYED) {
+      const sandboxId = event.tags.find((tag) => tag[0] === "d")?.[1];
+      if (sandboxId) destroyedIds.add(sandboxId);
+    }
     const owner = ownerTag(event);
     if (!owner) continue;
     const list = byOwner.get(owner);
@@ -53,47 +69,100 @@ function recompute() {
   const next = new Map<string, AgentSandbox>();
   for (const [owner, events] of byOwner) {
     const sandbox = reconstructAgentSandbox(events);
-    if (sandbox) {
+    if (
+      sandbox &&
+      !destroyedIds.has(sandbox.id) &&
+      !locallyRemovedSandboxIds.has(sandbox.id)
+    ) {
       next.set(owner, sandbox);
       // Passive observation: any owner seen with a live sandbox — not just
       // ones this client started — sticks in "ever had a computer" memory.
       markComputerEverAssigned(owner);
     }
   }
+  for (const [owner, sandbox] of commandSandboxByOwner) {
+    if (
+      !destroyedIds.has(sandbox.id) &&
+      !locallyRemovedSandboxIds.has(sandbox.id)
+    ) {
+      next.set(owner, sandbox);
+    }
+  }
   sandboxByOwner = next;
-  console.error(
-    "[agentSandboxStore] recompute — owners with a computer:",
-    [...next.keys()].map((k) => k.slice(0, 8)),
-  );
   notify();
 }
 
 /** Open the shared subscription once. Idempotent. */
 async function ensureSubscription() {
-  if (unsubscribe || starting) return;
+  if (unsubscribe || starting || listeners.size === 0) return;
   starting = true;
   const gen = generation;
-  console.error("[agentSandboxStore] ensureSubscription: opening");
-
+  let failed = false;
   try {
     const dispose = await relayClient.subscribeToAllSandboxEvents((event) => {
-      console.error("[agentSandboxStore] EVENT kind", event.kind);
       if (gen !== generation) return;
       if (seenEvents.has(event.id)) return;
       seenEvents.set(event.id, event);
+      const owner = ownerTag(event);
+      const sandboxId = event.tags.find((tag) => tag[0] === "d")?.[1];
+      if (owner && sandboxId) {
+        const optimistic = commandSandboxByOwner.get(owner);
+        if (optimistic?.id === sandboxId) commandSandboxByOwner.delete(owner);
+      }
       recompute();
     });
-    console.error("[agentSandboxStore] subscribed OK");
     if (gen !== generation) {
       void dispose();
       return;
     }
     unsubscribe = () => void dispose();
+    retryAttempt = 0;
   } catch (err) {
     console.error("[agentSandboxStore] subscription failed:", err);
+    failed = true;
   } finally {
     starting = false;
+    if (failed && gen === generation && listeners.size > 0 && !retryTimer) {
+      const delayMs = Math.min(1_000 * 2 ** retryAttempt, 30_000);
+      retryAttempt += 1;
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        void ensureSubscription();
+      }, delayMs);
+    }
   }
+}
+
+/** Apply a successful create/reuse response immediately. */
+export function upsertSandboxForOwner(
+  agentPubkey: string,
+  sandbox: AgentSandbox,
+): void {
+  const owner = agentPubkey.toLowerCase();
+  locallyRemovedSandboxIds.delete(sandbox.id);
+  const current = sandboxByOwner.get(owner);
+  const immediate =
+    current?.id === sandbox.id
+      ? {
+          ...current,
+          ...sandbox,
+          viewerUrl: sandbox.viewerUrl ?? current.viewerUrl,
+        }
+      : sandbox;
+  commandSandboxByOwner = new Map(commandSandboxByOwner).set(owner, immediate);
+  markComputerEverAssigned(owner);
+  recompute();
+}
+
+/** Apply a successful stop immediately, including broker "already gone". */
+export function removeSandboxById(sandboxId: string): void {
+  locallyRemovedSandboxIds = new Set(locallyRemovedSandboxIds).add(sandboxId);
+  commandSandboxByOwner = new Map(
+    [...commandSandboxByOwner].filter(
+      ([, sandbox]) => sandbox.id !== sandboxId,
+    ),
+  );
+  recompute();
 }
 
 /** Subscribe a React consumer to store changes. */
@@ -135,8 +204,13 @@ export function resetAgentSandboxStore() {
   const dispose = unsubscribe;
   unsubscribe = null;
   starting = false;
+  if (retryTimer) clearTimeout(retryTimer);
+  retryTimer = null;
+  retryAttempt = 0;
   seenEvents = new Map();
   sandboxByOwner = new Map();
+  commandSandboxByOwner = new Map();
+  locallyRemovedSandboxIds = new Set();
   notify();
   dispose?.();
 }

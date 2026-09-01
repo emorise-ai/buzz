@@ -198,6 +198,7 @@ export function ComputerWindowScreen({ sandboxId }: { sandboxId: string }) {
         <div className="relative flex min-h-0 flex-1 flex-col">
           <SandboxStage
             viewerUrl={mintedUrl}
+            rawViewerUrl={viewerUrl}
             sandboxId={sandboxId}
             sandboxName={sandboxName}
             agentDisplayName={agentDisplayName}
