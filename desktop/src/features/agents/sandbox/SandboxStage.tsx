@@ -18,6 +18,10 @@ const SCREEN_ASPECT_RATIO = 16 / 9;
  *  alive — well under the broker's keepalive grace window so a brief network
  *  blip between pings never drops the box (see the broker's `/heartbeat`). */
 const HEARTBEAT_INTERVAL_MS = 120_000;
+/** A viewer must either prove its RFB connection or be reminted. This bounds
+ * every loading state instead of leaving an opaque overlay up forever. */
+const VIEWER_CONNECT_TIMEOUT_MS = 10_000;
+const MAX_AUTOMATIC_VIEWER_REFRESHES = 2;
 
 export type SandboxStageHandle = {
   /** Open the "Transfer files" overlay — driven by a host surface's own
@@ -90,25 +94,36 @@ export const SandboxStage = React.forwardRef<
     "connecting" | "connected" | "reconnecting" | "failed"
   >("connecting");
   const refreshInFlight = React.useRef(false);
+  const refreshAttempts = React.useRef(0);
 
   React.useEffect(() => {
     setFrameUrl(viewerUrl);
     setConnectionState(refreshableViewerUrl ? "connecting" : "connected");
     refreshInFlight.current = false;
+    refreshAttempts.current = 0;
   }, [refreshableViewerUrl, viewerUrl]);
 
-  const refreshViewer = React.useCallback(async () => {
-    if (!refreshableViewerUrl || refreshInFlight.current) return;
-    refreshInFlight.current = true;
-    setConnectionState("reconnecting");
-    try {
-      setFrameUrl(await mintViewerUrl(refreshableViewerUrl));
-    } catch {
-      setConnectionState("failed");
-    } finally {
-      refreshInFlight.current = false;
-    }
-  }, [refreshableViewerUrl]);
+  const refreshViewer = React.useCallback(
+    async (resetAttempts = false) => {
+      if (!refreshableViewerUrl || refreshInFlight.current) return;
+      if (resetAttempts) refreshAttempts.current = 0;
+      if (refreshAttempts.current >= MAX_AUTOMATIC_VIEWER_REFRESHES) {
+        setConnectionState("failed");
+        return;
+      }
+      refreshAttempts.current += 1;
+      refreshInFlight.current = true;
+      setConnectionState("reconnecting");
+      try {
+        setFrameUrl(await mintViewerUrl(refreshableViewerUrl));
+      } catch {
+        setConnectionState("failed");
+      } finally {
+        refreshInFlight.current = false;
+      }
+    },
+    [refreshableViewerUrl],
+  );
 
   React.useImperativeHandle(
     ref,
@@ -185,6 +200,7 @@ export const SandboxStage = React.forwardRef<
       }
 
       if (type === "buzz:viewer-connected") {
+        refreshAttempts.current = 0;
         setConnectionState("connected");
         return;
       }
@@ -214,6 +230,33 @@ export const SandboxStage = React.forwardRef<
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
   }, [expired, refreshViewer]);
+
+  // The viewer can establish RFB before React's message effect is installed.
+  // Ask for its current state after the iframe loads so connection reporting is
+  // a handshake, not a race-prone one-shot notification.
+  const requestViewerStatus = React.useCallback(() => {
+    iframeRef.current?.contentWindow?.postMessage(
+      { type: "buzz:viewer-status-request" },
+      "*",
+    );
+  }, []);
+
+  // A broken viewer, proxy, or message bridge must reach a useful failure UI.
+  // Each successful remint changes frameUrl and starts one fresh bounded wait.
+  React.useEffect(() => {
+    if (
+      !refreshableViewerUrl ||
+      connectionState === "connected" ||
+      connectionState === "failed"
+    ) {
+      return;
+    }
+    const pendingFrameUrl = frameUrl;
+    const timeout = window.setTimeout(() => {
+      if (iframeRef.current?.src === pendingFrameUrl) void refreshViewer();
+    }, VIEWER_CONNECT_TIMEOUT_MS);
+    return () => window.clearTimeout(timeout);
+  }, [connectionState, frameUrl, refreshViewer, refreshableViewerUrl]);
 
   const title = agentDisplayName
     ? `${agentDisplayName}'s computer`
@@ -258,6 +301,7 @@ export const SandboxStage = React.forwardRef<
             className="h-full w-full border-0"
             sandbox="allow-scripts allow-same-origin allow-forms"
             allow="clipboard-read; clipboard-write"
+            onLoad={requestViewerStatus}
           />
           {connectionState !== "connected" && refreshableViewerUrl ? (
             <div
@@ -273,7 +317,7 @@ export const SandboxStage = React.forwardRef<
                   <button
                     type="button"
                     className="flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-xs text-foreground hover:bg-muted"
-                    onClick={() => void refreshViewer()}
+                    onClick={() => void refreshViewer(true)}
                   >
                     <RefreshCw className="h-3.5 w-3.5" />
                     Retry

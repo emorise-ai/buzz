@@ -249,4 +249,33 @@ test.describe("agent sandbox preview screenshots", () => {
     await expect(indicator).toHaveAttribute("aria-label", "Open computer");
     await expect(page.getByTestId("user-profile-panel")).toHaveCount(0);
   });
+
+  test("08-viewer-status-handshake-clears-a-missed-connect-overlay", async ({
+    page,
+  }) => {
+    await page.route("https://viewer.test/**", async (route) => {
+      await route.fulfill({
+        contentType: "text/html",
+        body: `<!doctype html><script>
+          window.addEventListener("message", (event) => {
+            if (event.data?.type === "buzz:viewer-status-request") {
+              window.parent.postMessage({ type: "buzz:viewer-connected" }, "*");
+            }
+          });
+        </script><body>Connected computer</body>`,
+      });
+    });
+    await gotoAgentProfile(page);
+    await emitSandbox(page, {
+      viewerUrl: "https://viewer.test/desktop",
+      expiresAt: Math.floor(Date.now() / 1000) + 42 * 60,
+    });
+
+    const preview = page.getByTestId(`agent-sandbox-preview-${AGENT_PUBKEY}`);
+    await expect(preview).toBeVisible({ timeout: 10_000 });
+    await preview.click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog.locator("iframe")).toBeVisible();
+    await expect(dialog.getByTestId("sandbox-connection-state")).toHaveCount(0);
+  });
 });

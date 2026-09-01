@@ -2814,17 +2814,32 @@ const VIEWER_PAGE: &str = r##"<!doctype html>
     };
   }
   let unwireMacShortcuts = () => {};
+  let viewerConnected = false;
+  function reportViewerConnected() {
+    if (viewerConnected && window.parent !== window) {
+      window.parent.postMessage({ type: "buzz:viewer-connected" }, "*");
+    }
+  }
+  window.addEventListener("message", (event) => {
+    if (
+      event.source === window.parent &&
+      event.data &&
+      event.data.type === "buzz:viewer-status-request"
+    ) {
+      reportViewerConnected();
+    }
+  });
   function connect() {
     const rfb = new RFB(document.getElementById("screen"), url);
     rfb.scaleViewport = true;
     rfb.background = "#101014";
     rfb.addEventListener("connect", () => {
       retry = 0;
-      if (window.parent !== window) {
-        window.parent.postMessage({ type: "buzz:viewer-connected" }, "*");
-      }
+      viewerConnected = true;
+      reportViewerConnected();
     });
     rfb.addEventListener("disconnect", () => {
+      viewerConnected = false;
       if (window.parent !== window) {
         // The signed path token is deliberately short-lived. The Buzz shell
         // can mint a replacement without asking the user to close/reopen the
@@ -2857,6 +2872,8 @@ mod viewer_page_tests {
         assert!(VIEWER_PAGE.contains("buzz:viewer-connected"));
         assert!(VIEWER_PAGE.contains("buzz:viewer-disconnected"));
         assert!(VIEWER_PAGE.contains("buzz:viewer-refresh-request"));
+        assert!(VIEWER_PAGE.contains("buzz:viewer-status-request"));
+        assert!(VIEWER_PAGE.contains("reportViewerConnected"));
         assert!(VIEWER_PAGE.contains("window.parent !== window"));
     }
 }
