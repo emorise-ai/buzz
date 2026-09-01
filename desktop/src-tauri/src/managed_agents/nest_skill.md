@@ -17,6 +17,8 @@ version: 1
 
 `BUZZ_AUTH_TAG` is required for `buzz agents draft-create` and `buzz agents draft-update` because those commands send owner-reviewed Desktop drafts. If missing, explain that this managed agent cannot open owner-reviewed agent drafts from chat.
 
+`BUZZ_SANDBOX_BROKER_URL` and, for an attached computer, `BUZZ_SANDBOX_ID` are injected by Buzz Desktop. Use `buzz sandbox files list|get|put` to transfer files between the local agent workspace and that computer; browser downloads are normally under `/home/agent/Downloads`.
+
 Run the bundled CLI with `--help` and `<command> <subcommand> --help` to discover all flags, arguments, and usage. This skill documents only what `--help` cannot tell you.
 
 ## Conversational Agent Management

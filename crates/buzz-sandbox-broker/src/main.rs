@@ -383,7 +383,7 @@ fn build_router(state: AppState) -> Router {
         // Raise the request-body cap above axum's 2 MB default. File uploads
         // (`fs/file`) and teach-a-task recording audio (`recording/stop`) both
         // legitimately send tens of MB, and both already enforce their own
-        // 50 MB caps with clear errors — but axum's default rejected anything
+        // 50-64 MiB caps with clear errors — but axum's default rejected anything
         // over 2 MB first with a terse 413 before those checks ran, so a
         // recording of more than a few seconds failed to save. Sized just
         // above the app-level caps so those remain the real limit.
@@ -391,10 +391,10 @@ fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Router-wide request-body cap. Above the 50 MB `fs/file` and recording-audio
+/// Router-wide request-body cap. Above the 64 MiB `fs/file` and 50 MiB recording-audio
 /// caps so the handlers' own size checks (with actionable messages) are what a
 /// caller hits, not axum's default 2 MB limit.
-const BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const BODY_LIMIT_BYTES: usize = 65 * 1024 * 1024;
 
 /// Unauthenticated: it reports only that the process is up, so a health probe
 /// does not need a credential.
@@ -1406,7 +1406,7 @@ const FS_EXEC_USER: &str = "10001:10001";
 /// artifacts, small enough that a caller cannot use the file API to fill the
 /// host's disk in one request — the TTL reaper and concurrency cap bound
 /// sandbox count and lifetime, not bytes written per call.
-const FS_MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
+const FS_MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// One entry of a directory listing, as emitted by the in-container `python3
 /// -c` scan and reported back to the caller.

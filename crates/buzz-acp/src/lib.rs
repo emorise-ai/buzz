@@ -4592,6 +4592,8 @@ mod computer_prompt_tests {
         assert!(prompt.contains("attached computer is the default target"));
         assert!(prompt.contains("buzz sandbox exec"));
         assert!(prompt.contains("buzz sandbox screenshot"));
+        assert!(prompt.contains("buzz sandbox files get"));
+        assert!(prompt.contains("buzz sandbox files put"));
         assert!(prompt.contains("take over the mouse and keyboard"));
         // The base prompt's own content must still be present — this is an
         // append, not a replacement.

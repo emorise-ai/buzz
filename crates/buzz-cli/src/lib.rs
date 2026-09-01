@@ -2081,6 +2081,48 @@ pub enum SandboxCmd {
         #[arg(short, long)]
         output: Option<String>,
     },
+    /// Transfer files between this agent's workspace and its computer
+    Files {
+        #[command(subcommand)]
+        command: SandboxFilesCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SandboxFilesCmd {
+    /// List a directory inside the computer
+    List {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        #[command(flatten)]
+        sandbox: SandboxIdArg,
+        /// Absolute directory under /workspace or /home/agent
+        #[arg(long, default_value = "/workspace")]
+        path: String,
+    },
+    /// Copy a file from the computer into the agent's local workspace
+    Get {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        /// Absolute source path under /workspace or /home/agent
+        remote_path: String,
+        #[command(flatten)]
+        sandbox: SandboxIdArg,
+        /// Local destination path (defaults to the remote file name)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Copy a local workspace file into the computer
+    Put {
+        #[command(flatten)]
+        broker: SandboxBrokerArg,
+        /// Local source path
+        local_path: String,
+        /// Absolute destination path under /workspace or /home/agent
+        remote_path: String,
+        #[command(flatten)]
+        sandbox: SandboxIdArg,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3364,5 +3406,98 @@ mod tests {
             body,
             serde_json::json!({ "app": "browser", "url": "https://example.com" })
         );
+    }
+
+    #[test]
+    fn sandbox_files_list_parses_remote_directory_and_id() {
+        let Cmd::Sandbox(SandboxCmd::Files {
+            command: SandboxFilesCmd::List { path, sandbox, .. },
+        }) = Cli::try_parse_from([
+            "buzz",
+            "--relay",
+            "wss://x",
+            "sandbox",
+            "files",
+            "list",
+            "--broker",
+            "http://broker",
+            "myid",
+            "--path",
+            "/home/agent/Downloads",
+        ])
+        .expect("files list parses")
+        .command
+        else {
+            panic!("expected Sandbox(Files(List))");
+        };
+        assert_eq!(sandbox.require().unwrap(), "myid");
+        assert_eq!(path, "/home/agent/Downloads");
+    }
+
+    #[test]
+    fn sandbox_files_get_parses_paths_and_id() {
+        let Cmd::Sandbox(SandboxCmd::Files {
+            command:
+                SandboxFilesCmd::Get {
+                    remote_path,
+                    sandbox,
+                    output,
+                    ..
+                },
+        }) = Cli::try_parse_from([
+            "buzz",
+            "--relay",
+            "wss://x",
+            "sandbox",
+            "files",
+            "get",
+            "--broker",
+            "http://broker",
+            "/home/agent/Downloads/model.glb",
+            "myid",
+            "--output",
+            "./assets/model.glb",
+        ])
+        .expect("files get parses")
+        .command
+        else {
+            panic!("expected Sandbox(Files(Get))");
+        };
+        assert_eq!(sandbox.require().unwrap(), "myid");
+        assert_eq!(remote_path, "/home/agent/Downloads/model.glb");
+        assert_eq!(output.as_deref(), Some("./assets/model.glb"));
+    }
+
+    #[test]
+    fn sandbox_files_put_parses_both_paths_and_id() {
+        let Cmd::Sandbox(SandboxCmd::Files {
+            command:
+                SandboxFilesCmd::Put {
+                    local_path,
+                    remote_path,
+                    sandbox,
+                    ..
+                },
+        }) = Cli::try_parse_from([
+            "buzz",
+            "--relay",
+            "wss://x",
+            "sandbox",
+            "files",
+            "put",
+            "--broker",
+            "http://broker",
+            "./assets/model.glb",
+            "/workspace/model.glb",
+            "myid",
+        ])
+        .expect("files put parses")
+        .command
+        else {
+            panic!("expected Sandbox(Files(Put))");
+        };
+        assert_eq!(sandbox.require().unwrap(), "myid");
+        assert_eq!(local_path, "./assets/model.glb");
+        assert_eq!(remote_path, "/workspace/model.glb");
     }
 }

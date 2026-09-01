@@ -681,8 +681,8 @@ pub async fn sandbox_fs_upload(
     let dest_path = validate_sandbox_path(&dest_path)?;
     let bytes =
         std::fs::read(&local_path).map_err(|e| format!("could not read the local file: {e}"))?;
-    if bytes.len() > 50 * 1024 * 1024 {
-        return Err("file is larger than the 50MB upload limit".to_string());
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err("file is larger than the 64 MiB upload limit".to_string());
     }
     let url = format!(
         "{}/sandboxes/{id}/fs/file?path={}",

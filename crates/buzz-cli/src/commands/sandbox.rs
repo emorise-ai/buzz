@@ -212,7 +212,77 @@ pub async fn dispatch(cmd: crate::SandboxCmd, client: &BuzzClient) -> Result<(),
             })?;
             print_json(&serde_json::json!({ "path": path, "bytes": bytes.len() }))
         }
+        crate::SandboxCmd::Files { command } => dispatch_files(command, client).await,
     }
+}
+
+async fn dispatch_files(
+    command: crate::SandboxFilesCmd,
+    client: &BuzzClient,
+) -> Result<(), CliError> {
+    match command {
+        crate::SandboxFilesCmd::List {
+            broker,
+            sandbox,
+            path,
+        } => {
+            let id = sandbox.require()?;
+            print_json(
+                &client
+                    .sandbox_files_list(&broker.broker, &id, &path)
+                    .await?,
+            )
+        }
+        crate::SandboxFilesCmd::Get {
+            broker,
+            remote_path,
+            sandbox,
+            output,
+        } => {
+            let id = sandbox.require()?;
+            let bytes = client
+                .sandbox_files_download(&broker.broker, &id, &remote_path)
+                .await?;
+            let path = output.unwrap_or_else(|| default_download_path(&remote_path));
+            std::fs::write(&path, &bytes).map_err(|e| {
+                CliError::Other(format!("failed to write downloaded file to {path}: {e}"))
+            })?;
+            print_json(&serde_json::json!({
+                "path": path,
+                "remote_path": remote_path,
+                "bytes": bytes.len(),
+            }))
+        }
+        crate::SandboxFilesCmd::Put {
+            broker,
+            local_path,
+            remote_path,
+            sandbox,
+        } => {
+            let id = sandbox.require()?;
+            let bytes = std::fs::read(&local_path).map_err(|e| {
+                CliError::Other(format!("failed to read local file {local_path}: {e}"))
+            })?;
+            let size = bytes.len();
+            client
+                .sandbox_files_upload(&broker.broker, &id, &remote_path, bytes)
+                .await?;
+            print_json(&serde_json::json!({
+                "path": remote_path,
+                "local_path": local_path,
+                "bytes": size,
+            }))
+        }
+    }
+}
+
+fn default_download_path(remote_path: &str) -> String {
+    std::path::Path::new(remote_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("sandbox-download")
+        .to_string()
 }
 
 /// Default screenshot filename: short enough to be readable, unique enough

@@ -42,6 +42,12 @@ fn nest_skill_contains_safe_mention_workflow() {
 }
 
 #[test]
+fn nest_skill_teaches_computer_file_transfer() {
+    assert!(BUZZ_CLI_SKILL_MD.contains("buzz sandbox files list|get|put"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("/home/agent/Downloads"));
+}
+
+#[test]
 fn nest_agents_template_separates_commit_attribution_claims() {
     assert_eq!(AGENTS_MD.matches("## Git Commit Attribution").count(), 1);
     assert!(AGENTS_MD.contains(

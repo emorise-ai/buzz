@@ -2329,7 +2329,7 @@ mod retry_policy_tests {
 mod tests {
     use super::{
         advance_query_cursor, create_response_with_id_if_accepted, extract_relay_response_field,
-        normalize_events, BuzzClient,
+        normalize_events, sandbox_file_url, BuzzClient,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
@@ -2553,6 +2553,21 @@ mod tests {
             "x-auth-tag header must not be present when no auth tag is configured"
         );
     }
+
+    #[test]
+    fn sandbox_file_url_encodes_the_exact_remote_path() {
+        let url = sandbox_file_url(
+            "https://broker.example/",
+            "sandbox-123",
+            "/fs/file",
+            "/home/agent/Downloads/Grill Module.glb",
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://broker.example/sandboxes/sandbox-123/fs/file?path=%2Fhome%2Fagent%2FDownloads%2FGrill+Module.glb"
+        );
+    }
 }
 
 /// Sandbox broker calls.
@@ -2569,6 +2584,17 @@ impl BuzzClient {
         url: &str,
         body: Option<Vec<u8>>,
     ) -> Result<(u16, String), CliError> {
+        self.broker_call_with_content_type(method, url, body, "application/json")
+            .await
+    }
+
+    async fn broker_call_with_content_type(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<Vec<u8>>,
+        content_type: &str,
+    ) -> Result<(u16, String), CliError> {
         let auth = sign_nip98(&self.keys, method.as_str(), url, body.as_deref())?;
         let mut req = self
             .http
@@ -2576,7 +2602,7 @@ impl BuzzClient {
             .header(reqwest::header::AUTHORIZATION, auth);
         if let Some(body) = body {
             req = req
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::CONTENT_TYPE, content_type)
                 .body(body);
         }
         let resp = req.send().await?;
@@ -2586,7 +2612,7 @@ impl BuzzClient {
             200..=299 => Ok((status, text)),
             401 | 403 => Err(CliError::Auth(broker_detail(status, &text))),
             404 => Err(CliError::NotFound(broker_detail(status, &text))),
-            400 => Err(CliError::Usage(broker_detail(status, &text))),
+            400 | 413 => Err(CliError::Usage(broker_detail(status, &text))),
             409 => Err(CliError::Conflict(broker_detail(status, &text))),
             _ => Err(CliError::Relay { status, body: text }),
         }
@@ -2752,6 +2778,50 @@ impl BuzzClient {
             .await
     }
 
+    /// List one allowed directory in the sandbox filesystem.
+    pub async fn sandbox_files_list(
+        &self,
+        broker_url: &str,
+        id: &str,
+        path: &str,
+    ) -> Result<serde_json::Value, CliError> {
+        let url = sandbox_file_url(broker_url, id, "/fs", path)?;
+        let (_, text) = self.broker_call(reqwest::Method::GET, &url, None).await?;
+        parse_broker_json(&text)
+    }
+
+    /// Download one file from the sandbox filesystem.
+    pub async fn sandbox_files_download(
+        &self,
+        broker_url: &str,
+        id: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, CliError> {
+        let url = sandbox_file_url(broker_url, id, "/fs/file", path)?;
+        self.broker_call_binary(reqwest::Method::GET, &url, None, "application/octet-stream")
+            .await
+    }
+
+    /// Upload one file into the sandbox filesystem.
+    pub async fn sandbox_files_upload(
+        &self,
+        broker_url: &str,
+        id: &str,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> Result<serde_json::Value, CliError> {
+        let url = sandbox_file_url(broker_url, id, "/fs/file", path)?;
+        let (_, text) = self
+            .broker_call_with_content_type(
+                reqwest::Method::PUT,
+                &url,
+                Some(bytes),
+                "application/octet-stream",
+            )
+            .await?;
+        parse_broker_json(&text)
+    }
+
     /// Same signing/status-mapping as `broker_call`, but returns the raw
     /// response body instead of decoding it as text/JSON — used for endpoints
     /// that answer with binary bytes (screenshot's PNG, recording's mp4).
@@ -2782,7 +2852,7 @@ impl BuzzClient {
             return Err(match status {
                 401 | 403 => CliError::Auth(broker_detail(status, &text)),
                 404 => CliError::NotFound(broker_detail(status, &text)),
-                400 => CliError::Usage(broker_detail(status, &text)),
+                400 | 413 => CliError::Usage(broker_detail(status, &text)),
                 409 => CliError::Conflict(broker_detail(status, &text)),
                 _ => CliError::Relay { status, body: text },
             });
@@ -2801,6 +2871,19 @@ impl BuzzClient {
         let bytes = resp.bytes().await?;
         Ok(bytes.to_vec())
     }
+}
+
+fn sandbox_file_url(
+    broker_url: &str,
+    id: &str,
+    suffix: &str,
+    path: &str,
+) -> Result<String, CliError> {
+    let base = broker_url.trim_end_matches('/');
+    let mut url = url::Url::parse(&format!("{base}/sandboxes/{id}{suffix}"))
+        .map_err(|e| CliError::Usage(format!("invalid sandbox broker URL: {e}")))?;
+    url.query_pairs_mut().append_pair("path", path);
+    Ok(url.into())
 }
 
 /// The broker answers `{"error": "..."}`; surface that text rather than the
