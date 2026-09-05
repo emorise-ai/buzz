@@ -93,14 +93,23 @@ jobs:
         run: ct lint --config ct.yaml --all
 
       - name: helm-unittest
-        run: helm unittest deploy/charts/buzz
+        run: |
+          if ! helm unittest deploy/charts/buzz >"$RUNNER_TEMP/helm-unittest.log" 2>&1; then
+            echo "::error::Helm unit tests failed; output withheld because it may contain Secret values."
+            exit 1
+          fi
 
       - name: helm template (render every fixture)
         run: |
           set -euo pipefail
           for f in deploy/charts/buzz/ci/*-values.yaml deploy/charts/buzz/tests/fixtures/*-values.yaml; do
             echo "::group::render $f"
-            helm template buzz deploy/charts/buzz -f "$f"
+            # Rendering validates every fixture, but both normal output and
+            # error diagnostics can include Kubernetes Secret data.
+            if ! helm template buzz deploy/charts/buzz -f "$f" >"$RUNNER_TEMP/helm-render.log" 2>&1; then
+              echo "::error::Helm render failed for $f; output withheld because it may contain Secret values."
+              exit 1
+            fi
             echo "::endgroup::"
           done
 
