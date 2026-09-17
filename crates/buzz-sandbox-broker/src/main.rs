@@ -237,12 +237,6 @@ async fn main() {
         },
         None => nostr::Keys::generate(),
     };
-    // Mirrors the relay's own default: it admits any authenticated caller
-    // unless membership is explicitly required.
-    let require_membership = std::env::var("BUZZ_SANDBOX_REQUIRE_MEMBERSHIP")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
-        .unwrap_or(false);
-
     let publisher = match events::Publisher::new(&relay_url, broker_keys.clone()) {
         Ok(p) => {
             info!(broker_pubkey = %p.pubkey_hex(), "publishing sandbox events to the relay");
@@ -262,7 +256,6 @@ async fn main() {
             relay_url,
             public_url,
             broker_keys.clone(),
-            require_membership,
         )),
         publisher,
         viewer_base: std::env::var("BUZZ_SANDBOX_VIEWER_URL")
@@ -1443,10 +1436,8 @@ struct LaunchRequest {
     url: Option<String>,
 }
 
-/// Authorize an fs-API call and validate its `path`, in that order — the
-/// signature check is local and must run before anything path-shaped is
-/// interpreted, and the path policy applies regardless of *who* is calling
-/// (matching the existing DELETE routes, any community member may act).
+/// Authorize an fs-API call before it can reach Docker. The signed caller
+/// must be a relay member and the owner or manager of a managed sandbox.
 async fn authorize_fs(
     state: &AppState,
     headers: &axum::http::HeaderMap,
@@ -1459,8 +1450,9 @@ async fn authorize_fs(
     if !is_safe_id(id) {
         return Err(bad_request("malformed sandbox id"));
     }
-    authorize(state, headers, method, path, body).await?;
+    let caller = authorize(state, headers, method, path, body).await?;
     sandbox::validate_fs_path(fs_path).map_err(bad_request)?;
+    require_owner_or_manager(state, id, &caller).await?;
     Ok(())
 }
 
@@ -1712,6 +1704,9 @@ async fn fs_upload(
     if let Err(e) = sandbox::validate_fs_path(&q.path) {
         return bad_request(e);
     }
+    if let Err(response) = require_owner_or_manager(&state, &id, &pubkey).await {
+        return response;
+    }
 
     let spool = match tempfile::NamedTempFile::new() {
         Ok(file) => file,
@@ -1862,7 +1857,7 @@ async fn fs_rename(
     if !is_safe_id(&id) {
         return bad_request("malformed sandbox id");
     }
-    if let Err(response) = authorize(
+    let caller = match authorize(
         &state,
         &headers,
         "POST",
@@ -1871,8 +1866,9 @@ async fn fs_rename(
     )
     .await
     {
-        return response;
-    }
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
     let req: FsRenameRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return bad_request(format!("invalid request body: {e}")),
@@ -1882,6 +1878,9 @@ async fn fs_rename(
     }
     if let Err(e) = sandbox::validate_fs_path(&req.to) {
         return bad_request(e);
+    }
+    if let Err(response) = require_owner_or_manager(&state, &id, &caller).await {
+        return response;
     }
 
     let (exit_code, output) = match state
@@ -3753,7 +3752,7 @@ mod router_tests {
 
     /// An `AppState` fit only for router-level tests: the Docker socket path
     /// is never dialed (no test here reaches a handler that calls Docker) and
-    /// no relay is configured, so `require_membership` stays irrelevant — the
+    /// no relay is configured, so membership stays irrelevant — the
     /// request never gets past token verification.
     ///
     /// `pub(super)` so `keepalive_tests` (a sibling test module) can build
@@ -3767,7 +3766,6 @@ mod router_tests {
                 "https://relay.example".to_string(),
                 "https://broker.example".to_string(),
                 nostr::Keys::generate(),
-                true,
             )),
             publisher: None,
             viewer_base: None,
@@ -3969,5 +3967,149 @@ mod router_tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[cfg(test)]
+mod fs_authorization_tests {
+    use super::*;
+    use axum::body::Body;
+    use base64::Engine;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tower::ServiceExt;
+
+    fn signed_request(method: &str, uri: &str, keys: &nostr::Keys, body: &[u8]) -> Request<Body> {
+        let url = format!("https://broker.example{uri}");
+        let mut tags = vec![
+            nostr::Tag::parse(["u", &url]).unwrap(),
+            nostr::Tag::parse(["method", method]).unwrap(),
+        ];
+        if !body.is_empty() || method == "PUT" {
+            tags.push(nostr::Tag::parse(["payload", &hex::encode(Sha256::digest(body))]).unwrap());
+        }
+        let event = nostr::EventBuilder::new(nostr::Kind::HttpAuth, "")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .unwrap();
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_string(&event).unwrap());
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(axum::http::header::AUTHORIZATION, format!("Nostr {auth}"))
+            .body(Body::from(body.to_vec()))
+            .unwrap()
+    }
+
+    /// A local Docker API stub answers only inspect calls. An authorization
+    /// denial must stop after that one read, before any file operation starts.
+    async fn mock_docker(
+        listener: tokio::net::UnixListener,
+        alpha: String,
+        beta: String,
+        calls: Arc<AtomicUsize>,
+    ) {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = [0_u8; 4096];
+            let Ok(n) = stream.read(&mut request).await else {
+                continue;
+            };
+            let line = String::from_utf8_lossy(&request[..n]);
+            let owner = if line.contains("/containers/alpha/json") {
+                Some(alpha.as_str())
+            } else if line.contains("/containers/beta/json") {
+                Some(beta.as_str())
+            } else {
+                None
+            };
+            let labels = match owner {
+                Some(owner) => serde_json::json!({
+                    sandbox::LABEL_KEY: "1",
+                    sandbox::LABEL_OWNER: owner,
+                }),
+                None => serde_json::json!({}),
+            };
+            let body = serde_json::json!({"Config": {"Labels": labels}}).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            calls.fetch_add(1, Ordering::SeqCst);
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn two_members_cannot_use_each_others_file_routes_or_an_unmanaged_container() {
+        let alpha = nostr::Keys::generate();
+        let beta = nostr::Keys::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("docker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(mock_docker(
+            listener,
+            alpha.public_key().to_hex(),
+            beta.public_key().to_hex(),
+            calls.clone(),
+        ));
+
+        let mut state = super::router_tests::test_state();
+        state.docker = docker::Docker::new(&socket);
+        state
+            .verifier
+            .cache_member_for_test(&alpha.public_key().to_hex());
+        state
+            .verifier
+            .cache_member_for_test(&beta.public_key().to_hex());
+
+        // Both signing identities are valid members and may act on their own
+        // managed sandbox. Their signed file requests to the other fail before
+        // Docker receives any exec/archive operation.
+        assert!(
+            require_owner_or_manager(&state, "alpha", &alpha.public_key().to_hex())
+                .await
+                .is_ok()
+        );
+        assert!(
+            require_owner_or_manager(&state, "beta", &beta.public_key().to_hex())
+                .await
+                .is_ok()
+        );
+        for (keys, other) in [(&alpha, "beta"), (&beta, "alpha")] {
+            for (method, suffix, body) in [
+                ("GET", "/fs?path=%2Fworkspace", b"".as_slice()),
+                ("GET", "/fs/file?path=%2Fworkspace%2Ffile", b"".as_slice()),
+                ("DELETE", "/fs?path=%2Fworkspace%2Ffile", b"".as_slice()),
+                (
+                    "PUT",
+                    "/fs/file?path=%2Fworkspace%2Ffile",
+                    b"data".as_slice(),
+                ),
+                (
+                    "POST",
+                    "/fs/rename",
+                    br#"{"from":"/workspace/file","to":"/workspace/renamed"}"#.as_slice(),
+                ),
+            ] {
+                let before = calls.load(Ordering::SeqCst);
+                let uri = format!("/sandboxes/{other}{suffix}");
+                let response = build_router(state.clone())
+                    .oneshot(signed_request(method, &uri, keys, body))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+                assert_eq!(calls.load(Ordering::SeqCst), before + 1, "inspect only");
+            }
+        }
+
+        let uri = "/sandboxes/foreign/fs?path=%2Fworkspace";
+        let response = build_router(state)
+            .oneshot(signed_request("GET", uri, &alpha, b""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        server.abort();
     }
 }
