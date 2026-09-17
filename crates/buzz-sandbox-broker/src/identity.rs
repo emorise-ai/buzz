@@ -39,11 +39,6 @@ pub struct Verifier {
     /// closed for *everyone* — the broker has to be a participant, not an
     /// anonymous caller.
     keys: nostr::Keys,
-    /// Whether membership is required at all. On an open relay the relay
-    /// itself admits any authenticated caller, so demanding a membership event
-    /// here would be stricter than the authority the broker defers to — it
-    /// would refuse people the relay accepts.
-    require_membership: bool,
     /// The broker's advertised origins, needed because NIP-98 signs the exact
     /// URL the client called — a mismatch rejects every request. More than one
     /// because the broker is legitimately reachable at several addresses at
@@ -77,12 +72,7 @@ impl Verifier {
         String::from_utf8(bytes).map_err(|_| "auth header is not valid UTF-8".to_string())
     }
 
-    pub fn new(
-        relay_url: String,
-        public_url: String,
-        keys: nostr::Keys,
-        require_membership: bool,
-    ) -> Self {
+    pub fn new(relay_url: String, public_url: String, keys: nostr::Keys) -> Self {
         Self {
             relay_url: relay_url.trim_end_matches('/').to_string(),
             // Comma-separated so one env var carries every address the broker
@@ -93,7 +83,6 @@ impl Verifier {
                 .filter(|u| !u.is_empty())
                 .collect(),
             keys,
-            require_membership,
             cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
@@ -238,12 +227,6 @@ impl Verifier {
     /// costs nothing and prevents the broker becoming a way to run containers
     /// while the authority that gates it is down.
     pub async fn is_member(&self, pubkey_hex: &str) -> bool {
-        // An open relay admits any authenticated caller. Requiring a
-        // membership event here would make the broker stricter than the
-        // authority it defers to, refusing people the relay itself accepts.
-        if !self.require_membership {
-            return true;
-        }
         if let Some(cached) = self.cached(pubkey_hex) {
             return cached;
         }
@@ -259,6 +242,14 @@ impl Verifier {
         let cache = self.cache.lock().ok()?;
         let (allowed, at) = cache.get(pubkey_hex)?;
         (at.elapsed() < MEMBERSHIP_CACHE_TTL).then_some(*allowed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_member_for_test(&self, pubkey_hex: &str) {
+        self.cache
+            .lock()
+            .expect("membership test cache")
+            .insert(pubkey_hex.to_string(), (true, std::time::Instant::now()));
     }
 
     /// Ask the relay whether this pubkey has a membership event.
@@ -414,7 +405,6 @@ mod tests {
             "https://relay.example/".into(),
             "https://broker.example/".into(),
             nostr::Keys::generate(),
-            true,
         )
     }
 
@@ -437,7 +427,6 @@ mod tests {
             "https://relay.example".into(),
             "http://127.0.0.1:9310, http://buzz-sandbox-broker:9310".into(),
             nostr::Keys::generate(),
-            true,
         );
         let keys = nostr::Keys::generate();
         for base in ["http://127.0.0.1:9310", "http://buzz-sandbox-broker:9310"] {
@@ -612,19 +601,15 @@ mod tests {
         }
     }
 
-    /// An open relay admits any authenticated caller; the broker must not be
-    /// stricter than the authority it defers to, or it refuses people the
-    /// relay itself accepts.
+    /// No membership answer is available when the relay is unreachable.
     #[tokio::test]
-    async fn an_open_relay_admits_any_authenticated_caller() {
+    async fn missing_membership_answer_fails_closed() {
         let v = Verifier::new(
-            "https://relay.example".into(),
+            "http://127.0.0.1:1".into(),
             "https://broker.example".into(),
             nostr::Keys::generate(),
-            false,
         );
-        // No network call is made, and the answer is yes.
-        assert!(v.is_member("any-pubkey").await);
+        assert!(!v.is_member("any-pubkey").await);
     }
 
     #[test]
